@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>New little window</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f3f3f6; --fg: #1c1c1e; --dim: rgba(28, 28, 30, 0.56); --faint: rgba(28, 28, 30, 0.36);
+      --input: rgba(28, 28, 30, 0.07); --ring: rgba(28, 28, 30, 0.14); --accent: #5566f0; --accent-soft: rgba(85, 102, 240, 0.18);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #1f2023; --fg: #ececf0; --dim: rgba(236, 236, 240, 0.58); --faint: rgba(236, 236, 240, 0.36); --input: rgba(255, 255, 255, 0.08); --ring: rgba(255, 255, 255, 0.16); --accent: #8d98ff; --accent-soft: rgba(141, 152, 255, 0.24); }
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; display: flex; align-items: center; justify-content: center; padding: 24px; }
+    main { width: min(560px, 100%); }
+    form { position: relative; }
+    .ic { position: absolute; left: 18px; top: 50%; transform: translateY(-50%); color: var(--dim); display: flex; pointer-events: none; }
+    input {
+      width: 100%; height: 56px; padding: 0 20px 0 50px; border: 0; border-radius: 16px; background: var(--input); color: inherit;
+      font: inherit; font-size: 18px; outline: none; transition: box-shadow 110ms, background-color 110ms;
+    }
+    input::placeholder { color: var(--dim); }
+    input:focus { box-shadow: 0 0 0 3px var(--accent-soft), inset 0 0 0 1.5px var(--accent); }
+    p { margin: 14px 4px 0; color: var(--faint); font-size: 12px; text-align: center; }
+  </style>
+</head>
+<body>
+  <main>
+    <form id="form" autocomplete="off">
+      <span class="ic"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></svg></span>
+      <input id="q" data-testid="little-search-input" type="text" placeholder="Search or enter address" aria-label="Search or enter address" spellcheck="false" autocomplete="off" autocapitalize="off" autofocus>
+    </form>
+    <p>Enter to go, Esc to close</p>
+  </main>
+  <script type="module" src="littlesearch.js"></script>
+</body>
+</html>

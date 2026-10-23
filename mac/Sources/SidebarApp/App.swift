@@ -5,6 +5,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let server = HostServer()
     private var manager: OverlayManager?
     private let permissions = Permissions()
+    private lazy var router = LinkRouter(server: server)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // One instance only: it owns host.sock.
@@ -25,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         server.start()
         let mgr = OverlayManager(server: server)
         manager = mgr
+        router.preferredBridge = { [weak mgr] in mgr?.preferredBridge() }
 
         HotKey.registerPin { [weak mgr] in
             Task { @MainActor in
@@ -37,11 +39,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        HotKey.registerLittle { [weak self] in
+            Task { @MainActor in
+                self?.router.openNewLittle()
+            }
+        }
+
         permissions.ensure { [weak self] in
             guard let self = self else { return }
             self.manager?.start()
             self.server.setOverlayRunning(true)
         }
+    }
+
+    /// v2.8: links (and HTML files) handed to us as the default browser. Only reached in the normal app
+    /// process; connector mode (Chrome launching this executable) exits before an AppDelegate exists.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        router.handle(urls)
     }
 
     func applicationWillTerminate(_ notification: Notification) {

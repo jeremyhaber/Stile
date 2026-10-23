@@ -370,6 +370,8 @@ final class HostServer {
             doSetSettings(m, c)
         case "setOverlayEnabled":
             doSetOverlayEnabled(m, c)
+        case "setDefaultBrowser":
+            doSetDefaultBrowser(m, c)
         default:
             Log.write("host: unknown message type '\(type)'")
             c.reply(m, ["type": "error", "error": "unknown message type '\(type)'"])
@@ -451,6 +453,25 @@ final class HostServer {
         }
         setOverlayEnabled(on, from: c)
         c.reply(m, ["type": "overlayEnabled", "enabled": on])
+    }
+
+    /// v2.8: make this app (or Chrome again) the default browser. Replies when macOS has answered.
+    private func doSetDefaultBrowser(_ m: [String: Any], _ c: ProfileBridge) {
+        func effective() -> Bool { (HostStore.currentSettings()["defaultBrowser"] as? Bool) ?? false }
+        guard HostStore.isBool(m["enabled"]), let on = m["enabled"] as? Bool else {
+            c.reply(m, ["type": "defaultBrowser", "enabled": effective(), "ok": false, "error": "invalid enabled"])
+            return
+        }
+        LittleLinks.setDefault(on) { [weak self, weak c] err in
+            // Turning it off always sticks (the feature is off even if Chrome could not be restored).
+            if err == nil || !on { _ = HostStore.updateState(["littleLinksEnabled": on]) }
+            let now = effective()
+            var reply: [String: Any] = ["type": "defaultBrowser", "enabled": now, "ok": err == nil]
+            if let e = err { reply["error"] = e }
+            if let c = c { c.reply(m, reply) }
+            self?.broadcast(except: c, ["type": "defaultBrowser", "enabled": now])
+            Settings.post()
+        }
     }
 
     private func doSetSettings(_ m: [String: Any], _ c: ProfileBridge) {

@@ -29,6 +29,10 @@ final class OverlayController {
     /// Small "Sidebar isn't set up for this profile" pill shown instead of a panel over the rail.
     private let notice = SetupNoticePanel()
     private var noticeCandidates: [(dir: String, name: String)] = []
+    /// v2.8: "Open as tab  \u{2318}O" pill at the top-right of a little window.
+    private let littlePill = LittlePillPanel()
+    /// This window is a little window (per the extension's windowRoles): no sidebar, no setup pill.
+    private(set) var isLittle = false
     /// Global on/off (set by the manager). While off, nothing of ours is on screen.
     var overlayEnabled = true
 
@@ -126,6 +130,7 @@ final class OverlayController {
         sidebar.onPointerExit = { [weak self] in self?.pointerExited() }
         sidebar.onResize = { [weak self] w in self?.liveResize(to: w) }
         notice.onDismissed = { [weak self] in self?.updateNotice() }
+        littlePill.onClick = { [weak self] in self?.promoteLittle() }
         sidebar.onResizeEnded = { [weak self] in
             guard let self = self else { return }
             self.resizing = false
@@ -165,6 +170,7 @@ final class OverlayController {
         captureTimer = nil
         sidebar.teardown()
         notice.teardown()
+        littlePill.teardown()
     }
 
     func attach(_ mapping: WindowMapper.Mapping?) {
@@ -176,7 +182,7 @@ final class OverlayController {
             if bridge !== m.bridge || chromeWindowId != m.windowId {
                 bridge = m.bridge
                 chromeWindowId = m.windowId
-                sidebar.connect(bridge: m.bridge, windowId: m.windowId)
+                if !isLittle { sidebar.connect(bridge: m.bridge, windowId: m.windowId) }
             }
         } else {
             if bridge != nil || chromeWindowId != nil {
@@ -191,6 +197,49 @@ final class OverlayController {
         // The sidebar is only ever shown for a window mapped to a live connection.
         if computeVisible() != visible { update(window: window, chromeFrontmost: chromeFrontmost) }
         updateNotice()
+        updateLittlePill()
+    }
+
+    // MARK: Little windows (v2.8)
+
+    /// Manager: whether this window is a little window. Little windows never show the sidebar or the setup pill.
+    func setLittle(_ on: Bool) {
+        if isLittle == on { return }
+        isLittle = on
+        Log.write("window \(key): \(on ? "little window" : "regular window")")
+        if on {
+            visible = false
+            hideAll()
+            notice.hide()
+        } else if let b = bridge, let id = chromeWindowId, !b.closed {
+            sidebar.connect(bridge: b, windowId: id)
+            visible = computeVisible()
+            if visible { rescan(reason: "no longer little") }
+        }
+        updateNotice()
+        updateLittlePill()
+    }
+
+    private func promoteLittle() {
+        guard isLittle, let b = bridge, !b.closed, let id = chromeWindowId else { return }
+        LittleLinks.promote(bridge: b, windowId: id)
+    }
+
+    /// Top-right pill: 8 pt from the window's right edge, below Chrome's title bar.
+    private func layoutLittlePill(in frame: CGRect) {
+        let size = littlePill.pillSize
+        let ax = CGRect(x: frame.maxX - 8 - size.width, y: frame.minY + 40, width: size.width, height: size.height)
+        let ns = Geometry.flip(ax)
+        if littlePill.frame != ns { littlePill.setFrame(ns, display: true) }
+    }
+
+    private func updateLittlePill() {
+        guard isLittle, window.visible, liveMapped else {
+            littlePill.hide()
+            return
+        }
+        layoutLittlePill(in: window.frame)
+        orderAbove(littlePill)
     }
 
     /// Mapped to an extension window whose connection is live.
@@ -201,7 +250,7 @@ final class OverlayController {
 
     /// The sidebar panel may be on screen: Chrome window visible and supported, overlay on, live mapping.
     private func computeVisible() -> Bool {
-        window.visible && !unsupported && overlayEnabled && liveMapped
+        window.visible && !unsupported && overlayEnabled && liveMapped && !isLittle
     }
 
     /// Manager: the global `overlayEnabled` changed. Hides everything, or resumes (the update rescans the rail).
@@ -302,7 +351,7 @@ final class OverlayController {
     /// extension (see `applySetup`), the overlay on, and not dismissed for that profile.
     private func updateNotice() {
         let cands = noticeCandidates.filter { !SetupNoticePanel.isDismissed($0.dir) }
-        guard overlayEnabled, window.visible, !unsupported, !liveMapped, !cands.isEmpty else {
+        guard overlayEnabled, window.visible, !unsupported, !liveMapped, !isLittle, !cands.isEmpty else {
             notice.hide()
             return
         }
@@ -316,7 +365,10 @@ final class OverlayController {
         window = w
         chromeFrontmost = f
         visible = computeVisible()
-        defer { updateNotice() }
+        defer {
+            updateNotice()
+            updateLittlePill()
+        }
         if !visible {
             hideAll()
             return
@@ -670,6 +722,7 @@ final class OverlayController {
     /// Display-link frame: `real` is the window-server bounds, `mouse` is in NSEvent (bottom-left) coordinates.
     func followTick(real: CGRect?, mouse: NSPoint) {
         if notice.isVisible, let r = real, drag == nil { layoutNotice(in: r) }
+        if littlePill.isVisible, let r = real, drag == nil { layoutLittlePill(in: r) }
         guard visible, let r = real else { return }
         if drag != nil {
             advance(mouse: topLeft(mouse), tick: true, real: r)

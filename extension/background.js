@@ -30,7 +30,7 @@ async function sget(area, key, def) {
   } catch { return def; }
 }
 const getBindings = () => sget('session', 'bindings', {});
-const setBindings = (b) => chrome.storage.session.set({ bindings: b });
+const setBindings = async (b) => { await chrome.storage.session.set({ bindings: b }); scheduleBoundSave(); };
 const getLast = () => sget('local', 'lastActive', {});
 const setLast = (l) => chrome.storage.local.set({ lastActive: l });
 const getArchive = () => sget('local', 'archive', []);
@@ -226,8 +226,10 @@ async function rebuildBindings() {
   const bindings = await getBindings();
   let wins = [];
   try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ['normal'] }); } catch { /* ignore */ }
+  const little = await littleIds();
   let changed = false;
   for (const w of wins) {
+    if (little.has(w.id)) continue;
     const tabs = w.tabs || [];
     const used = new Set();
     for (const t of tabs) if (bindings[t.id]) used.add(bindings[t.id]);
@@ -301,7 +303,8 @@ async function sweep() {
     wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
   } catch { return { archived: 0, closed: 0 }; }
   const archiveGrouped = await sget('sync', 'archiveGrouped', false);
-  const normal = new Set(wins.filter((w) => w.type === 'normal' && !w.incognito).map((w) => w.id));
+  const little = await littleIds();
+  const normal = new Set(wins.filter((w) => w.type === 'normal' && !w.incognito && !little.has(w.id)).map((w) => w.id));
   const bindings = await getBindings();
   const locks = await getLocks();
   const stored = await getLast();
@@ -323,7 +326,9 @@ async function sweep() {
   if (changed) await setLast(last);
   const archived = await addToArchive(toArchive);
   await removeTabs([...toArchive, ...toClose].map((t) => t.id));
-  return { archived, closed: toClose.length };
+  let expired = 0;
+  try { expired = await expireTemporary(); } catch (e) { console.warn('[sidebar] temporary expiry failed', e); }
+  return { archived, closed: toClose.length, expired };
 }
 
 // ---------------------------------------------------------------- native helper
@@ -371,6 +376,7 @@ async function handshake(p) {
       await chrome.storage.local.set({ globalDefaultMinutes: r.settings.archiveDefaultMinutes });
     }
     if (r.settings) await storeOverlayEnabled(r.settings.overlayEnabled);
+    if (r.settings && typeof r.settings.defaultBrowser === 'boolean') await chrome.storage.local.set({ defaultBrowser: r.settings.defaultBrowser });
     const dir = await resolveProfileDir(profiles);
     await enqueue(() => setHelper({ status: 'connected', error: undefined, profiles, currentProfileDir: dir }));
     if (dir) { try { await nreq({ type: 'identify', profileDir: dir }); } catch (e) { console.warn('identify failed', e); } }
@@ -416,14 +422,17 @@ function onHelperMessage(m) {
     enqueue(() => setHelper({ profiles: m.profiles })).catch(() => {});
   }
   else if (m.type === 'overlayEnabled' && !m.requestId) storeOverlayEnabled(m.enabled).catch(() => {});
+  else if (m.type === 'defaultBrowser' && typeof m.enabled === 'boolean') chrome.storage.local.set({ defaultBrowser: m.enabled }).catch(() => {});
   else if (m.type === 'settings' && m.settings && typeof m.settings.archiveDefaultMinutes === 'number') {
     chrome.storage.local.set({ globalDefaultMinutes: m.settings.archiveDefaultMinutes }).catch(() => {});
+    if (typeof m.settings.defaultBrowser === 'boolean') chrome.storage.local.set({ defaultBrowser: m.settings.defaultBrowser }).catch(() => {});
   }
 }
 
 async function activateWindow(bounds) {
   let win = null;
   try { win = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }); } catch { /* none */ }
+  if (win && (await littleIds()).has(win.id)) win = await pickNormalWindow();   // v2.8: never raise a little window as "the" Chrome window
   if (!win || win.type !== 'normal') {
     try { await chrome.windows.create({ focused: true }); } catch { /* ignore */ }
     return;
@@ -454,7 +463,8 @@ let snapTimer = null;
 async function liveNormalIds() {
   try {
     const ws = await chrome.windows.getAll({ windowTypes: ['normal'] });
-    return ws.filter((w) => w.type === 'normal' && !w.incognito).map((w) => w.id).sort((a, b) => a - b);
+    const little = await littleIds();   // v2.8: regular-style little windows are normal windows, but never main / pop-out / merge candidates
+    return ws.filter((w) => w.type === 'normal' && !w.incognito && !little.has(w.id)).map((w) => w.id).sort((a, b) => a - b);
   } catch { return null; }
 }
 
@@ -500,8 +510,10 @@ async function rebuildSnapshot() {
   const snaps = {};
   for (const [k, v] of Object.entries(old)) if (k !== 'groups' && Array.isArray(v)) snaps[k] = v;   // keep windows we can't see (closing)
   const used = {};
+  const little = await littleIds();
   for (const w of wins) {
     if (w.type !== 'normal' || w.incognito || closingWindows.has(w.id)) continue;
+    if (little.has(w.id)) { delete snaps[w.id]; continue; }   // v2.8: little windows are never snapshotted / merged back
     if (mergingWindows.has(w.id)) { delete snaps[w.id]; continue; }   // v2.5: a window being emptied by a merge has no snapshot
     const list = [];
     for (const t of (w.tabs || []).slice().sort((a, b) => a.index - b.index)) {
@@ -731,9 +743,11 @@ async function boot() {
   if (bindings === undefined) { await setBindings({}); await rebuildBindings(); }
   else await pruneBindings();
   connectHelper();
+  await reconcileLittle();
   await seedWindowOrder();
   await resolveMain();
   await rebuildSnapshot();
+  scheduleBoundSave(1500);
   try { for (const t of await chrome.tabs.query({})) noteFavicon(t); } catch { /* ignore */ }
 }
 
@@ -819,8 +833,258 @@ function siteOf(url) {
   return { key, name: first.charAt(0).toUpperCase() + first.slice(1) };
 }
 
+// ---------------------------------------------------------------- v2.8: little windows + the Temporary list
+// storage.local.temporary = [{ id, url, title, favIconUrl, createdAt, lastUsedAt, tabId|null, windowId|null, scrollY }] newest first (SW-owned,
+// written inside the write queue; never for incognito). storage.session.littleWindows = { [windowId]: entryId } says which windows are little.
+const TEMP_CAP = 200;
+const LITTLE_W = 760;
+const LITTLE_H = 620;
+const searchPageUrl = () => chrome.runtime.getURL('littlesearch.html');
+const isSearchUrl = (u) => typeof u === 'string' && u.startsWith(searchPageUrl());
+const getTemp = () => sget('local', 'temporary', []);
+const getLittleMap = () => sget('session', 'littleWindows', {});
+const setLittleMap = (m) => chrome.storage.session.set({ littleWindows: m });
+async function littleIds() { return new Set(Object.keys(await getLittleMap()).map(Number)); }
+async function setTemp(list) {
+  let keep = list;
+  if (list.length > TEMP_CAP) {   // overflow is archived rather than lost
+    keep = list.slice(0, TEMP_CAP);
+    await archiveTemporary(list.slice(TEMP_CAP));
+  }
+  await chrome.storage.local.set({ temporary: keep });
+}
+async function littleSettings() {
+  const style = (await sget('sync', 'littleStyle', 'minimal')) === 'regular' ? 'regular' : 'minimal';
+  const mo = Number(await sget('sync', 'littleMaxOpen', 3));
+  const tm = await sget('sync', 'temporaryMinutes', 360);
+  return { style, maxOpen: Number.isFinite(mo) ? Math.min(5, Math.max(1, Math.round(mo))) : 3, minutes: typeof tm === 'number' && tm >= 0 ? tm : 360 };
+}
+const okLittleUrl = (u) => { try { return /^(https?:|file:|ftp:)$/i.test(new URL(u).protocol) || isSearchUrl(u); } catch { return false; } };
+
+async function archiveTemporary(entries) {
+  const now = Date.now();
+  const out = [];
+  for (const e of entries) {
+    if (!e || !e.url || isBlankUrl(e.url) || isSearchUrl(e.url)) continue;
+    out.push({ id: crypto.randomUUID(), url: e.url, title: e.title || e.url, favIconUrl: e.favIconUrl || '', archivedAt: now, source: 'temporary' });
+  }
+  if (!out.length) return 0;
+  await setArchive([...out.reverse(), ...(await getArchive())]);
+  return out.length;
+}
+
+async function readScrollY(tabId) {
+  try {
+    const r = await chrome.scripting.executeScript({ target: { tabId }, func: () => window.scrollY });
+    const y = r && r[0] && r[0].result;
+    return Number.isFinite(y) && y > 0 ? Math.round(y) : 0;
+  } catch { return 0; }
+}
+// Not awaited by callers (it must not hold the write queue): wait for the page to load, then scroll.
+function restoreScrollLater(tabId, y) {
+  if (!(y > 0)) return;
+  (async () => {
+    for (let i = 0; i < 60; i++) {
+      let t = null;
+      try { t = await chrome.tabs.get(tabId); } catch { return; }
+      if (t.status === 'complete') {
+        try { await chrome.scripting.executeScript({ target: { tabId }, func: (yy) => window.scrollTo(0, yy), args: [y] }); } catch { /* ignore */ }
+        return;
+      }
+      await sleep(250);
+    }
+  })().catch(() => {});
+}
+const closeWindowQuiet = async (id) => { try { await chrome.windows.remove(id); } catch { /* gone */ } };
+const windowOrNull = async (id) => { try { return id == null ? null : await chrome.windows.get(id); } catch { return null; } };
+
+// A normal, non-incognito, non-little window to centre on / promote into.
+async function pickNormalWindow() {
+  let wins = [];
+  try { wins = await chrome.windows.getAll({ windowTypes: ['normal'] }); } catch { return null; }
+  const little = await littleIds();
+  const ok = wins.filter((w) => w.type === 'normal' && !w.incognito && !little.has(w.id));
+  if (!ok.length) return null;
+  const f = ok.find((w) => w.focused);
+  if (f) return f;
+  let main = null;
+  try { main = (await resolveMain()).main; } catch { /* ignore */ }
+  return ok.find((w) => w.id === main) || ok[0];
+}
+
+async function littleBounds(b) {
+  const W = Number.isFinite(b && b.width) && b.width > 100 ? Math.round(b.width) : LITTLE_W;
+  const H = Number.isFinite(b && b.height) && b.height > 100 ? Math.round(b.height) : LITTLE_H;
+  let left = Number.isFinite(b && b.left) ? Math.round(b.left) : null;
+  let top = Number.isFinite(b && b.top) ? Math.round(b.top) : null;
+  if (left === null || top === null) {
+    let ref = null;
+    try { ref = await pickNormalWindow(); } catch { /* ignore */ }
+    if (ref && Number.isFinite(ref.left) && Number.isFinite(ref.width)) {
+      left = Math.max(0, Math.round(ref.left + (ref.width - W) / 2));
+      top = Math.max(0, Math.round(ref.top + (ref.height - H) / 2));
+    }
+  }
+  const o = { width: W, height: H };
+  if (left !== null && top !== null) { o.left = left; o.top = top; }
+  return o;
+}
+
+// Close the least recently used little windows beyond the limit (their entries stay in the list, parked).
+async function enforceLittleMax(keepId) {
+  const { maxOpen } = await littleSettings();
+  const temp = await getTemp();
+  const map = await getLittleMap();
+  const open = temp.filter((e) => e.windowId != null && String(e.windowId) in map);
+  const extra = open.length - maxOpen;
+  if (extra <= 0) return;
+  const victims = open.filter((e) => e.id !== keepId).sort((a, b) => (a.lastUsedAt || 0) - (b.lastUsedAt || 0)).slice(0, extra);
+  for (const v of victims) await closeWindowQuiet(v.windowId);
+}
+
+// windows.onRemoved for a little window: the entry stays (url/title kept, window/tab detached); an unused search window leaves no entry.
+async function onLittleClosed(windowId) {
+  const map = await getLittleMap();
+  delete map[windowId];
+  await setLittleMap(map);
+  const temp = await getTemp();
+  let changed = false;
+  const next = [];
+  for (const e of temp) {
+    if (e.windowId === windowId) {
+      changed = true;
+      if (isSearchUrl(e.url)) continue;
+      next.push({ ...e, windowId: null, tabId: null });
+    } else next.push(e);
+  }
+  if (changed) await setTemp(next);
+}
+
+// Drop state that points at windows which no longer exist (after a browser restart window ids are reused).
+async function reconcileLittle() {
+  let wins = [];
+  try { wins = await chrome.windows.getAll(); } catch { return; }
+  const live = new Set(wins.map((w) => w.id));
+  const map = await getLittleMap();
+  let mapChanged = false;
+  for (const k of Object.keys(map)) if (!live.has(Number(k))) { delete map[k]; mapChanged = true; }
+  if (mapChanged) await setLittleMap(map);
+  const temp = await getTemp();
+  let changed = false;
+  const next = [];
+  for (const e of temp) {
+    if (e.windowId != null && map[e.windowId] !== e.id) {
+      changed = true;
+      if (isSearchUrl(e.url)) continue;
+      next.push({ ...e, windowId: null, tabId: null });
+    } else if (e.windowId == null && isSearchUrl(e.url)) changed = true;
+    else next.push(e);
+  }
+  if (changed) await setTemp(next);
+}
+
+async function expireTemporary() {
+  const { minutes } = await littleSettings();
+  if (!minutes) return 0;
+  const temp = await getTemp();
+  const now = Date.now();
+  const old = temp.filter((e) => now - (e.lastUsedAt || e.createdAt || now) > minutes * 60000);
+  if (!old.length) return 0;
+  await setTemp(temp.filter((e) => !old.includes(e)));
+  const n = await archiveTemporary(old);
+  for (const e of old) if (e.windowId != null) await closeWindowQuiet(e.windowId);
+  return n;
+}
+
+// tab navigation inside a little window keeps its entry current
+async function trackLittleTab(tabId, windowId, change, tab) {
+  const map = await getLittleMap();
+  if (!(String(windowId) in map)) return;
+  const temp = await getTemp();
+  const e = temp.find((x) => x.tabId === tabId);
+  if (!e) return;
+  let changed = false;
+  const url = tab.url || tab.pendingUrl || '';
+  if ('url' in change && url && url !== e.url) { e.url = url; e.lastUsedAt = Date.now(); changed = true; }
+  if (('title' in change || 'url' in change) && typeof tab.title === 'string' && tab.title && tab.title !== e.title) { e.title = tab.title; changed = true; }
+  if ('favIconUrl' in change && change.favIconUrl && change.favIconUrl !== e.favIconUrl && !/^chrome(-extension)?:/i.test(change.favIconUrl)) { e.favIconUrl = change.favIconUrl; changed = true; }
+  if (changed) await setTemp(temp);
+}
+
+// ---------------------------------------------------------------- v2.8: pinned tabs come back where they were after a Chrome restart
+// storage.local.boundTabs = [{ bookmarkId, url (the bound tab's current URL), windowIndex, index }], SW-owned and debounced.
+// It is only read at browser startup (the restore window: session flag boundRestore, ~10 s) and never navigates tabs during a session.
+let boundSaveTimer = null;
+let boundHoldUntil = 0;
+function scheduleBoundSave(delay = 700) {
+  clearTimeout(boundSaveTimer);
+  boundSaveTimer = setTimeout(() => enqueue(saveBoundTabs).catch(() => {}), delay);
+}
+async function normalWindowsForBound() {
+  let wins = [];
+  try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ['normal'] }); } catch { return null; }
+  const little = await littleIds();
+  return wins.filter((w) => w.type === 'normal' && !w.incognito && !little.has(w.id)).sort((a, b) => a.id - b.id);
+}
+async function saveBoundTabs() {
+  if (await sget('session', 'boundRestore', false)) return;   // startup restore in progress: keep the stored records untouched
+  if (Date.now() < boundHoldUntil) { scheduleBoundSave(boundHoldUntil - Date.now() + 500); return; }
+  const wins = await normalWindowsForBound();
+  if (!wins || !wins.length) return;   // Chrome is quitting
+  const b = await getBindings();
+  const out = [];
+  wins.forEach((w, wi) => {
+    for (const t of (w.tabs || []).slice().sort((x, y) => x.index - y.index)) {
+      if (b[t.id]) out.push({ bookmarkId: b[t.id], url: t.url || t.pendingUrl || '', windowIndex: wi, index: t.index });
+    }
+  });
+  const cur = await sget('local', 'boundTabs', []);
+  if (JSON.stringify(cur) !== JSON.stringify(out)) await chrome.storage.local.set({ boundTabs: out });
+}
+async function beginBoundRestore() {
+  await chrome.storage.session.set({ boundRestore: true, boundPending: await sget('local', 'boundTabs', []) });
+}
+async function restoreBoundTabs(final) {
+  if (!(await sget('session', 'boundRestore', false))) return;
+  const pending = await sget('session', 'boundPending', []);
+  const reset = (await sget('sync', 'pinnedResetOnRestart', true)) !== false;
+  const left = [];
+  if (pending.length) {
+    const leaves = await sidebarLeaves();
+    const bindings = await getBindings();
+    const wins = (await normalWindowsForBound()) || [];
+    const claimed = new Set(Object.keys(bindings).map(Number));
+    let changed = false;
+    for (const rec of pending) {
+      const bm = leaves.find((l) => l.id === rec.bookmarkId);
+      if (!bm) continue;   // the bookmark is gone
+      let best = null;
+      wins.forEach((w, wi) => {
+        if ((w.tabs || []).some((t) => bindings[t.id] === bm.id)) return;   // this window already has a tab for that item
+        for (const t of w.tabs || []) {
+          if (claimed.has(t.id) || (t.url || t.pendingUrl || '') !== rec.url) continue;
+          const score = (wi === rec.windowIndex ? 0 : 100000) + Math.abs(t.index - (rec.index || 0));
+          if (!best || score < best.score) best = { t, score };
+        }
+      });
+      if (!best) { left.push(rec); continue; }
+      bindings[best.t.id] = bm.id;
+      claimed.add(best.t.id);
+      changed = true;
+      if (reset && (best.t.url || best.t.pendingUrl || '') !== bm.url) {
+        try { await chrome.tabs.update(best.t.id, { url: bm.url }); } catch (e) { console.warn('[sidebar] pinned reset failed', e && e.message); }
+      }
+    }
+    if (changed) await setBindings(bindings);
+  }
+  if (final) {
+    await chrome.storage.session.remove(['boundRestore', 'boundPending']);
+    scheduleBoundSave(300);
+  } else await chrome.storage.session.set({ boundPending: left });
+}
+
 // ---------------------------------------------------------------- commands
-const unqueued = new Set(['switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle', 'setOverlayEnabled']);
+const unqueued = new Set(['switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle', 'setOverlayEnabled', 'setDefaultBrowser']);
 
 const commands = {
   async ensureRoots() {
@@ -1354,8 +1618,161 @@ const commands = {
     return { ok: true, locked: !!locked };
   },
 
-  // Test hook: run the startup re-attach (names + locks by URL) in the given mode.
+  // ---- v2.8: little windows and the Temporary list
+  // url: null opens littlesearch.html. bounds {left, top, width, height} come from the app (default 760x620 centred on the main window).
+  async openLittle({ url, bounds, entryId }) {
+    const st = await littleSettings();
+    const target = url == null ? searchPageUrl() : String(url);
+    if (!okLittleUrl(target)) return { ok: false, error: 'This link can’t be opened in a little window' };
+    const now = Date.now();
+    let temp = await getTemp();
+    const map = await getLittleMap();
+    let entry = entryId ? temp.find((e) => e.id === entryId) : (url != null ? temp.find((e) => e.url === target) : null);
+    if (entry && entry.windowId != null && String(entry.windowId) in map && await windowOrNull(entry.windowId)) {
+      // already open: just bring it forward
+      entry.lastUsedAt = now;
+      await setTemp(temp);
+      try { await chrome.windows.update(entry.windowId, { focused: true }); } catch { /* ignore */ }
+      return { ok: true, windowId: entry.windowId, tabId: entry.tabId, entryId: entry.id, existing: true };
+    }
+    const geo = await littleBounds(bounds);
+    const win = await chrome.windows.create({ url: target, type: st.style === 'regular' ? 'normal' : 'popup', focused: true, ...geo });
+    let tab = win.tabs && win.tabs[0];
+    if (!tab) { try { tab = (await chrome.tabs.query({ windowId: win.id }))[0]; } catch { /* ignore */ } }
+    temp = await getTemp();
+    entry = entry ? temp.find((e) => e.id === entry.id) : null;
+    if (!entry) {
+      entry = { id: crypto.randomUUID(), url: target, title: isSearchUrl(target) ? 'New little window' : '', favIconUrl: '', createdAt: now, lastUsedAt: now, tabId: null, windowId: null, scrollY: 0 };
+      temp.unshift(entry);
+    }
+    entry.tabId = tab ? tab.id : null;
+    entry.windowId = win.id;
+    entry.lastUsedAt = now;
+    const map2 = await getLittleMap();
+    map2[win.id] = entry.id;
+    await setLittleMap(map2);
+    await setTemp(temp);
+    await enforceLittleMax(entry.id);
+    return { ok: true, windowId: win.id, tabId: entry.tabId, entryId: entry.id };
+  },
+
+  // Make a Temporary link an ordinary Today tab in the main window. Regular little windows move the live tab; popups can't move, so the
+  // URL is reopened in the main window (scroll position carried over).
+  async promoteLittle({ entryId, windowId }) {
+    const temp = await getTemp();
+    // Sidebar.app only knows Chrome window ids (pill / ⌘O), so accept either.
+    const e = temp.find((x) => (entryId != null && x.id === entryId) || (entryId == null && windowId != null && x.windowId === windowId));
+    if (e) entryId = e.id;
+    if (!e) return { ok: false, error: 'No such temporary link' };
+    let target = null;
+    try { target = (await resolveMain()).main; } catch { /* ignore */ }
+    if (target == null) { const w = await pickNormalWindow(); target = w ? w.id : null; }
+    const win = await windowOrNull(e.windowId);
+    let tab = null;
+    try { tab = e.tabId != null ? await chrome.tabs.get(e.tabId) : null; } catch { /* gone */ }
+    await setTemp(temp.filter((x) => x.id !== entryId));
+    if (win && tab && win.type === 'normal') {
+      let wid = target;
+      if (wid == null) { const nw = await chrome.windows.create({ tabId: tab.id, focused: true }); wid = nw.id; }
+      else {
+        await chrome.tabs.move(tab.id, { windowId: wid, index: -1 });
+        await chrome.tabs.update(tab.id, { active: true });
+        try { await chrome.windows.update(wid, { focused: true }); } catch { /* ignore */ }
+      }
+      await touch([tab.id]);
+      await sleep(150);
+      if (await windowOrNull(win.id)) await closeWindowQuiet(win.id);   // Chrome closes an emptied window by itself
+      return { ok: true, tabId: tab.id, windowId: wid, moved: true };
+    }
+    const y = (tab ? await readScrollY(tab.id) : 0) || e.scrollY || 0;
+    const url = (tab && (tab.url || tab.pendingUrl)) || e.url;
+    let nt;
+    if (target != null) {
+      nt = await chrome.tabs.create({ windowId: target, url, active: true });
+      try { await chrome.windows.update(target, { focused: true }); } catch { /* ignore */ }
+    } else {
+      const nw = await chrome.windows.create({ url, focused: true });
+      nt = nw.tabs && nw.tabs[0];
+    }
+    if (nt) { await touch([nt.id]); restoreScrollLater(nt.id, y); }
+    if (win) await closeWindowQuiet(win.id);
+    return { ok: true, tabId: nt ? nt.id : null, windowId: nt ? nt.windowId : target, moved: false };
+  },
+
+  async reopenLittle({ entryId }) {
+    const temp = await getTemp();
+    const e = temp.find((x) => x.id === entryId);
+    if (!e) return { ok: false, error: 'No such temporary link' };
+    const map = await getLittleMap();
+    if (e.windowId != null && String(e.windowId) in map && await windowOrNull(e.windowId)) {
+      e.lastUsedAt = Date.now();
+      await setTemp(temp);
+      try { await chrome.windows.update(e.windowId, { focused: true }); } catch { /* ignore */ }
+      return { ok: true, windowId: e.windowId, tabId: e.tabId, entryId: e.id };
+    }
+    return await commands.openLittle({ url: e.url, entryId: e.id });
+  },
+
+  async removeTemporary({ entryId }) {
+    const temp = await getTemp();
+    const e = temp.find((x) => x.id === entryId);
+    if (!e) return { ok: false, error: 'No such temporary link' };
+    await setTemp(temp.filter((x) => x.id !== entryId));
+    const archived = await archiveTemporary([e]);
+    if (e.windowId != null) await closeWindowQuiet(e.windowId);
+    return { ok: true, archived };
+  },
+
+  async clearTemporary() {
+    const temp = await getTemp();
+    if (!temp.length) return { ok: true, archived: 0 };
+    await setTemp([]);
+    const archived = await archiveTemporary(temp);
+    for (const e of temp) if (e.windowId != null) await closeWindowQuiet(e.windowId);
+    return { ok: true, archived };
+  },
+
+  // Park a tab in the Temporary list: its URL, title, favicon and scroll position are kept and the tab closes (no little window opens).
+  async moveToTemporary({ tabId }) {
+    let tab;
+    try { tab = await chrome.tabs.get(tabId); } catch { return { ok: false, error: 'No such tab' }; }
+    if (tab.incognito) return { ok: false, error: 'Incognito tabs can’t be moved to Temporary' };
+    const url = tab.url || tab.pendingUrl || '';
+    if (!url || isBlankUrl(url) || isSearchUrl(url)) return { ok: false, error: 'This tab has nothing to keep' };
+    if ((await getBindings())[tabId]) return { ok: false, error: 'Pinned and favourite tabs can’t be moved to Temporary' };
+    if ((await getLocks())[tabId]) return { ok: false, error: 'Unlock the tab first' };
+    if ((await littleIds()).has(tab.windowId)) return { ok: false, error: 'This tab is already in a little window' };
+    const scrollY = await readScrollY(tabId);
+    const now = Date.now();
+    const temp = (await getTemp()).filter((e) => !(e.windowId == null && e.url === url));   // parking the same page twice keeps one entry
+    temp.unshift({ id: crypto.randomUUID(), url, title: tab.title || '', favIconUrl: tab.favIconUrl || '', createdAt: now, lastUsedAt: now, tabId: null, windowId: null, scrollY });
+    await setTemp(temp);
+    try {
+      if ((await chrome.tabs.query({ windowId: tab.windowId })).length === 1) await chrome.tabs.create({ windowId: tab.windowId, active: true });
+    } catch (e) { console.warn('[sidebar] new tab', e && e.message); }
+    await removeTabs([tabId]);
+    return { ok: true, entryId: temp[0].id };
+  },
+
+  async setDefaultBrowser({ enabled }) {
+    if (!helperConnected()) return { ok: false, error: 'Sidebar.app isn’t running' };
+    try {
+      const r = await nreq({ type: 'setDefaultBrowser', enabled: !!enabled }, 20000);
+      if (r && typeof r.enabled === 'boolean') await chrome.storage.local.set({ defaultBrowser: r.enabled });
+      return { ok: !!(r && r.ok !== false && !r.error), enabled: r && r.enabled, error: (r && r.error) || undefined };
+    } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+  },
+
+  // Test hook: run the startup re-attach (names + locks by URL) in the given mode. Mode "startup" replays what a Chrome restart does to
+  // pinned tabs: bindings are cleared, then the stored boundTabs records are matched to the (restored) tabs and reset.
   async debugRematch({ mode }) {
+    if (mode === 'startup') {
+      await beginBoundRestore();
+      await setBindings({});
+      await restoreBoundTabs(true);
+      await rebuildBindings();
+      return { ok: true };
+    }
     await rematchTabState(mode || 'retry');
     return { ok: true };
   },
@@ -1417,6 +1834,9 @@ const commands = {
       windows,
       groups,
       splitSupported: SPLIT_OK,
+      temporary: await getTemp(),
+      littleWindows: await getLittleMap(),
+      boundTabs: await sget('local', 'boundTabs', []),
       tabNames: await getTabNames(),
       lockedTabs: await getLocks(),
       incognitoAllowed: await incognitoAllowed(),
@@ -1433,7 +1853,10 @@ const commands = {
         mergeOnClose: await sget('sync', 'mergeOnClose', true),
         effectiveMinutes: await archiveThreshold(),
         overlayEnabled: (await sget('local', 'overlayEnabled', true)) !== false,
-        appEverConnected: !!(await sget('local', 'appEverConnected', false))
+        appEverConnected: !!(await sget('local', 'appEverConnected', false)),
+        defaultBrowser: !!(await sget('local', 'defaultBrowser', false)),
+        pinnedResetOnRestart: (await sget('sync', 'pinnedResetOnRestart', true)) !== false,
+        ...(await littleSettings())
       },
       contextMenus: Object.values(menuItems),
       badge: { text: await chrome.action.getBadgeText({}).catch(() => null), title: await chrome.action.getTitle({}).catch(() => null) }
@@ -1450,6 +1873,7 @@ chrome.runtime.onInstalled.addListener(() => {
     await rebuildBindings();
     connectHelper();
     await chrome.storage.session.remove(['windowSnapshots', 'windowOrder', 'mainWindowId', 'lastMerge']);
+    await reconcileLittle();
     await seedWindowOrder();
     await resolveMain();
     await rebuildSnapshot();
@@ -1458,20 +1882,23 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.runtime.onStartup.addListener(() => {
   enqueue(async () => {
+    await beginBoundRestore();   // v2.8: before bindings are cleared, so saves stay off and the stored records survive
     await rematchTabState('init');
     await setupCommon();
     await resetAllLastActive();
     await setBindings({});
+    await restoreBoundTabs(false);
     await rebuildBindings();
     connectHelper();
     await chrome.storage.session.remove(['windowSnapshots', 'windowOrder', 'mainWindowId', 'lastMerge']);
+    await reconcileLittle();
     await seedWindowOrder();
     await resolveMain();
     await rebuildSnapshot();
   }).catch(() => {});
   // Session restore may still be creating tabs; the rebuild is purely additive.
   for (const ms of [3000, 10000]) {
-    setTimeout(() => enqueue(rebuildBindings).catch(() => {}), ms);
+    setTimeout(() => enqueue(async () => { await restoreBoundTabs(ms === 10000); await rebuildBindings(); }).catch(() => {}), ms);
     setTimeout(() => enqueue(() => rematchTabState(ms === 10000 ? 'final' : 'retry')).catch(() => {}), ms);
   }
 });
@@ -1495,8 +1922,8 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
 
 chrome.tabs.onRemoved.addListener((tabId, info) => {
   // A tab closed on its own leaves the snapshot at once; tabs of a closing window stay in it.
-  if (info && info.isWindowClosing) closingWindows.add(info.windowId);
-  else { enqueue(() => dropFromSnapshot(tabId, info && info.windowId)).catch(() => {}); scheduleSnapshot(); }
+  if (info && info.isWindowClosing) { closingWindows.add(info.windowId); boundHoldUntil = Date.now() + 3000; }
+  else { enqueue(() => dropFromSnapshot(tabId, info && info.windowId)).catch(() => {}); scheduleSnapshot(); scheduleBoundSave(); }
   enqueue(async () => {
     const last = await getLast();
     if (tabId in last) { delete last[tabId]; await setLast(last); }
@@ -1511,12 +1938,25 @@ chrome.tabs.onRemoved.addListener((tabId, info) => {
 // (it then shows up in Today); otherwise it keeps its binding in the new window.
 chrome.tabs.onAttached.addListener((tabId, info) => {
   scheduleSnapshot();
+  scheduleBoundSave();
   enqueue(async () => {
     const b = await getBindings();
     const bid = b[tabId];
     if (!bid) return;
     const tabs = await chrome.tabs.query({ windowId: info.newWindowId });
     if (tabs.some((t) => t.id !== tabId && b[t.id] === bid)) { delete b[tabId]; await setBindings(b); }
+  }).catch(() => {});
+});
+
+// v2.8: using a little window keeps its Temporary entry fresh
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  enqueue(async () => {
+    const id = (await getLittleMap())[windowId];
+    if (!id) return;
+    const temp = await getTemp();
+    const e = temp.find((x) => x.id === id);
+    if (e) { e.lastUsedAt = Date.now(); await setTemp(temp); }
   }).catch(() => {});
 });
 
@@ -1541,9 +1981,12 @@ chrome.tabs.onDetached.addListener((tabId, info) => {
   enqueue(() => dropFromSnapshot(tabId, info && info.oldWindowId)).catch(() => {});
   scheduleSnapshot();
 });
-chrome.tabs.onMoved.addListener(() => scheduleSnapshot());
+chrome.tabs.onMoved.addListener(() => { scheduleSnapshot(); scheduleBoundSave(); });
+chrome.tabs.onDetached.addListener(() => scheduleBoundSave());
 chrome.tabs.onUpdated.addListener((id, change, tab) => {
   if ('favIconUrl' in change) noteFavicon(tab);
+  if ('url' in change && change.url) scheduleBoundSave();
+  if (!tab.incognito && ('url' in change || 'title' in change || 'favIconUrl' in change)) enqueue(() => trackLittleTab(id, tab.windowId, change, tab)).catch(() => {});
   if ('url' in change && change.url) {
     enqueue(() => refreshTabUrls(id, change.url)).catch(() => {});
   }
@@ -1558,6 +2001,7 @@ if (chrome.tabGroups) {
 chrome.windows.onCreated.addListener((win) => {
   if (!win || win.type !== 'normal' || win.incognito) return;
   enqueue(async () => {
+    if ((await littleIds()).has(win.id)) return;
     const order = await sget('session', 'windowOrder', []);
     if (!order.includes(win.id)) await chrome.storage.session.set({ windowOrder: [...order, win.id] });
     await resolveMain();
@@ -1566,7 +2010,10 @@ chrome.windows.onCreated.addListener((win) => {
 });
 
 chrome.windows.onRemoved.addListener((windowId) => {
-  enqueue(() => onWindowClosed(windowId)).catch((e) => console.warn('[sidebar] window close failed', e));
+  enqueue(async () => {
+    if ((await littleIds()).has(windowId)) { closingWindows.delete(windowId); return onLittleClosed(windowId); }
+    return onWindowClosed(windowId);
+  }).catch((e) => console.warn('[sidebar] window close failed', e));
   enqueue(async () => {
     const abw = await sget('session', 'activeByWindow', {});
     if (windowId in abw) { delete abw[windowId]; await chrome.storage.session.set({ activeByWindow: abw }); }
@@ -1621,7 +2068,8 @@ registerBoostListeners();
 async function windowRoles() {
   let main = null;
   try { main = (await resolveMain()).main; } catch { /* ignore */ }
-  return { mainWindowId: main, mergeOnClose: (await sget('sync', 'mergeOnClose', true)) !== false };
+  const littleWindowIds = [...(await littleIds())].sort((a, b) => a - b);
+  return { mainWindowId: main, mergeOnClose: (await sget('sync', 'mergeOnClose', true)) !== false, littleWindowIds };
 }
 let rolesTimer = null;
 let lastRoles = null;
@@ -1639,7 +2087,7 @@ function scheduleRolesEvent() {
 }
 chrome.storage.onChanged.addListener((changes, area) => {
   const keys = Object.keys(changes);
-  if ((area === 'session' && keys.some((k) => k === 'mainWindowId' || k === 'windowOrder')) || (area === 'sync' && keys.includes('mergeOnClose'))) scheduleRolesEvent();
+  if ((area === 'session' && keys.some((k) => k === 'mainWindowId' || k === 'windowOrder' || k === 'littleWindows')) || (area === 'sync' && keys.includes('mergeOnClose'))) scheduleRolesEvent();
 });
 chrome.windows.onRemoved.addListener(() => setTimeout(scheduleRolesEvent, 300));
 chrome.windows.onCreated.addListener(() => setTimeout(scheduleRolesEvent, 300));

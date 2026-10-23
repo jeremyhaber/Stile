@@ -178,6 +178,13 @@ const S = {
   tabNames: {},
   lockedTabs: {},
   incognito: false,
+  temporary: [],
+  littleIds: new Set(),
+  littleStyle: 'minimal',
+  littleMaxOpen: 3,
+  temporaryMinutes: 360,
+  pinnedReset: true,
+  defaultBrowser: false,
   favCache: {},
   boundAny: new Map(),
   mainWindowId: null,
@@ -209,13 +216,13 @@ let loaded = false;
 
 // ------------------------------------------------------------------ load + derive
 async function load() {
-  const [tabs, wins, groups, ses, loc, syn] = await Promise.all([
+  let [tabs, wins, groups, ses, loc, syn] = await Promise.all([
     chrome.tabs.query({ windowId: S.windowId }).catch(() => []),
     chrome.windows.getAll({ populate: true, windowTypes: ['normal'] }).catch(() => []),
     (chrome.tabGroups ? chrome.tabGroups.query({}).catch(() => []) : Promise.resolve([])),
-    chrome.storage.session.get(['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'incTabNames', 'incLockedTabs']).catch(() => ({})),
-    chrome.storage.local.get(['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs', 'faviconCache', 'appEverConnected', 'overlayEnabled']).catch(() => ({})),
-    chrome.storage.sync.get(['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor']).catch(() => ({}))
+    chrome.storage.session.get(['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'incTabNames', 'incLockedTabs', 'littleWindows']).catch(() => ({})),
+    chrome.storage.local.get(['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs', 'faviconCache', 'appEverConnected', 'overlayEnabled', 'temporary', 'defaultBrowser']).catch(() => ({})),
+    chrome.storage.sync.get(['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor', 'littleStyle', 'littleMaxOpen', 'temporaryMinutes', 'pinnedResetOnRestart']).catch(() => ({}))
   ]);
   let roots = await getRoots().catch(() => null);
   if (!roots && !triedEnsure) {
@@ -239,6 +246,9 @@ async function load() {
     S.incognito = !!(own && own.incognito) || (S.tabs.length > 0 && S.tabs.every((t) => t.incognito));
   }
   const sameWorld = (w) => !!w.incognito === S.incognito;
+  // v2.8: little windows (regular style are 'normal' windows) are never listed as windows of Today
+  S.littleIds = new Set(Object.keys(ses.littleWindows || {}).map(Number));
+  wins = wins.filter((w) => !S.littleIds.has(w.id));
   S.otherWins = wins.filter((w) => w.id !== S.windowId && w.type === 'normal' && sameWorld(w))
     .map((w) => ({ id: w.id, focused: !!w.focused, tabs: (w.tabs || []).slice().sort((a, b) => a.index - b.index) }));
   S.groups = new Map((groups || []).map((g) => [g.id, g]));
@@ -258,6 +268,13 @@ async function load() {
   S.archiveGrouped = !!syn.archiveGrouped;
   S.sidebarColor = normSidebarColor(syn.sidebarColor);
   S.mergeOnClose = syn.mergeOnClose !== false;
+  S.littleStyle = syn.littleStyle === 'regular' ? 'regular' : 'minimal';
+  S.littleMaxOpen = Number.isFinite(Number(syn.littleMaxOpen)) && syn.littleMaxOpen !== undefined ? Math.min(5, Math.max(1, Math.round(Number(syn.littleMaxOpen)))) : 3;
+  S.temporaryMinutes = typeof syn.temporaryMinutes === 'number' && syn.temporaryMinutes >= 0 ? syn.temporaryMinutes : 360;
+  S.pinnedReset = syn.pinnedResetOnRestart !== false;
+  S.defaultBrowser = !!loc.defaultBrowser;
+  // Temporary is per profile and never for incognito; an unused littlesearch.html window is not a link yet
+  S.temporary = S.incognito ? [] : (Array.isArray(loc.temporary) ? loc.temporary : []).filter((e) => e && e.url && !isSearchUrl(e.url));
   S.normalCount = wins.filter((w) => w.type === 'normal' && sameWorld(w)).length;
   {
     const order = Array.isArray(ses.windowOrder) ? ses.windowOrder : [];
@@ -422,7 +439,7 @@ function draw() {
   drawPopoutBar();
   drawOfflineCard();
   // Overlay compact mode is the same DOM as expanded (clipped by the app), so the lists stay drawn behind settings/archive too.
-  if (S.view === 'main' || (OVERLAY && isCompact())) { drawHint(); drawFavs(); drawPinned(); drawToday(); }
+  if (S.view === 'main' || (OVERLAY && isCompact())) { drawHint(); drawFavs(); drawPinned(); drawTemp(); drawToday(); }
   drawFooter();
   if (OVERLAY) postActiveTitle();
   if (S.view === 'archive') drawArchive();
@@ -743,6 +760,74 @@ function setCollapsed(id, v) {
   draw();
 }
 
+// ---- temporary (v2.8): links opened in little windows or parked from Today
+function tempTitle(e) { return e.title || hostOf(e.url) || e.url; }
+function drawTemp() {
+  const sec = $('sec-temp');
+  const list = S.temporary;
+  sec.classList.toggle('sec-empty', !list.length);
+  $('temp-count').textContent = list.length ? String(list.length) : '';
+  $('temp-count').hidden = !list.length;
+  $('temp-list').replaceChildren(...list.map(tempRow));
+}
+
+function tempRow(e) {
+  const open = e.windowId != null && S.littleIds.has(e.windowId);
+  const title = tempTitle(e);
+  const row = h('div', {
+    class: 'row temp-row' + (open ? ' is-open' : ''), role: 'listitem', tabindex: '0', 'data-testid': 'temp-row', 'data-key': 'p' + e.id, 'data-nav': '',
+    'data-entry-id': e.id, 'data-url': e.url, 'data-title': title, 'data-open': open ? 'true' : 'false', title: e.url,
+    onclick: (ev) => { if (!ev.target.closest('.act')) cmd('reopenLittle', { entryId: e.id }); },
+    oncontextmenu: (ev) => { ev.preventDefault(); showTempMenu(ev, e); },
+    onkeydown: (ev) => {
+      if (ev.target !== ev.currentTarget) return;
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); cmd('reopenLittle', { entryId: e.id }); }
+      else if (ev.key === 'Delete' || ev.key === 'Backspace') { ev.preventDefault(); focusNeighbour(row); cmd('removeTemporary', { entryId: e.id }); }
+    }
+  },
+  rbg(),
+  favEl(e.url, e.favIconUrl),
+  h('span', { class: 'title', text: title }),
+  open ? h('span', { class: 'temp-dot', 'data-testid': 'temp-open-dot', title: 'Open in a little window' }) : null,
+  h('button', {
+    type: 'button', class: 'icon-btn act', title: 'Make full tab', 'aria-label': 'Make full tab', 'data-testid': 'temp-promote',
+    onclick: (ev) => { ev.stopPropagation(); promoteTemp(e); }
+  }, icon('arrowUpRight', 14)),
+  h('button', {
+    type: 'button', class: 'icon-btn act close', title: 'Remove (moves to Archive)', 'aria-label': 'Remove', 'data-testid': 'temp-remove',
+    onclick: (ev) => { ev.stopPropagation(); cmd('removeTemporary', { entryId: e.id }); }
+  }, icon('x', 14)));
+  return row;
+}
+
+async function promoteTemp(e) {
+  const r = await cmd('promoteLittle', { entryId: e.id });
+  if (r && !r.ok) toast(r.error || 'Could not open it as a tab');
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch { /* fall through */ }
+  try {
+    const ta = h('textarea', { style: 'position:fixed;opacity:0;left:-1000px' });
+    ta.value = text;
+    document.body.append(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch { return false; }
+}
+
+function showTempMenu(ev, e) {
+  showMenu(ev, [
+    { label: 'Make full tab', action: 'temp-promote', run: () => promoteTemp(e) },
+    { label: 'Open in little window', action: 'temp-open', run: () => cmd('reopenLittle', { entryId: e.id }) },
+    { label: 'Copy link', action: 'temp-copy', run: async () => { if (await copyText(e.url)) toast('Link copied'); } },
+    '-',
+    { label: 'Remove', action: 'temp-remove', danger: true, run: () => cmd('removeTemporary', { entryId: e.id }) }
+  ]);
+}
+
 // ---- today
 function drawToday() {
   const list = $('today');
@@ -947,6 +1032,7 @@ function splitRow(u, act, other) {
   return row;
 }
 
+const isSearchUrl = (u) => typeof u === 'string' && u.startsWith(chrome.runtime.getURL('littlesearch.html'));
 const nameOf = (t) => (t && S.tabNames[t.id] && S.tabNames[t.id].name) || '';
 const isLocked = (t) => !!(t && S.lockedTabs[t.id]);
 const lockBadge = (t) => (isLocked(t) ? h('span', { class: 'badge-ic lock', title: 'Locked', 'data-testid': 'lock-icon' }, icon('lock', 12)) : null);
@@ -1039,6 +1125,7 @@ function drawArchive() {
     },
     favEl(e.url, e.favIconUrl),
     h('span', { class: 'title', text: e.title || e.url }),
+    e.source === 'temporary' ? h('span', { class: 'tag', 'data-testid': 'archive-temp-tag', text: 'Temporary' }) : null,
     h('span', { class: 'sub', text: hostOf(e.url) }),
     h('button', {
       type: 'button', class: 'icon-btn act', title: 'Delete from archive', 'aria-label': 'Delete from archive', 'data-testid': 'archive-delete',
@@ -1111,6 +1198,8 @@ function drawSettings() {
 
   $('set-archive-grouped').checked = S.archiveGrouped;
   $('set-merge-on-close').checked = S.mergeOnClose;
+  $('set-pinned-reset').checked = S.pinnedReset;
+  drawLittleSettings(connected);
   if (OVERLAY) drawAppSettings();
   drawStyleList();
   const profiles = (connected && hs.profiles) || [];
@@ -1136,6 +1225,30 @@ function drawSettings() {
   $('helper-retry').hidden = connected;
   $('field-overlay-enabled').hidden = !connected;
   $('set-overlay-enabled').checked = S.overlayEnabled;
+}
+
+// v2.8: Settings > Little windows
+const TEMP_EXPIRY_CHOICES = [60, 360, 720, 1440, 0];
+function drawLittleSettings(connected) {
+  const cb = $('set-little-default');
+  cb.checked = connected && S.defaultBrowser;
+  cb.disabled = !connected;
+  $('little-default-hint').textContent = connected
+    ? 'Sidebar.app asks macOS to make it your default browser; links it can\u2019t show go to Chrome as usual.'
+    : 'Needs Sidebar.app. Open it, then turn this on.';
+  for (const b of document.querySelectorAll('[data-testid="little-style"] .seg-b')) b.setAttribute('aria-pressed', String(b.dataset.style === S.littleStyle));
+  $('little-style-hint').textContent = S.littleStyle === 'minimal'
+    ? 'Just the page and a slim address bar. \u201cMake full tab\u201d reopens the page in your main window.'
+    : 'A regular Chrome window with toolbar and tabs. \u201cMake full tab\u201d moves the live tab, keeping its page state.';
+  const mx = $('set-little-max');
+  if (!mx.children.length) mx.replaceChildren(...[1, 2, 3, 4, 5].map((n) => h('option', { value: String(n), text: String(n) })));
+  mx.value = String(S.littleMaxOpen);
+  const ex = $('set-temp-expiry');
+  const opts = TEMP_EXPIRY_CHOICES.slice();
+  if (!opts.includes(S.temporaryMinutes)) opts.push(S.temporaryMinutes);
+  const sig = JSON.stringify(opts);
+  if (ex.dataset.sig !== sig) { ex.replaceChildren(...opts.map((v) => h('option', { value: String(v), text: fmtMinutes(v) }))); ex.dataset.sig = sig; }
+  ex.value = String(S.temporaryMinutes);
 }
 
 // v2.7: card shown when the Mac app isn't connected (only once it has connected before, so side-panel-only users aren't nagged).
@@ -1539,6 +1652,10 @@ function showTabMenu(ev, tab, opts = {}) {
   items.push({ label: locked ? 'Unlock tab' : 'Lock tab', action: locked ? 'unlock' : 'lock', run: () => cmd('setTabLock', { tabId: tab.id, locked: !locked }) });
   items.push(
     S.incognito || tab.incognito ? null : { label: 'Archive tab', action: 'archive', run: () => cmd('archiveTab', { tabId: tab.id }) },
+    S.incognito || tab.incognito || locked || S.bindings[tab.id] ? null : { label: 'Move to Temporary', action: 'to-temporary', run: async () => {
+      const r = await cmd('moveToTemporary', { tabId: tab.id });
+      if (r && !r.ok) toast(r.error || 'Could not move it to Temporary');
+    } },
     '-',
     { label: 'Duplicate tab', action: 'duplicate', run: () => safe(chrome.tabs.duplicate(tab.id)) },
     { label: 'Close tab', action: 'close', run: () => safe(chrome.tabs.remove(tab.id)) },
@@ -2024,6 +2141,36 @@ function setupStatic() {
     S.mergeOnClose = e.target.checked;
     chrome.storage.sync.set({ mergeOnClose: e.target.checked }).catch(() => {});
   });
+  $('set-pinned-reset').addEventListener('change', (e) => {
+    S.pinnedReset = e.target.checked;
+    chrome.storage.sync.set({ pinnedResetOnRestart: e.target.checked }).catch(() => {});
+  });
+  $('set-little-default').addEventListener('change', async (e) => {
+    const r = await cmd('setDefaultBrowser', { enabled: e.target.checked });
+    if (!r || !r.ok) toast((r && r.error) || 'Could not change the default browser');
+    scheduleRender();
+  });
+  for (const b of document.querySelectorAll('[data-testid="little-style"] .seg-b')) {
+    b.addEventListener('click', () => {
+      S.littleStyle = b.dataset.style;
+      chrome.storage.sync.set({ littleStyle: S.littleStyle }).catch(() => {});
+      drawLittleSettings(!!(S.helper && S.helper.status === 'connected'));
+    });
+  }
+  $('set-little-max').addEventListener('change', (e) => {
+    S.littleMaxOpen = Number(e.target.value);
+    chrome.storage.sync.set({ littleMaxOpen: S.littleMaxOpen }).catch(() => {});
+  });
+  $('set-temp-expiry').addEventListener('change', (e) => {
+    S.temporaryMinutes = Number(e.target.value);
+    chrome.storage.sync.set({ temporaryMinutes: S.temporaryMinutes }).catch(() => {});
+  });
+  $('temp-clear').addEventListener('click', async () => {
+    const n = S.temporary.length;
+    const r = await cmd('clearTemporary');
+    if (!r || !r.ok) toast((r && r.error) || 'Could not clear Temporary');
+    else if (n) toast(`Archived ${plural(n, 'temporary link')}`);
+  });
   $('popout-merge').addEventListener('click', () => mergeWindowCmd(S.windowId));
   $('popout-bar').addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
@@ -2063,9 +2210,9 @@ function setupListeners() {
   chrome.storage.onChanged.addListener((changes, area) => {
     const keys = Object.keys(changes);
     const rel = {
-      session: ['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'overlayConnected', 'incTabNames', 'incLockedTabs'],
-      local: ['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'roots', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs', 'appEverConnected', 'overlayEnabled'],
-      sync: ['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor']
+      session: ['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'overlayConnected', 'incTabNames', 'incLockedTabs', 'littleWindows'],
+      local: ['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'roots', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs', 'appEverConnected', 'overlayEnabled', 'temporary', 'defaultBrowser'],
+      sync: ['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor', 'littleStyle', 'littleMaxOpen', 'temporaryMinutes', 'pinnedResetOnRestart']
     }[area];
     if (rel && keys.some((k) => rel.includes(k))) {
       // lastActive changes constantly; only the Today list reads it

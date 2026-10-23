@@ -43,6 +43,7 @@ final class OverlayManager {
         }
         closer.chromePid = { [weak self] in self?.tracker.pid ?? 0 }
         closer.focusedWindowKey = { [weak self] in self?.tracker.focusedWindowKey() }
+        closer.onRolesChanged = { [weak self] in self?.applyMapping() }
         closer.ensureTap()
 
         tracker.onUpdate = { [weak self] in self?.trackerUpdated() }
@@ -184,6 +185,7 @@ final class OverlayManager {
                 }
                 c.overlayEnabled = overlayEnabled
                 controllers[w.key] = c
+                c.setLittle(closer.isLittle(mapper.map[w.key]))
                 c.attach(mapper.map[w.key])
             }
             c.isFocusedChromeWindow = (w.key == focusedNow)
@@ -209,13 +211,23 @@ final class OverlayManager {
     }
 
     private func applyMapping() {
-        for (k, c) in controllers { c.attach(mapper.map[k]) }
+        for (k, c) in controllers {
+            c.setLittle(closer.isLittle(mapper.map[k]))
+            c.attach(mapper.map[k])
+        }
         closer.refreshTargets(supportedWindows())
     }
 
-    /// Windows eligible for close interception: everything except unsupported (unmapped incognito etc.) windows.
+    /// Windows eligible for close interception: everything except unsupported (unmapped incognito etc.) windows
+    /// and little windows.
     private func supportedWindows() -> [ChromeWindow] {
-        tracker.windows.filter { controllers[$0.key]?.unsupported != true }
+        tracker.windows.filter { controllers[$0.key]?.unsupported != true && controllers[$0.key]?.isLittle != true }
+    }
+
+    /// The profile of Chrome's most recently focused mapped window (for links from other apps).
+    func preferredBridge() -> ProfileBridge? {
+        if let k = tracker.focusedWindowKey(), let m = mapper.map[k], !m.bridge.closed { return m.bridge }
+        return nil
     }
 
     private func pointerMoved() {

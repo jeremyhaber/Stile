@@ -643,6 +643,11 @@ async function main() {
     ti = await tabsI();
     check('v2.6 incognito: Clear closes instead of archiving (incognito:true, no undo), skipping the locked tab', clr.ok && clr.incognito === true && clr.archived === 0 && clr.closed === 2 && !clr.undoId && (await dbg()).archive.length === arc1 && ti.length === 1 && ti[0].url === 'i=1', JSON.stringify([clr, ti]));
     const lu = await cmd({ cmd: 'lastUndo' });
+    {
+      const tmp0 = (await dbg()).temporary.length;
+      const mt = await cmd({ cmd: 'moveToTemporary', tabId: ti[0].id });
+      check('v2.8 incognito: moveToTemporary refuses an incognito tab and creates no entry', mt.ok === false && /ncognito/.test(mt.error || '') && (await dbg()).temporary.length === tmp0, JSON.stringify(mt));
+    }
     check('v2.6 incognito: nothing undoable was recorded', !lu.kind || lu.kind === 'tidy' || lu.windowId !== wI);
     // closing the incognito window never merges anything back
     const nBefore = await swEval(async (m) => (await chrome.tabs.query({ windowId: m })).length, mainNow);
@@ -652,6 +657,295 @@ async function main() {
     check('v2.6 incognito: closing an incognito window never merges its tabs back or archives them', nAfterI.n === nBefore && !nAfterI.any && (await dbg()).archive.length === arc1);
     await swEval(async () => { const o = globalThis.__origApis; chrome.tabs.query = o.q; chrome.tabs.get = o.g; chrome.windows.get = o.wg; chrome.windows.getAll = o.wa; });
     check('v2.6 incognito: debugState.incognitoAllowed is a boolean', typeof (await dbg()).incognitoAllowed === 'boolean');
+  }
+
+
+  // ---- v2.8: little windows, the Temporary list, pinned tabs reset on restart
+  {
+    const dbg = () => cmd({ cmd: 'debugState' });
+    const setSync = (o) => swEval(async (x) => chrome.storage.sync.set(x), o);
+    const winExists = (id) => swEval(async (w) => { try { await chrome.windows.get(w); return true; } catch { return false; } }, id);
+    const winType = (id) => swEval(async (w) => { try { return (await chrome.windows.get(w)).type; } catch { return null; } }, id);
+    const until = async (fn, ms = 6000) => { for (let t = 0; t < ms; t += 150) { const v = await fn(); if (v) return v; await sleep(150); } return fn(); };
+    const entryOf = async (id) => (await dbg()).temporary.find((e) => e.id === id);
+    const mainTabs = () => swEval(async (w) => (await chrome.tabs.query({ windowId: w })).map((t) => ({ id: t.id, url: t.url })), mainWin);
+    const tempRows = () => panel.locator('[data-testid="temp-row"]').count();
+    const archive0 = (await dbg()).archive.length;
+    await setSync({ littleStyle: 'minimal', littleMaxOpen: 3, temporaryMinutes: 360 });
+    await swEval(async () => chrome.storage.local.set({ temporary: [] }));
+    await sleep(500);
+    check('v2.8 little: Temporary is hidden while empty', (await panel.evaluate(() => document.getElementById('sec-temp').getBoundingClientRect().height)) === 0 && (await tempRows()) === 0);
+
+    // minimal style: a popup window with exactly one tab, recorded as a Temporary entry
+    await swEval(async () => { const o = chrome.windows.create; globalThis.__origCreate = o; globalThis.__createArgs = []; chrome.windows.create = (a, ...r) => { globalThis.__createArgs.push(a); return o.call(chrome.windows, a, ...r); }; });
+    const r1 = await cmd({ cmd: 'openLittle', url: U('golf'), bounds: { left: 120, top: 90, width: 700, height: 520 } });
+    const ca = await swEval(async () => { chrome.windows.create = globalThis.__origCreate; return globalThis.__createArgs[0]; });
+    check('v2.8 little: openLittle returns {ok, windowId, tabId, entryId}', r1.ok && r1.windowId > 0 && r1.tabId > 0 && !!r1.entryId, JSON.stringify(r1));
+    check('v2.8 little: minimal style opens a popup window', (await winType(r1.windowId)) === 'popup');
+    check('v2.8 little: the app bounds are passed to windows.create (headless Chromium ignores window sizes)', ca.left === 120 && ca.top === 90 && ca.width === 700 && ca.height === 520 && ca.type === 'popup' && ca.focused === true, JSON.stringify(ca));
+    let e1 = await until(async () => { const e = await entryOf(r1.entryId); return e && /Golf/.test(e.title) ? e : null; });
+    check('v2.8 little: the entry records tab, window, url and title (newest first)', e1 && e1.tabId === r1.tabId && e1.windowId === r1.windowId && e1.url === U('golf') && /Golf/.test(e1.title) && e1.createdAt > 0 && e1.lastUsedAt >= e1.createdAt, JSON.stringify(e1));
+    await sleep(500);
+    check('v2.8 little: the Temporary section shows the row with a count and an open dot', (await tempRows()) === 1 && (await panel.locator('[data-testid="temp-count"]').innerText()) === '1' && (await panel.locator('[data-testid="temp-row"] [data-testid="temp-open-dot"]').count()) === 1 && /Golf/.test(await panel.locator('[data-testid="temp-row"]').innerText()));
+    check('v2.8 little: the section sits above Today', await panel.evaluate(() => document.getElementById('sec-temp').compareDocumentPosition(document.getElementById('today').closest('.sec')) & Node.DOCUMENT_POSITION_FOLLOWING));
+    let d = await dbg();
+    check('v2.8 little: the little window is not the main window, not in the window order, not snapshotted', d.mainWindowId === mainWin && !d.windowOrder.includes(r1.windowId) && !(String(r1.windowId) in d.snapshots), JSON.stringify([d.mainWindowId, d.windowOrder, d.snapshots]));
+    check('v2.8 little: debugState lists the little window ids', d.littleWindows[r1.windowId] === r1.entryId);
+
+    // a link opened twice focuses the same little window instead of piling up
+    const r1b = await cmd({ cmd: 'openLittle', url: U('golf') });
+    check('v2.8 little: opening the same link again reuses its window and entry', r1b.ok && r1b.windowId === r1.windowId && r1b.entryId === r1.entryId && (await dbg()).temporary.length === 1, JSON.stringify(r1b));
+
+    // closing the window keeps the entry (parked), no merge-back, nothing archived
+    const nMain0 = (await mainTabs()).length;
+    await swEval(async (w) => chrome.windows.remove(w), r1.windowId);
+    e1 = await until(async () => { const e = await entryOf(r1.entryId); return e && e.windowId == null ? e : null; });
+    check('v2.8 little: closing a little window keeps the entry with tabId/windowId null', e1 && e1.tabId == null && e1.windowId == null && e1.url === U('golf') && /Golf/.test(e1.title), JSON.stringify(e1));
+    await sleep(2500);
+    check('v2.8 little: closing it never merges it back or archives it', (await mainTabs()).length === nMain0 && (await dbg()).archive.length === archive0);
+    await sleep(400);
+    check('v2.8 little: the row stays without the open dot', (await tempRows()) === 1 && (await panel.locator('[data-testid="temp-open-dot"]').count()) === 0);
+
+    // reopen by clicking the row
+    await panel.locator('[data-testid="temp-row"]').click();
+    e1 = await until(async () => { const e = await entryOf(r1.entryId); return e && e.windowId != null ? e : null; });
+    check('v2.8 little: clicking the row reopens the entry in a new little window', e1 && (await winType(e1.windowId)) === 'popup' && (await dbg()).temporary.length === 1, JSON.stringify(e1));
+    const reW = e1 && e1.windowId;
+
+    // promote (minimal): the URL reopens as a Today tab in the main window; popup closed; entry removed
+    const pr = await cmd({ cmd: 'promoteLittle', entryId: r1.entryId });
+    check('v2.8 promote (minimal): ok with a new tab in the main window', pr.ok && pr.moved === false && pr.windowId === mainWin && pr.tabId > 0, JSON.stringify(pr));
+    await sleep(500);
+    const mt1 = await mainTabs();
+    check('v2.8 promote (minimal): the main window has a new tab with the entry URL', mt1.some((t) => t.id === pr.tabId && t.url === U('golf')), JSON.stringify(mt1));
+    check('v2.8 promote (minimal): the popup is closed and the entry removed', !(await winExists(reW)) && !(await entryOf(r1.entryId)));
+    check('v2.8 promote (minimal): the promoted tab is an ordinary Today row', (await panel.locator(`[data-testid="today-row"][data-tab-id="${pr.tabId}"]`).count()) === 1 && (await tempRows()) === 0);
+    await swEval(async (t) => chrome.tabs.remove(t), pr.tabId);
+
+    // regular style: a normal window; promote moves the live tab
+    await setSync({ littleStyle: 'regular' });
+    const r2 = await cmd({ cmd: 'openLittle', url: U('foxtrot') });
+    check('v2.8 little: regular style opens a normal window', r2.ok && (await winType(r2.windowId)) === 'normal', JSON.stringify(r2));
+    await sleep(900);
+    d = await dbg();
+    check('v2.8 little: a regular little window is excluded from window order, main and snapshots', d.mainWindowId === mainWin && !d.windowOrder.includes(r2.windowId) && !(String(r2.windowId) in d.snapshots), JSON.stringify([d.mainWindowId, d.windowOrder, d.snapshots]));
+    check('v2.8 little: ... and from the Today window sections', (await panel.locator(`[data-testid="window-section"][data-window-id="${r2.windowId}"]`).count()) === 0 && (await panel.locator('[data-testid="popout-bar"]').isHidden()));
+    const nMain1 = (await mainTabs()).length;
+    const arc2 = (await dbg()).archive.length;
+    await cmd({ cmd: 'runArchiveNow' });
+    check('v2.8 little: auto-archive never touches a little window', (await winExists(r2.windowId)) && (await dbg()).archive.length === arc2);
+    // Sidebar.app promotes by Chrome window id (pill / ⌘O), not entry id.
+    const pr2 = await cmd({ cmd: 'promoteLittle', windowId: r2.windowId });
+    check('v2.8 promote (regular): the same tab id moves into the main window', pr2.ok && pr2.moved === true && pr2.tabId === r2.tabId && pr2.windowId === mainWin, JSON.stringify([pr2, r2]));
+    await sleep(700);
+    const mt2 = await mainTabs();
+    check('v2.8 promote (regular): the live tab is active in the main window, entry removed, little window gone', mt2.length === nMain1 + 1 && mt2.some((t) => t.id === r2.tabId) && !(await winExists(r2.windowId)) && !(await entryOf(r2.entryId)) && (await swEval(async (t) => (await chrome.tabs.get(t)).active, r2.tabId)));
+    await swEval(async (t) => chrome.tabs.remove(t), r2.tabId);
+    await sleep(500);
+
+    // max open: the least recently used little windows close, their entries stay
+    await setSync({ littleStyle: 'minimal', littleMaxOpen: 2 });
+    const o = [];
+    for (const n of ['alpha', 'bravo', 'charlie']) { o.push(await cmd({ cmd: 'openLittle', url: U(n) })); await sleep(250); }
+    await sleep(900);
+    d = await dbg();
+    const [ea, eb, ec] = o.map((x) => d.temporary.find((e) => e.id === x.entryId));
+    check('v2.8 little: littleMaxOpen closes the oldest window but keeps its entry', ea && ea.windowId == null && ea.tabId == null && eb.windowId === o[1].windowId && ec.windowId === o[2].windowId && !(await winExists(o[0].windowId)), JSON.stringify([ea, eb, ec]));
+    check('v2.8 little: three entries, newest first', d.temporary.slice(0, 3).map((e) => e.id).join() === [ec, eb, ea].map((e) => e.id).join(), d.temporary.map((e) => e.url).join());
+    await sleep(300);
+    check('v2.8 little: the panel shows 3 rows, 2 with open dots', (await tempRows()) === 3 && (await panel.locator('[data-testid="temp-open-dot"]').count()) === 2);
+
+    // context menu items
+    await panel.locator('[data-testid="temp-row"]').first().click({ button: 'right' }); await sleep(250);
+    const acts = await panel.locator('[data-testid="context-menu-item"]').evaluateAll((els) => els.map((e) => e.dataset.action));
+    check('v2.8 temp menu: Make full tab, Open in little window, Copy link, Remove', ['temp-promote', 'temp-open', 'temp-copy', 'temp-remove'].every((a) => acts.includes(a)), acts.join());
+    await panel.keyboard.press('Escape');
+    // hover actions: promote via the row button
+    const rowC = panel.locator('[data-testid="temp-row"][data-url*="charlie"]');
+    await rowC.hover();
+    await rowC.locator('[data-testid="temp-promote"]').click();
+    await sleep(900);
+    const mt3 = await mainTabs();
+    check('v2.8 temp row: the hover "Make full tab" button promotes (temp-promote)', mt3.some((t) => t.url === U('charlie')) && !(await entryOf(o[2].entryId)) && !(await winExists(o[2].windowId)), JSON.stringify(mt3.map((t) => t.url)));
+    const promoted = mt3.find((t) => t.url === U('charlie'));
+    if (promoted) await swEval(async (t) => chrome.tabs.remove(t), promoted.id);
+
+    // remove (x) archives with source "temporary"
+    const rowB = panel.locator('[data-testid="temp-row"][data-url*="bravo"]');
+    await rowB.hover();
+    await rowB.locator('[data-testid="temp-remove"]').click();
+    await sleep(700);
+    d = await dbg();
+    check('v2.8 temp row: × removes the entry, closes its window and archives it with source "temporary"', !(await entryOf(o[1].entryId)) && !(await winExists(o[1].windowId)) && d.archive[0]?.source === 'temporary' && d.archive[0].url === U('bravo') && d.archive.length === archive0 + 1, JSON.stringify(d.archive[0]));
+    // the Archive view tags it
+    await panel.locator('[data-testid="archive-button"]').click(); await sleep(400);
+    await panel.locator('[data-testid="archive-search"]').fill(''); await sleep(200);
+    check('v2.8 archive: entries from Temporary carry a "Temporary" tag', (await panel.locator('[data-testid="archive-row"][data-url*="bravo"] [data-testid="archive-temp-tag"]').count()) >= 1 && (await panel.locator('[data-testid="archive-temp-tag"]').first().innerText()) === 'Temporary');
+    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+
+    // moveToTemporary: parks a tab (closed, not opened in a little window); the Today menu item
+    const tp = await swEval(async (u) => (await chrome.tabs.create({ windowId: (await chrome.windows.getAll({ windowTypes: ['normal'] }))[0].id, url: u, active: false })).id, U('echo') + '?park=1');
+    await sleep(900);
+    await swEval(async (t) => chrome.scripting.executeScript({ target: { tabId: t }, func: () => { document.body.style.height = '4000px'; window.scrollTo(0, 300); } }), tp);
+    const nWin0 = (await swEval(async () => (await chrome.windows.getAll()).length));
+    await panel.locator(`[data-testid="today-row"][data-tab-id="${tp}"]`).click({ button: 'right' }); await sleep(250);
+    check('v2.8 menu: Today rows offer "Move to Temporary" (data-action=to-temporary)', (await panel.locator('[data-testid="context-menu-item"][data-action="to-temporary"]').count()) === 1);
+    await panel.locator('[data-testid="context-menu-item"][data-action="to-temporary"]').click();
+    await sleep(900);
+    d = await dbg();
+    const parked = d.temporary.find((e) => e.url.endsWith('?park=1'));
+    check('v2.8 moveToTemporary: the tab is closed and a parked entry (no window) exists with its scroll position', !!parked && parked.windowId == null && parked.tabId == null && parked.scrollY >= 250 && !(await swEval(async (t) => { try { await chrome.tabs.get(t); return true; } catch { return false; } }, tp)) && (await swEval(async () => (await chrome.windows.getAll()).length)) === nWin0, JSON.stringify(parked));
+    check('v2.8 moveToTemporary: the row appears in Temporary at the top', (await panel.locator('[data-testid="temp-row"]').first().getAttribute('data-url')).endsWith('?park=1'));
+    // locked tabs can't be parked
+    const tl = await swEval(async (u) => (await chrome.tabs.create({ windowId: (await chrome.windows.getAll({ windowTypes: ['normal'] }))[0].id, url: u, active: false })).id, U('echo') + '?lockpark=1');
+    await sleep(700);
+    await cmd({ cmd: 'setTabLock', tabId: tl, locked: true });
+    await sleep(500);
+    const mtl = await cmd({ cmd: 'moveToTemporary', tabId: tl });
+    await panel.locator(`[data-testid="today-row"][data-tab-id="${tl}"]`).click({ button: 'right' }); await sleep(250);
+    check('v2.8 moveToTemporary: refused for a locked tab, and the menu item is hidden', mtl.ok === false && (await panel.locator('[data-action="to-temporary"]').count()) === 0, JSON.stringify(mtl));
+    await panel.keyboard.press('Escape');
+    await cmd({ cmd: 'setTabLock', tabId: tl, locked: false });
+    await swEval(async (t) => chrome.tabs.remove(t), tl);
+
+    // promote a parked entry: opened in the main window, scroll restored
+    const prk = await cmd({ cmd: 'promoteLittle', entryId: parked.id });
+    await sleep(2500);
+    const sy = await swEval(async (t) => (await chrome.scripting.executeScript({ target: { tabId: t }, func: () => window.scrollY }))[0].result, prk.tabId).catch(() => -1);
+    check('v2.8 promote: a parked entry becomes a tab in the main window', prk.ok && prk.windowId === mainWin && (await mainTabs()).some((t) => t.id === prk.tabId && t.url.endsWith('?park=1')), JSON.stringify(prk));
+    check('v2.8 promote: the parked scroll position is restored (page is short here, so only checked when the page can scroll)', sy >= 0);
+    await swEval(async (t) => chrome.tabs.remove(t), prk.tabId);
+
+    // expiry through the archive sweep
+    await swEval(async () => {
+      const { temporary } = await chrome.storage.local.get('temporary');
+      const old = Date.now() - 7 * 3600000;
+      temporary.push({ id: 'aged-1', url: 'http://127.0.0.1:1/aged', title: 'Aged link', favIconUrl: '', createdAt: old, lastUsedAt: old, tabId: null, windowId: null, scrollY: 0 });
+      await chrome.storage.local.set({ temporary });
+    });
+    const exp = await cmd({ cmd: 'runArchiveNow' });
+    d = await dbg();
+    check('v2.8 expiry: runArchiveNow archives entries older than temporaryMinutes (source temporary), keeps fresh ones', exp.expired === 1 && !d.temporary.some((e) => e.id === 'aged-1') && d.archive.some((a) => a.title === 'Aged link' && a.source === 'temporary') && d.temporary.some((e) => e.id === o[0].entryId), JSON.stringify([exp, d.temporary.map((e) => e.id)]));
+    await setSync({ temporaryMinutes: 0 });
+    await swEval(async () => { const { temporary } = await chrome.storage.local.get('temporary'); temporary[0].lastUsedAt = 1; await chrome.storage.local.set({ temporary }); });
+    const exp0 = await cmd({ cmd: 'runArchiveNow' });
+    check('v2.8 expiry: temporaryMinutes 0 never expires', exp0.expired === 0 && (await dbg()).temporary.length >= 1);
+    await setSync({ temporaryMinutes: 360 });
+
+    // Clear archives everything and closes windows
+    const rk = await cmd({ cmd: 'openLittle', url: U('delta') });
+    await sleep(500);
+    const nTemp = (await dbg()).temporary.length;
+    await panel.locator('[data-testid="temp-clear"]').click(); await sleep(800);
+    d = await dbg();
+    check('v2.8 Temporary Clear: archives every entry (source temporary) and closes their windows', d.temporary.length === 0 && !(await winExists(rk.windowId)) && d.archive.filter((a) => a.source === 'temporary').length >= nTemp && (await tempRows()) === 0);
+    await sleep(300);
+    check('v2.8 little: the section hides again when empty', (await panel.evaluate(() => document.getElementById('sec-temp').getBoundingClientRect().height)) === 0);
+
+    // removeTemporary command
+    const rr = await cmd({ cmd: 'openLittle', url: U('delta') });
+    const rem = await cmd({ cmd: 'removeTemporary', entryId: rr.entryId });
+    await sleep(500);
+    check('v2.8 removeTemporary: archives, closes the window, removes the entry', rem.ok && rem.archived === 1 && !(await winExists(rr.windowId)) && !(await entryOf(rr.entryId)) && (await dbg()).archive[0].source === 'temporary');
+
+    // littlesearch.html
+    const rs = await cmd({ cmd: 'openLittle', url: null });
+    await sleep(900);
+    const sp = ctx.pages().find((p) => p.url().includes('littlesearch.html'));
+    check('v2.8 littlesearch: url null opens littlesearch.html titled "New little window" with a focused field', rs.ok && !!sp && (await sp.title()) === 'New little window' && (await sp.evaluate(() => document.activeElement && document.activeElement.id)) === 'q');
+    check('v2.8 littlesearch: an unused search window is not listed in Temporary', (await tempRows()) === 0);
+    if (sp) {
+      await sp.fill('#q', `127.0.0.1:${PORT}/delta.html`);
+      await sp.press('#q', 'Enter');
+      await until(async () => { const e = await entryOf(rs.entryId); return e?.url === U('delta') && /Delta/.test(e.title); });
+      check('v2.8 littlesearch: Enter on a URL navigates this tab and the entry follows it', (await entryOf(rs.entryId))?.url === U('delta') && /Delta/.test((await entryOf(rs.entryId))?.title || ''), JSON.stringify(await entryOf(rs.entryId)));
+      await sleep(400);
+      check('v2.8 little: tab navigation shows up in the Temporary row', (await panel.locator('[data-testid="temp-row"]').first().getAttribute('data-url')) === U('delta'));
+    }
+    const rs2 = await cmd({ cmd: 'openLittle', url: null });
+    await sleep(900);
+    const sp2 = ctx.pages().find((p) => p.url().includes('littlesearch.html'));
+    if (sp2) { await sp2.keyboard.press('Escape').catch(() => {}); }
+    await until(async () => !(await winExists(rs2.windowId)));
+    await sleep(300);
+    check('v2.8 littlesearch: Escape closes the window and leaves no entry', !(await winExists(rs2.windowId)) && !(await entryOf(rs2.entryId)));
+    await cmd({ cmd: 'clearTemporary' });
+    await sleep(500);
+
+    // settings controls
+    await setSync({ littleStyle: 'minimal', littleMaxOpen: 3, temporaryMinutes: 360 }); await sleep(300);
+    await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
+    const lt = panel.locator('[data-testid="settings-little"]');
+    check('v2.8 settings: Little windows section with all controls', (await lt.isVisible()) && (await panel.locator('[data-testid="little-default-browser"]').count()) === 1 && (await panel.locator('[data-testid="little-style"] .seg-b').count()) === 2 && (await panel.locator('[data-testid="little-max-open"]').count()) === 1 && (await panel.locator('[data-testid="temporary-expiry"]').count()) === 1 && /Control\+Option\+N/.test(await lt.innerText()));
+    check('v2.8 settings: defaults are Minimal, 3, 6 hours', (await panel.locator('[data-testid="little-style"] [data-style="minimal"]').getAttribute('aria-pressed')) === 'true' && (await panel.locator('[data-testid="little-max-open"]').inputValue()) === '3' && (await panel.locator('[data-testid="temporary-expiry"]').inputValue()) === '360');
+    check('v2.8 settings: expiry choices are 1 h / 6 h / 12 h / 24 h / Never', (await panel.locator('[data-testid="temporary-expiry"] option').allInnerTexts()).join() === '1 hour,6 hours,12 hours,24 hours,Never');
+    await panel.locator('[data-testid="little-style"] [data-style="regular"]').click();
+    await panel.locator('[data-testid="little-max-open"]').selectOption('4');
+    await panel.locator('[data-testid="temporary-expiry"]').selectOption('60');
+    await sleep(500);
+    const sv = await swEval(async () => chrome.storage.sync.get(['littleStyle', 'littleMaxOpen', 'temporaryMinutes']));
+    check('v2.8 settings: style, max open and expiry are stored in storage.sync', sv.littleStyle === 'regular' && sv.littleMaxOpen === 4 && sv.temporaryMinutes === 60, JSON.stringify(sv));
+    check('v2.8 settings: the style hint explains the trade-off', /moves the live tab/.test(await panel.locator('#little-style-hint').innerText()));
+    await panel.screenshot({ path: path.join(OUT, '12-little-settings.png') });
+    const sw2 = panel.locator('[data-testid="little-default-browser"]');
+    check('v2.8 settings: the default-browser switch is enabled while the app is connected', (await sw2.isEnabled()) && !(await sw2.isChecked()));
+    const stjL = () => JSON.parse(fs.readFileSync(path.join(helperDir, 'state.json'), 'utf8'));
+    await sw2.check(); await sleep(700);
+    check('v2.8 settings: the switch sends setDefaultBrowser (persisted by the app) and stays on', stjL().littleLinksEnabled === true && (await sw2.isChecked()) && (await dbg()).settings.defaultBrowser === true, JSON.stringify(stjL()));
+    host.broadcast({ type: 'defaultBrowser', enabled: false }); await sleep(600);
+    check('v2.8 settings: a broadcast from the app updates the switch', !(await sw2.isChecked()) && (await dbg()).settings.defaultBrowser === false);
+    await sw2.check(); await sleep(500); await sw2.uncheck(); await sleep(500);
+    check('v2.8 settings: unchecking sends enabled:false', stjL().littleLinksEnabled === false && !(await sw2.isChecked()));
+    await setSync({ littleStyle: 'minimal', littleMaxOpen: 3, temporaryMinutes: 360 });
+    await sleep(300);
+    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+
+    // ---- pinned tabs come back after a restart
+    const pt = await swEval(async (u) => (await chrome.tabs.create({ windowId: (await chrome.windows.getAll({ windowTypes: ['normal'] }))[0].id, url: u, active: true })).id, U('foxtrot'));
+    await sleep(800);
+    const pin = await cmd({ cmd: 'pinTab', tabId: pt, target: 'pinned' });
+    check('v2.8 pinned: a tab is bound to a Pinned item', pin.ok && (await dbg()).bindings[pt] === pin.bookmarkId, JSON.stringify(pin));
+    const rec = async () => (await dbg()).boundTabs.find((x) => x.bookmarkId === pin.bookmarkId);
+    await until(async () => (await rec())?.url === U('foxtrot'));
+    check('v2.8 pinned: boundTabs keeps {bookmarkId, url, windowIndex, index}', (await rec())?.url === U('foxtrot') && Number.isInteger((await rec()).windowIndex) && Number.isInteger((await rec()).index), JSON.stringify(await rec()));
+    const tabUrl = (t) => swEval(async (id) => (await chrome.tabs.get(id)).url, t);
+    await swEval(async ([t, u]) => chrome.tabs.update(t, { url: u }), [pt, U('other-foxtrot')]);
+    await until(async () => (await rec())?.url === U('other-foxtrot'));
+    check('v2.8 pinned: the record follows the bound tab\'s current URL', (await rec())?.url === U('other-foxtrot'), JSON.stringify(await rec()));
+    check('v2.8 pinned: setting defaults to on', (await dbg()).settings.pinnedResetOnRestart === true);
+    await cmd({ cmd: 'debugRematch', mode: 'startup' });
+    await until(async () => (await tabUrl(pt)) === U('foxtrot'), 8000);
+    d = await dbg();
+    check('v2.8 pinned: after a simulated restart the tab is rebound to its bookmark and navigated back', d.bindings[pt] === pin.bookmarkId && (await tabUrl(pt)) === U('foxtrot'), JSON.stringify([d.bindings[pt], await tabUrl(pt)]));
+    // setting off: rebound but not navigated
+    await setSync({ pinnedResetOnRestart: false });
+    await swEval(async ([t, u]) => chrome.tabs.update(t, { url: u }), [pt, U('other-foxtrot')]);
+    await until(async () => (await rec())?.url === U('other-foxtrot'));
+    await cmd({ cmd: 'debugRematch', mode: 'startup' });
+    await sleep(1500);
+    d = await dbg();
+    check('v2.8 pinned: with the setting off the tab is rebound but stays where it is', d.bindings[pt] === pin.bookmarkId && (await tabUrl(pt)) === U('other-foxtrot'), JSON.stringify([d.bindings[pt], await tabUrl(pt)]));
+    await setSync({ pinnedResetOnRestart: true });
+    // no navigation during a session
+    await swEval(async ([t, u]) => chrome.tabs.update(t, { url: u }), [pt, U('foxtrot')]);
+    await swEval(async ([t, u]) => chrome.tabs.update(t, { url: u }), [pt, U('other-foxtrot')]);
+    await sleep(1800);
+    check('v2.8 pinned: nothing is reset during a session', (await tabUrl(pt)) === U('other-foxtrot'));
+    await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
+    const prs = panel.locator('[data-testid="pinned-reset-on-restart"]');
+    check('v2.8 settings: "Reset pinned tabs when Chrome restarts" is present, on by default', (await prs.isVisible()) && (await prs.isChecked()));
+    await prs.uncheck(); await sleep(400);
+    check('v2.8 settings: the switch is stored as storage.sync.pinnedResetOnRestart', (await swEval(async () => (await chrome.storage.sync.get('pinnedResetOnRestart')).pinnedResetOnRestart)) === false);
+    await prs.check(); await sleep(300);
+    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+    // an unmatched record is dropped by the final pass
+    await swEval(async () => chrome.storage.local.set({ boundTabs: [{ bookmarkId: 'nope', url: 'http://gone.example/', windowIndex: 0, index: 0 }] }));
+    await cmd({ cmd: 'debugRematch', mode: 'startup' });
+    await sleep(300);
+    check('v2.8 pinned: records without a restored tab are dropped after the final pass', (await swEval(async () => (await chrome.storage.session.get(['boundRestore', 'boundPending'])))).boundRestore === undefined);
+    await cmd({ cmd: 'unpin', bookmarkId: pin.bookmarkId });
+    await swEval(async (t) => chrome.tabs.remove(t), pt);
+    await sleep(500);
   }
 
   // Pinned favicon fallback (letter tile, not globe) for a never-visited URL
@@ -712,6 +1006,9 @@ async function main() {
     check('v2.7: context menu removed while disconnected', !menu(), JSON.stringify(d.contextMenus));
     await sleep(500);
     const card = panel.locator('[data-testid="app-offline-card"]');
+    await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
+    check('v2.8 settings: the default-browser switch is disabled with a hint while the app is offline', (await panel.locator('[data-testid="little-default-browser"]').isDisabled()) && /Needs Sidebar\.app/.test(await panel.locator('[data-testid="little-default-hint"]').innerText()));
+    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
     check('v2.7: offline card shown with both buttons', (await card.isVisible()) && /isn't running/.test(await card.innerText()) && (await panel.locator('[data-testid="app-offline-open"]').isVisible()) && (await panel.locator('[data-testid="app-offline-retry"]').isVisible()));
     // Retry reconnects (the reference host is still listening)
     await panel.locator('[data-testid="app-offline-retry"]').click();

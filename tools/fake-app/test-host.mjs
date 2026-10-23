@@ -74,7 +74,7 @@ class Client {
     return found;
   }
   async request(m, type) {
-    const rt = { getProfiles: 'profiles', identify: 'identified', switchProfile: 'switchResult', setGlobalSettings: 'settings', setProfileStyle: 'profiles', setOverlayEnabled: 'overlayEnabled' };
+    const rt = { getProfiles: 'profiles', identify: 'identified', switchProfile: 'switchResult', setGlobalSettings: 'settings', setProfileStyle: 'profiles', setOverlayEnabled: 'overlayEnabled', setDefaultBrowser: 'defaultBrowser' };
     this.send(m);
     return this.recv(type ?? rt[m.type] ?? m.type);
   }
@@ -102,6 +102,7 @@ check('profile name and email parsed', by.Default?.email === 'me@example.com' &&
 check('empty email is ""', by['Profile 2']?.email === '');
 check('hello: default archiveDefaultMinutes 720', r?.settings?.archiveDefaultMinutes === 720);
 check('hello: overlayEnabled defaults to true', r?.settings?.overlayEnabled === true, j(r?.settings));
+check('hello: defaultBrowser defaults to false', r?.settings?.defaultBrowser === false, j(r?.settings));
 
 // chromeTheme from Preferences
 const ct = by.Default?.chromeTheme;
@@ -211,6 +212,24 @@ r = await A.request({ type: 'setOverlayEnabled', enabled: 'yes' });
 check('setOverlayEnabled: non-boolean rejected, unchanged', !!r?.error && r.enabled === false && readJson(path.join(appDir, 'state.json')).overlayEnabled === false, j(r));
 r = await A.request({ type: 'setOverlayEnabled', enabled: true });
 check('setOverlayEnabled: re-enable', r?.enabled === true && readJson(path.join(appDir, 'state.json')).overlayEnabled === true);
+// setDefaultBrowser (v2.8)
+r = await A.request({ type: 'setDefaultBrowser', enabled: true, requestId: 12 });
+check('setDefaultBrowser: reply {type, enabled, ok, requestId}', r?.type === 'defaultBrowser' && r.enabled === true && r.ok === true && r.requestId === 12, j(r));
+check('setDefaultBrowser: persisted (littleLinksEnabled)', readJson(path.join(appDir, 'state.json')).littleLinksEnabled === true);
+for (const [n, c] of [['B', B], ['C', C], ['D0', D0]]) {
+  const m = await c.recv('defaultBrowser');
+  check(`setDefaultBrowser: broadcast to connection ${n}`, m?.enabled === true && !('requestId' in m), j(m));
+}
+check('setDefaultBrowser: sender gets no unsolicited broadcast', await A.quiet(300));
+const D2 = spawnClient();
+r = await D2.request({ type: 'hello' });
+check('hello after set: settings.defaultBrowser true', r?.settings?.defaultBrowser === true, j(r?.settings));
+check('setDefaultBrowser: other state keys preserved', readJson(path.join(appDir, 'state.json')).overlayEnabled === true);
+r = await A.request({ type: 'setDefaultBrowser', enabled: 'yes' });
+check('setDefaultBrowser: non-boolean rejected, unchanged', r?.ok === false && !!r.error && r.enabled === true && readJson(path.join(appDir, 'state.json')).littleLinksEnabled === true, j(r));
+r = await A.request({ type: 'setDefaultBrowser', enabled: false });
+check('setDefaultBrowser: disable', r?.enabled === false && r.ok === true && readJson(path.join(appDir, 'state.json')).littleLinksEnabled === false);
+D2.closeStdin();
 D1.closeStdin();
 D0.closeStdin();
 B.msgs.length = 0; C.msgs.length = 0; A.msgs.length = 0;

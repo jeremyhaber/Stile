@@ -1052,6 +1052,174 @@ async function main() {
     await swEval(async (w) => chrome.windows.update(w, { focused: true }), mainWin);
   }
 
+  // ---- v2.8: little windows, Temporary section (expanded + compact), littlesearch.html, settings
+  {
+    const cmdR = async (c) => (await rawCall('sidebar.cmd', [c]))?.result;
+    const roles = async () => (await rawCall('sidebar.windowRoles'))?.result;
+    const evs = () => app.bridgeEvents.filter((e) => e.name === 'sidebar.windowRolesChanged');
+    const dbgS = async () => (await rawCall('sidebar.cmd', [{ cmd: 'debugState' }]))?.result;
+    const setSync = (o) => swEval(async (x) => chrome.storage.sync.set(x), o);
+    const winExists = (id) => swEval(async (w) => { try { await chrome.windows.get(w); return true; } catch { return false; } }, id);
+    const rows = () => panel.locator('[data-testid="temp-row"]').count();
+    app.incWins = new Set(); app.splitMap = {};
+    await setSync({ littleStyle: 'minimal', littleMaxOpen: 5, temporaryMinutes: 360 });
+    await swEval(async () => chrome.storage.local.set({ temporary: [] }));
+    setHost({ state: 'peek', compact: false, railWidth: 56 }); await sleep(600);
+    const r0 = await roles();
+    check('v2.8 windowRoles: includes littleWindowIds (empty at first)', Array.isArray(r0.littleWindowIds) && r0.littleWindowIds.length === 0, JSON.stringify(r0));
+    check('v2.8 hidden: the Temporary section takes no space while empty', (await panel.evaluate(() => document.getElementById('sec-temp').getBoundingClientRect().height)) === 0);
+
+    // what the Mac app does: sidebar.cmd openLittle {url, bounds}
+    const nE = evs().length;
+    const L1 = await cmdR({ cmd: 'openLittle', url: U('golf'), bounds: { left: 100, top: 80, width: 760, height: 620 } });
+    check('v2.8 bridge: sidebar.cmd openLittle returns {ok, windowId, tabId, entryId}', L1?.ok && L1.windowId > 0 && L1.tabId > 0 && !!L1.entryId, JSON.stringify(L1));
+    await until(() => evs().length > nE, 4000);
+    const lastRoles = () => evs()[evs().length - 1]?.args[0];
+    check('v2.8 windowRolesChanged fires when a little window opens, with littleWindowIds', evs().length > nE && lastRoles().littleWindowIds.includes(L1.windowId) && lastRoles().mainWindowId === r0.mainWindowId, JSON.stringify(evs().slice(nE)));
+    check('v2.8 windowRoles lists the little window and the main window is unchanged', (await roles()).littleWindowIds.join() === String(L1.windowId) && (await roles()).mainWindowId === r0.mainWindowId);
+    const L2 = await cmdR({ cmd: 'openLittle', url: U('hotel') });
+    await sleep(400);
+    await swEval(async (w) => chrome.windows.update(w, { focused: true }), mainWin);
+    // park a tab too, so the list has a closed entry
+    const tp = await swEval(async (w) => (await chrome.tabs.create({ windowId: w, url: 'http://127.0.0.1/parked-page', active: false })).id, mainWin);
+    await swEval(async (t) => chrome.tabs.update(t, { url: 'http://127.0.0.1:' + location.port }), tp).catch(() => {});
+    await sleep(300);
+    await swEval(async (t) => chrome.tabs.remove(t), tp);
+    const pk = await swEval(async ([w, u]) => (await chrome.tabs.create({ windowId: w, url: u, active: false })).id, [mainWin, U('india')]);
+    await sleep(900);
+    const mv = await cmdR({ cmd: 'moveToTemporary', tabId: pk });
+    check('v2.8 bridge: moveToTemporary parks a tab', mv?.ok && !!mv.entryId, JSON.stringify(mv));
+    await until(async () => (await rows()) === 3, 6000);
+    check('v2.8 overlay: the Temporary section lists 3 rows with a count of 3, above Today', (await rows()) === 3 && (await panel.locator('[data-testid="temp-count"]').innerText()) === '3' && await panel.evaluate(() => document.getElementById('sec-temp').compareDocumentPosition(document.getElementById('today').closest('.sec')) & Node.DOCUMENT_POSITION_FOLLOWING));
+    check('v2.8 overlay: open dots mark the two rows with a little window', (await panel.locator('[data-testid="temp-open-dot"]').count()) === 2);
+    await sleep(500);
+
+    // geometry: expanded vs compact
+    const geo = () => panel.evaluate(() => {
+      const sec = document.getElementById('sec-temp');
+      const rowsG = [...sec.querySelectorAll('[data-testid="temp-row"]')].map((r) => { const b = r.getBoundingClientRect(), p = r.querySelector('.rbg').getBoundingClientRect(), f = r.querySelector('.fav-ic').getBoundingClientRect(), d = r.querySelector('[data-testid="temp-open-dot"]');
+        const db = d && d.getBoundingClientRect();
+        return { y: b.y, h: b.height, p: { x: p.left, r: p.right, w: p.width, cx: (p.left + p.right) / 2 }, f: { cx: f.left + f.width / 2, cy: f.top + f.height / 2 }, dot: db && { x: db.left, r: db.right, cx: db.left + db.width / 2, cy: db.top + db.height / 2, o: getComputedStyle(d).opacity } }; });
+      const head = sec.querySelector('.sec-h'), h2 = head.querySelector('h2');
+      return { rows: rowsG, labelO: getComputedStyle(h2).opacity, actionsO: getComputedStyle(head.querySelector('.sec-actions')).opacity, dividerO: getComputedStyle(head, '::after').opacity, headY: head.getBoundingClientRect().y,
+        stray: [...sec.querySelectorAll('.fav-ic, .fav-ic *, .temp-dot, .rbg')].filter((e) => { const b = e.getBoundingClientRect(); return getComputedStyle(e).opacity !== '0' && b.width > 0 && b.height > 0 && (b.left < -0.5 || b.right > 56.5); }).map((e) => e.className || e.tagName),
+        diag: { st: document.getElementById('scroll-main').scrollTop, top: sec.offsetTop, secs: [...document.querySelectorAll('#scroll-main > *')].map((e) => e.id + ':' + Math.round(e.getBoundingClientRect().height)).join() } };
+    });
+    const gE = await geo();
+    setHost({ compact: true, railWidth: 56 }); await sleep(600);
+    const gC = await geo();
+    check('v2.8 compact: the section label and actions fade out and the centred divider fades in', gC.labelO === '0' && gC.actionsO === '0' && gC.dividerO === '1', JSON.stringify([gC.labelO, gC.actionsO, gC.dividerO]));
+    check('v2.8 compact: temp rows keep their positions (relative to the section header) and heights', gC.rows.length === 3 && gC.rows.every((r, i) => Math.abs((r.y - gC.headY) - (gE.rows[i].y - gE.headY)) < 0.5 && Math.abs(r.h - gE.rows[i].h) < 0.5), JSON.stringify([gC.rows.map((r) => r.y - gC.headY), gE.rows.map((r) => r.y - gE.headY)]));
+    check('v2.8 compact: each row pill is a rounded square (<=44 wide) centred on the icon column, inside the 56px strip', gC.rows.every((r) => r.p.w <= 44 && Math.abs(r.p.cx - 28) <= 1 && r.p.x >= 0 && r.p.r <= 56), JSON.stringify(gC.rows.map((r) => r.p)));
+    check('v2.8 compact: favicons sit in the icon column', gC.rows.every((r) => Math.abs(r.f.cx - 28) <= 1), JSON.stringify(gC.rows.map((r) => r.f.cx)));
+    const dots = gC.rows.filter((r) => r.dot);
+    check('v2.8 compact: the open dot sits at the icon\'s top-right inside the pill', dots.length === 2 && dots.every((r) => r.dot.o === '1' && r.dot.cx > r.f.cx && r.dot.cy < r.f.cy && r.dot.x >= r.p.x && r.dot.r <= r.p.r), JSON.stringify(dots.map((r) => [r.dot, r.f, r.p])));
+    check('v2.8 compact: nothing visible in the Temporary section lies outside x in [0, 56]', gC.stray.length === 0, gC.stray.join());
+    await panel.mouse.move(200, 700);
+    const cShot = await panel.screenshot({ clip: { x: 0, y: 0, width: 56, height: 860 } });
+    fs.writeFileSync(path.join(SHOTS, 'temporary-compact.png'), cShot);
+    setHost({ compact: false, railWidth: 48 }); await sleep(600);
+    await panel.mouse.move(200, 700);
+    const eShot = await panel.screenshot({ clip: { x: 0, y: 0, width: 320, height: 860 } });
+    fs.writeFileSync(path.join(SHOTS, 'temporary-expanded.png'), eShot);
+    {
+      const pg = await ctx.newPage();
+      await pg.setViewportSize({ width: 420, height: 900 });
+      await pg.setContent(`<body style="margin:0;background:#888;display:flex;gap:24px;padding:20px;align-items:flex-start"><img src="data:image/png;base64,${cShot.toString('base64')}" style="box-shadow:0 0 0 1px #0004"><img src="data:image/png;base64,${eShot.toString('base64')}" style="box-shadow:0 0 0 1px #0004"></body>`);
+      await pg.screenshot({ path: path.join(SHOTS, 'temporary-compact-vs-expanded.png') });
+      await pg.close();
+    }
+    await panel.emulateMedia({ colorScheme: 'dark' }); await sleep(500);
+    await panel.screenshot({ path: path.join(SHOTS, 'temporary-expanded-dark.png'), clip: { x: 0, y: 0, width: 320, height: 860 } });
+    await panel.emulateMedia({ colorScheme: 'light' }); await sleep(400);
+
+    // native menu (overlay): items and running one
+    const rowL = panel.locator('[data-testid="temp-row"][data-url*="hotel"]');
+    const nCtx = hostCount('contextMenu');
+    await rowL.click({ button: 'right' });
+    await until(() => hostCount('contextMenu') > nCtx, 3000);
+    const items = lastHost('contextMenu')?.value.items || [];
+    check('v2.8 native menu: Make full tab, Open in little window, Copy link, Remove', ['Make full tab', 'Open in little window', 'Copy link', 'Remove'].every((l) => items.some((i) => i.label === l)), JSON.stringify(items.map((i) => i.label)));
+    await panel.evaluate(() => window.__sidebarMenuResult(null)); await sleep(200);
+    const nCtx2 = hostCount('contextMenu');
+    await panel.locator(`[data-testid="today-row"]`).first().click({ button: 'right' });
+    await until(() => hostCount('contextMenu') > nCtx2, 3000);
+    check('v2.8 native menu: Today rows offer "Move to Temporary"', (lastHost('contextMenu')?.value.items || []).some((i) => i.label === 'Move to Temporary'));
+    await panel.evaluate(() => window.__sidebarMenuResult(null)); await sleep(200);
+
+    // hotel is in a window; "Make full tab" through the native menu moves it to the main window as a tab
+    const nMain0 = await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).length, mainWin);
+    const nCtx3 = hostCount('contextMenu');
+    await rowL.click({ button: 'right' });
+    await until(() => hostCount('contextMenu') > nCtx3, 3000);
+    const promoteItem = lastHost('contextMenu').value.items.find((i) => i.label === 'Make full tab');
+    await panel.evaluate((id) => window.__sidebarMenuResult(id), promoteItem.id); await sleep(1200);
+    const nMain1 = await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).length, mainWin);
+    check('v2.8 native menu: "Make full tab" opens the link in the main window and removes the entry and its window', nMain1 === nMain0 + 1 && !(await winExists(L2.windowId)) && (await rows()) === 2 && (await roles()).littleWindowIds.join() === String(L1.windowId), JSON.stringify([nMain0, nMain1, await rows(), (await roles()).littleWindowIds]));
+    const hotelTab = await swEval(async (w) => (await chrome.tabs.query({ windowId: w, url: '*://*/hotel.html' }))[0]?.id, mainWin);
+    if (hotelTab) await swEval(async (t) => chrome.tabs.remove(t), hotelTab);
+
+    // closing a little window fires the roles event again
+    const nE2 = evs().length;
+    await swEval(async (w) => chrome.windows.remove(w), L1.windowId);
+    await until(() => evs().length > nE2, 4000);
+    check('v2.8 windowRolesChanged fires again when the little window closes (ids drop out)', evs().length > nE2 && lastRoles().littleWindowIds.length === 0, JSON.stringify(evs().slice(nE2)));
+    await sleep(500);
+    check('v2.8 overlay: the closed entry stays in the list (2 rows, no dots)', (await rows()) === 2 && (await panel.locator('[data-testid="temp-open-dot"]').count()) === 0);
+
+    // a regular-style little window is a normal window: not listed, not merged by "merge all", not main
+    await setSync({ littleStyle: 'regular' });
+    const L3 = await cmdR({ cmd: 'openLittle', url: U('juliet') });
+    await sleep(900);
+    const ma = await cmdR({ cmd: 'mergeAll' });
+    await sleep(800);
+    const st3 = await dbgS();
+    check('v2.8 regular little window: not a window section, not merged by Merge all, never main, not snapshotted', (await winExists(L3.windowId)) && (await panel.locator(`[data-testid="window-section"][data-window-id="${L3.windowId}"]`).count()) === 0 && st3.mainWindowId === r0.mainWindowId && !(String(L3.windowId) in st3.snapshots) && !st3.windowOrder.includes(L3.windowId), JSON.stringify([ma, st3.windowOrder]));
+    check('v2.8 regular little window: listed in windowRoles.littleWindowIds', (await roles()).littleWindowIds.includes(L3.windowId));
+    await cmdR({ cmd: 'removeTemporary', entryId: L3.entryId }); await sleep(700);
+    await setSync({ littleStyle: 'minimal' });
+
+    // littlesearch.html screenshot
+    const rs = await cmdR({ cmd: 'openLittle', url: null, bounds: { left: 200, top: 120, width: 760, height: 620 } });
+    await sleep(1000);
+    const sp = ctx.pages().find((p) => p.url().includes('littlesearch.html'));
+    if (sp) {
+      await sp.setViewportSize({ width: 760, height: 520 });
+      await sp.screenshot({ path: path.join(SHOTS, 'littlesearch.png') });
+      await sp.emulateMedia({ colorScheme: 'dark' });
+      await sp.screenshot({ path: path.join(SHOTS, 'littlesearch-dark.png') });
+    }
+    check('v2.8 littlesearch: the page opened through the bridge, focused field, title "New little window"', !!sp && (await sp.title()) === 'New little window' && (await sp.evaluate(() => document.activeElement.id)) === 'q');
+    if (sp) { await sp.fill('#q', `127.0.0.1:${SITE}/kilo.html`); await sp.press('#q', 'Enter').catch(() => {}); }
+    await until(async () => (await swEval(async (id) => (await chrome.tabs.get(id)).url, rs.tabId)) === U('kilo'), 6000);
+    check('v2.8 littlesearch: Enter navigates this tab', (await swEval(async (id) => (await chrome.tabs.get(id)).url, rs.tabId)) === U('kilo'));
+    await cmdR({ cmd: 'removeTemporary', entryId: rs.entryId }); await sleep(600);
+
+    // settings in the overlay: the Little windows section and the default-browser switch against the reference host
+    await panel.locator('[data-testid="settings-button"]').click(); await sleep(500);
+    const sw = panel.locator('[data-testid="little-default-browser"]');
+    check('v2.8 settings (overlay): controls present; switch enabled while the app is connected', (await panel.locator('[data-testid="settings-little"]').isVisible()) && (await sw.isEnabled()) && (await panel.locator('[data-testid="little-style"]').isVisible()) && (await panel.locator('[data-testid="little-max-open"]').isVisible()) && (await panel.locator('[data-testid="temporary-expiry"]').isVisible()));
+    await sw.check(); await sleep(900);
+    check('v2.8 settings (overlay): the switch sends setDefaultBrowser to the app', refApp.readState().littleLinksEnabled === true && (await sw.isChecked()), JSON.stringify(refApp.readState()));
+    check('v2.8 hello: the app now reports defaultBrowser true', (await swEval(async () => (await chrome.storage.local.get('defaultBrowser')).defaultBrowser)) === true);
+    refApp.broadcast({ type: 'defaultBrowser', enabled: false }); await sleep(700);
+    check('v2.8 settings (overlay): a broadcast from the app unchecks it', !(await sw.isChecked()));
+    await panel.locator('#field-little').scrollIntoViewIfNeeded(); await sleep(200);
+    await panel.locator('[data-testid="little-style"] [data-style="regular"]').click(); await sleep(300);
+    await panel.evaluate(() => document.getElementById('field-little').scrollIntoView({ block: 'start' })); await sleep(200);
+    await panel.screenshot({ path: path.join(SHOTS, 'little-windows-settings.png') });
+    await panel.emulateMedia({ colorScheme: 'dark' }); await sleep(400);
+    await panel.screenshot({ path: path.join(SHOTS, 'little-windows-settings-dark.png') });
+    await panel.emulateMedia({ colorScheme: 'light' }); await sleep(300);
+    await setSync({ littleStyle: 'minimal', littleMaxOpen: 3, temporaryMinutes: 360 });
+    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+
+    // Clear
+    await panel.locator('[data-testid="temp-clear"]').click(); await sleep(800);
+    check('v2.8 Clear archives every entry and hides the section', (await rows()) === 0 && (await dbgS()).temporary.length === 0 && (await panel.evaluate(() => document.getElementById('sec-temp').getBoundingClientRect().height)) === 0);
+    setHost({ state: 'peek', compact: false, railWidth: 48 }); await sleep(400);
+  }
+
   // ---- connection drop: the extension stops forwarding; reconnecting resumes
   const nBefore = refApp.isConnected('Default');
   for (const c of [...refApp.conns]) c.sock.destroy();

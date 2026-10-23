@@ -207,7 +207,7 @@ class HostServer extends EventEmitter {
     }
     const handlers = {
       hello: this.doHello, identify: this.doIdentify, getProfiles: this.doGetProfiles,
-      setProfileStyle: this.doSetStyle, switchProfile: this.doSwitch, setGlobalSettings: this.doSetSettings, setOverlayEnabled: this.doSetOverlayEnabled,
+      setProfileStyle: this.doSetStyle, switchProfile: this.doSwitch, setGlobalSettings: this.doSetSettings, setOverlayEnabled: this.doSetOverlayEnabled, setDefaultBrowser: this.doSetDefaultBrowser,
     };
     const h = Object.hasOwn(handlers, m.type) ? handlers[m.type] : null;
     if (!h) { this.log(`unknown message type '${m.type}'`); return this.reply(conn, m, { type: 'error', error: `unknown message type '${m.type}'` }); }
@@ -239,6 +239,8 @@ class HostServer extends EventEmitter {
     return {
       archiveDefaultMinutes: validMinutes(st.archiveDefaultMinutes) ? Number(st.archiveDefaultMinutes) : DEFAULT_ARCHIVE_MINUTES,
       overlayEnabled: st.overlayEnabled !== false,
+      // v2.8: the app's view of "little links on AND we are the default http handler" (the reference host has no OS to ask: just the stored flag)
+      defaultBrowser: st.littleLinksEnabled === true,
     };
   }
 
@@ -391,6 +393,17 @@ class HostServer extends EventEmitter {
     this.broadcast({ type: 'overlayEnabled', enabled: m.enabled }, conn);
     this.reply(conn, m, { type: 'overlayEnabled', enabled: m.enabled });
     this.emit('overlayEnabled', { enabled: m.enabled });
+  }
+
+  // v2.8: Settings > Little windows > "Open links from other apps in little windows". Swift really changes the default browser; here we only store it.
+  doSetDefaultBrowser(conn, m) {
+    if (typeof m.enabled !== 'boolean') {
+      return this.reply(conn, m, { type: 'defaultBrowser', enabled: this.readState().littleLinksEnabled === true, ok: false, error: 'invalid enabled' });
+    }
+    this.updateState((st) => { st.littleLinksEnabled = m.enabled; });
+    this.broadcast({ type: 'defaultBrowser', enabled: m.enabled }, conn);
+    this.reply(conn, m, { type: 'defaultBrowser', enabled: m.enabled, ok: true });
+    this.emit('defaultBrowser', { enabled: m.enabled });
   }
 
   doSetStyle(conn, m) {

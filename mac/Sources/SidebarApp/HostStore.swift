@@ -302,7 +302,9 @@ enum HostStore {
 
     static func settings(from st: [String: Any]) -> [String: Any] {
         ["archiveDefaultMinutes": validMinutes(st["archiveDefaultMinutes"]) ?? 720,
-         "overlayEnabled": overlayEnabled(from: st)]
+         "overlayEnabled": overlayEnabled(from: st),
+         // v2.8: little links are on AND this app really is the default http(s) handler.
+         "defaultBrowser": LittleLinks.enabled(in: st) && LittleLinks.isDefaultHandler()]
     }
 
     /// Global on/off for the overlay (v2.7); anything but an explicit `false` means on.

@@ -1,10 +1,11 @@
 import Carbon
 import Foundation
 
-/// Global hot keys via Carbon: Control+Option+S (pin) and Control+Option+Shift+S (overlay on/off).
+/// Global hot keys via Carbon: Control+Option+S (pin), Control+Option+Shift+S (overlay on/off) and Control+Option+N (little window).
 enum HotKey {
     static let pinID: UInt32 = 1
     static let toggleOverlayID: UInt32 = 2
+    static let littleID: UInt32 = 3
 
     private static var handlerRef: EventHandlerRef?
     private static var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
@@ -45,6 +46,11 @@ enum HotKey {
     /// Control+Option+S.
     static func registerPin(action: @escaping () -> Void) {
         register(id: pinID, keyCode: kVK_ANSI_S, modifiers: controlKey | optionKey, action: action)
+    }
+
+    /// Control+Option+N (v2.8: new little window).
+    static func registerLittle(action: @escaping () -> Void) {
+        register(id: littleID, keyCode: kVK_ANSI_N, modifiers: controlKey | optionKey, action: action)
     }
 
     /// Control+Option+Shift+S.

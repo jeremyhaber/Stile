@@ -19,6 +19,8 @@ final class CloseInterceptor {
     struct Roles {
         var mainWindowId: Int?
         var mergeOnClose: Bool
+        /// v2.8: Chrome window ids of little windows (never merged, no overlay).
+        var littleWindowIds: Set<Int> = []
     }
 
     /// Cached close button of a visible Chrome window (AX coordinates, top-left origin).
@@ -33,6 +35,8 @@ final class CloseInterceptor {
     var mappingProvider: ((Int) -> WindowMapper.Mapping?)?
     var chromePid: (() -> pid_t)?
     var focusedWindowKey: (() -> Int?)?
+    /// Called after a bridge's cached roles changed (the manager re-evaluates which windows are little).
+    var onRolesChanged: (() -> Void)?
 
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -101,22 +105,40 @@ final class CloseInterceptor {
     }
 
     private func rolesChanged(_ b: ProfileBridge, _ payload: [String: Any]?) {
-        if let p = payload, p["mainWindowId"] != nil || p["mergeOnClose"] != nil {
+        if let p = payload, p["mainWindowId"] != nil || p["mergeOnClose"] != nil || p["littleWindowIds"] != nil {
             roles[b.id] = parseRoles(p)
+            onRolesChanged?()
         } else {
             fetchRoles(b)
         }
     }
 
     private func parseRoles(_ d: [String: Any]) -> Roles {
-        Roles(mainWindowId: JSONUtil.int(d["mainWindowId"]), mergeOnClose: (d["mergeOnClose"] as? Bool) ?? false)
+        let little = ((d["littleWindowIds"] as? [Any]) ?? []).compactMap { JSONUtil.int($0) }
+        return Roles(mainWindowId: JSONUtil.int(d["mainWindowId"]), mergeOnClose: (d["mergeOnClose"] as? Bool) ?? false,
+                     littleWindowIds: Set(little))
+    }
+
+    /// True when the mapped Chrome window is a little window according to the cached roles.
+    func isLittle(_ m: WindowMapper.Mapping?) -> Bool {
+        guard let m = m, !m.bridge.closed, let r = roles[m.bridge.id] else { return false }
+        return r.littleWindowIds.contains(m.windowId)
+    }
+
+    /// The (bridge, windowId) of the window with this key when it is a little window.
+    private func littleWindow(_ key: Int) -> (bridge: ProfileBridge, windowId: Int)? {
+        guard let m = mappingProvider?(key), isLittle(m) else { return nil }
+        return (m.bridge, m.windowId)
     }
 
     private func fetchRoles(_ b: ProfileBridge) {
         Task { @MainActor [weak self] in
             do {
                 let res = try await b.call("sidebar.windowRoles")
-                if let d = res as? [String: Any] { self?.roles[b.id] = self?.parseRoles(d) }
+                if let d = res as? [String: Any], let self = self {
+                    self.roles[b.id] = self.parseRoles(d)
+                    self.onRolesChanged?()
+                }
             } catch {
                 Log.write("close-interceptor: sidebar.windowRoles failed for \(b.profileDir): \(error.localizedDescription)")
             }
@@ -138,7 +160,8 @@ final class CloseInterceptor {
     /// The (bridge, windowId) to merge when the window with this key is an interceptable pop-out.
     private func qualifying(_ key: Int) -> (bridge: ProfileBridge, windowId: Int)? {
         guard let m = mappingProvider?(key), !m.bridge.closed, let r = roles[m.bridge.id],
-              r.mergeOnClose, let main = r.mainWindowId, main != m.windowId else { return nil }
+              r.mergeOnClose, let main = r.mainWindowId, main != m.windowId,
+              !r.littleWindowIds.contains(m.windowId) else { return nil }
         return (m.bridge, m.windowId)
     }
 
@@ -177,8 +200,18 @@ final class CloseInterceptor {
             return false
 
         case .keyDown:
-            guard event.getIntegerValueField(.keyboardEventKeycode) == 13 else { return false }
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
             let relevant: CGEventFlags = [.maskCommand, .maskShift, .maskControl, .maskAlternate]
+            if code == 31 {
+                // Command+O in a little window: "Open as tab" (swallowed; key repeat promotes only once).
+                guard event.flags.intersection(relevant) == [.maskCommand], chromeIsFrontmost(),
+                      let key = focusedWindowKey?(), let l = littleWindow(key) else { return false }
+                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                    LittleLinks.promote(bridge: l.bridge, windowId: l.windowId)
+                }
+                return true
+            }
+            guard code == 13 else { return false }
             guard event.flags.intersection(relevant) == [.maskCommand, .maskShift] else { return false }
             if targets.isEmpty || !chromeIsFrontmost() { return false }
             guard let key = focusedWindowKey?(), let t = targets[key], let q = qualifying(key) else { return false }

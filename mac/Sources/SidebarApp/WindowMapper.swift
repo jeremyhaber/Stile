@@ -34,7 +34,7 @@ final class WindowMapper {
             var lists: [(ProfileBridge, [[String: Any]])] = []
             for b in bridges {
                 do {
-                    let res = try await b.call("windows.getAll", [["windowTypes": ["normal"]]])
+                    let res = try await b.call("windows.getAll", [["windowTypes": ["normal", "popup"]]])
                     if let arr = res as? [[String: Any]] { lists.append((b, arr)) }
                 } catch {
                     Log.write("mapper: windows.getAll failed for \(b.profileDir): \(error.localizedDescription)")

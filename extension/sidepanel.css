@@ -769,3 +769,22 @@ html.compact .kbd-hint { opacity: 0; pointer-events: none; }
 .split-row .half { position: relative; }
 
 .hc-actions { display: flex; gap: 6px; margin-top: 6px; }
+
+/* ---- v2.8: Temporary section, little-window settings ---- */
+.sec-h h2 .count { margin-left: 6px; padding: 0 6px; border-radius: 8px; background: var(--active); color: var(--dim); font-size: 10px; font-weight: 600; letter-spacing: 0; line-height: 15px; display: inline-block; vertical-align: 1px; font-variant-numeric: tabular-nums; }
+.sec-h h2 .count[hidden] { display: none; }
+/* hidden while empty like Favourites/Pinned, but a drag never reveals it (nothing can be dropped there) */
+body.drag-reveal #sec-temp.sec-empty { max-height: 0; opacity: 0; margin-top: 0; visibility: hidden; pointer-events: none; }
+.sec-temp { transition: max-height 160ms var(--ease, ease), opacity 160ms var(--ease, ease), margin-top 160ms var(--ease, ease), visibility 0s linear 0s; }
+.temp-row .title { flex: 1; }
+.temp-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--accent-text); margin: 0 2px; }
+.row .tag { flex: none; padding: 0 6px; border-radius: 6px; background: var(--active); color: var(--dim); font-size: 10px; font-weight: 600; line-height: 16px; }
+/* compact strip: the open dot sits at the icon's top-right inside the pill, like the audible dot */
+html.overlay.compact .row .temp-dot {
+  position: absolute; top: 5px; left: calc(var(--icon-x) - var(--gut) + 3px); width: 7px; height: 7px; margin: 0;
+  box-shadow: 0 0 0 1.5px var(--bg); pointer-events: none; z-index: 2;
+}
+.field .sublabel { display: block; margin: 12px 0 6px; font-weight: 500; }
+.field .cap { margin: 10px 6px 6px; font-size: 12px; font-weight: 500; }
+#field-little .seg { margin-left: 6px; }
+#field-little select { width: 100%; }

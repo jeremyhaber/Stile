@@ -63,6 +63,15 @@
           </header>
           <div id="pinned" class="tree" role="tree" aria-label="Pinned" data-testid="pinned-tree"></div>
         </section>
+        <section class="sec sec-temp sec-empty" id="sec-temp" data-testid="temp-section">
+          <header class="sec-h">
+            <h2>Temporary<span class="count" id="temp-count" data-testid="temp-count"></span></h2>
+            <span class="sec-actions">
+              <button id="temp-clear" type="button" class="text-btn" aria-label="Archive all temporary links" title="Archive all temporary links" data-testid="temp-clear">Clear</button>
+            </span>
+          </header>
+          <div id="temp-list" class="list" role="list" aria-label="Temporary" data-testid="temp-list"></div>
+        </section>
         <section class="sec sec-today">
           <header class="sec-h">
             <h2>Today</h2>
@@ -130,6 +139,27 @@
           <label>Windows</label>
           <label class="check sub"><input type="checkbox" id="set-merge-on-close" data-testid="settings-merge-on-close"><span>When you close a pop-out window, move its tabs back to the main window</span></label>
           <p class="hint">Closing a pop-out that has a single tab archives that tab instead. The main window is the first window of the session; right-click a window in Today to change it.</p>
+        </div>
+        <div class="field" id="field-pinned">
+          <label>Pinned</label>
+          <label class="check sub"><input type="checkbox" id="set-pinned-reset" data-testid="pinned-reset-on-restart"><span>Reset pinned tabs when Chrome restarts</span></label>
+          <p class="hint">After a restart, Favourites and Pinned tabs that had wandered off go back to their original page. The back button (↶) still resets one by hand.</p>
+        </div>
+        <div class="field" id="field-little" data-testid="settings-little">
+          <label id="little-label">Little windows</label>
+          <label class="check sub"><input type="checkbox" id="set-little-default" data-testid="little-default-browser"><span>Open links from other apps in little windows</span></label>
+          <p class="hint" id="little-default-hint" data-testid="little-default-hint"></p>
+          <p class="cap" id="little-style-cap">Window style</p>
+          <div class="seg" role="group" aria-labelledby="little-style-cap" data-testid="little-style">
+            <button type="button" class="seg-b" data-style="minimal" aria-pressed="true">Minimal</button>
+            <button type="button" class="seg-b" data-style="regular" aria-pressed="false">Regular</button>
+          </div>
+          <p class="hint" id="little-style-hint"></p>
+          <label for="set-little-max" class="sublabel">Keep open at most</label>
+          <select id="set-little-max" data-testid="little-max-open"></select>
+          <label for="set-temp-expiry" class="sublabel">Move temporary links to Archive after</label>
+          <select id="set-temp-expiry" data-testid="temporary-expiry"></select>
+          <p class="hint">Control+Option+N opens a little window from anywhere.</p>
         </div>
         <div class="field" id="field-pin-mode" hidden><!-- legacy; kept for the testid, never shown -->
           <label for="set-pin-mode">When pinned</label>
