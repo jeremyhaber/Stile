@@ -29,6 +29,6 @@
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>NSAccessibilityUsageDescription</key>
-    <string>Sidebar needs Accessibility access to follow Chrome's windows and draw its sidebar and tab-bar cover on top of them.</string>
+    <string>Sidebar needs Accessibility access to follow Chrome's windows and to draw its sidebar over Chrome's vertical tab rail.</string>
 </dict>
 </plist>

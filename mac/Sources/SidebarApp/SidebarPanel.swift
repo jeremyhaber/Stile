@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import WebKit
 
 /// Non-activating panel (can become key so text fields work) hosting the side panel UI in a WKWebView.
@@ -12,7 +13,11 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     var onResize: ((CGFloat) -> Void)?
     var onResizeEnded: (() -> Void)?
 
+    /// Transparent panel content: holds `container` (clipped, rounded) and the peek shadow strip.
+    let root = NSView(frame: .zero)
+    /// Clips the web view; its width is the sidebar's logical width.
     let container = NSView(frame: .zero)
+    let shadowStrip = NSView(frame: .zero)
     let webView: WKWebView
     let handle = ResizeHandleView(frame: .zero)
 
@@ -21,6 +26,7 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     private var bridge: ProfileBridge?
     private var subscription: UUID?
     private var loadedKey: String?
+    private var lastHostJSON = ""
     private var pageLoaded = false
     private var trampoline: ScriptMessageTrampoline?
     private let userContent: WKUserContentController
@@ -58,9 +64,22 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         trampoline = t
         userContent.add(t, name: "sidebarBridge")
 
+        root.wantsLayer = true
         container.wantsLayer = true
         container.layer?.masksToBounds = true
-        contentView = container
+        container.autoresizingMask = [.height]
+        root.addSubview(container)
+
+        shadowStrip.wantsLayer = true
+        let gradient = CAGradientLayer()
+        gradient.colors = [NSColor.black.withAlphaComponent(0.22).cgColor, NSColor.black.withAlphaComponent(0).cgColor]
+        gradient.startPoint = CGPoint(x: 0, y: 0.5)
+        gradient.endPoint = CGPoint(x: 1, y: 0.5)
+        shadowStrip.layer = gradient
+        shadowStrip.autoresizingMask = [.height]
+        shadowStrip.isHidden = true
+        root.addSubview(shadowStrip)
+        contentView = root
 
         webView.navigationDelegate = self
         webView.autoresizingMask = [.height, .maxXMargin]
@@ -73,7 +92,7 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         container.addSubview(webView)
 
         handle.autoresizingMask = [.minXMargin, .height]
-        handle.currentWidth = { [weak self] in self?.frame.width ?? 280 }
+        handle.currentWidth = { [weak self] in self?.container.frame.width ?? 280 }
         handle.onResizeBegan = { [weak self] in self?.onResizeBegan?() }
         handle.onResize = { [weak self] w in self?.onResize?(w) }
         handle.onResizeEnded = { [weak self] in self?.onResizeEnded?() }
@@ -89,11 +108,27 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
-    /// Lay the web view out at a fixed width (the panel itself may be narrower while animating).
-    func fitContent(width: CGFloat) {
-        let h = container.bounds.height
+    /// Lay the web view out at a fixed logical width (the panel itself may be narrower while animating).
+    /// `shadow` is the width of the transparent shadow strip to the right of the content (peek only).
+    func fitContent(width: CGFloat, shadow: CGFloat = 0) {
+        let h = root.bounds.height
+        container.frame = NSRect(x: 0, y: 0, width: width, height: h)
         webView.frame = NSRect(x: 0, y: 0, width: width, height: h)
-        handle.frame = NSRect(x: container.bounds.width - 6, y: 0, width: 6, height: h)
+        handle.frame = NSRect(x: max(0, width - 6), y: 0, width: 6, height: h)
+        shadowStrip.isHidden = shadow <= 0
+        shadowStrip.frame = NSRect(x: width, y: 0, width: max(shadow, 0), height: h)
+    }
+
+    /// Square flush corners except: 10 px on the right while floating, and on the bottom-left when the
+    /// panel sits in the corner of Chrome's (rounded) window.
+    func setCorners(right: Bool, bottomLeft: Bool) {
+        guard let layer = container.layer else { return }
+        var mask: CACornerMask = []
+        // On macOS (non-flipped layers) MinY is the bottom edge.
+        if right { mask.insert(.layerMaxXMinYCorner); mask.insert(.layerMaxXMaxYCorner) }
+        if bottomLeft { mask.insert(.layerMinXMinYCorner) }
+        layer.maskedCorners = mask
+        layer.cornerRadius = mask.isEmpty ? 0 : 10
     }
 
     // MARK: Content
@@ -114,12 +149,27 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         .box{padding:24px;text-align:center;max-width:240px;opacity:.85}
         h1{font-size:14px;margin:0 0 10px}
         p{margin:6px 0;line-height:1.45;opacity:.75}
+        .mini{display:none;height:100vh;align-items:center;justify-content:center;font-size:18px;opacity:.5}
+        @media (max-width:120px){.box{display:none}.mini{display:flex}}
         </style>
+        <div class="mini">&hellip;</div>
         <div class="box"><h1>Waiting for the Sidebar extension&hellip;</h1>
-        <p>Make sure the Sidebar extension is installed and enabled in this Chrome profile and that the native helper is set up.</p>
+        <p>Make sure the Sidebar extension is loaded and enabled in this Chrome profile.</p>
         <p>This window connects automatically.</p></div>
         """
         webView.loadHTMLString(html, baseURL: nil)
+    }
+
+    /// The "Add the Sidebar extension to this profile" card.
+    func showSetup(candidates: [(dir: String, name: String)]) {
+        let key = "setup:" + candidates.map { $0.dir }.joined(separator: ",")
+        if loadedKey == key { return }
+        if let sub = subscription { bridge?.removeSubscriber(sub) }
+        subscription = nil
+        bridge = nil
+        loadedKey = key
+        pageLoaded = false
+        webView.loadHTMLString(SetupCard.html(candidates: candidates), baseURL: nil)
     }
 
     func connect(bridge newBridge: ProfileBridge, windowId: Int) {
@@ -205,9 +255,12 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         webView.evaluateJavaScript("window.__sidebarBridgeReceive && window.__sidebarBridgeReceive(\(lit))", completionHandler: nil)
     }
 
-    func sendHostState(pinned: Bool, pinMode: String, state: String) {
-        let obj: [String: Any] = ["pinned": pinned, "pinMode": pinMode, "state": state]
+    /// Calls window.__sidebarHostState({state, railFound, railControllable, launchAtLogin, accessibility, appVersion, ...}).
+    /// Identical consecutive states are skipped unless `force` (e.g. after a page load).
+    func sendHostState(_ obj: [String: Any], force: Bool = false) {
         guard let json = JSONUtil.string(obj) else { return }
+        if !force && json == lastHostJSON { return }
+        lastHostJSON = json
         webView.evaluateJavaScript("window.__sidebarHostState && window.__sidebarHostState(\(json))", completionHandler: nil)
     }
 
@@ -217,12 +270,14 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         pageLoaded = true
+        lastHostJSON = ""
         onHost?("pageLoaded", nil)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         Log.write("sidebar: web content process terminated; reloading")
         pageLoaded = false
+        lastHostJSON = ""
         webView.reload()
     }
 }

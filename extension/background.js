@@ -307,6 +307,8 @@ function connectHelper() {
   p.onDisconnect.addListener(() => {
     const msg = (chrome.runtime.lastError && chrome.runtime.lastError.message) || '';
     if (port === p) port = null;
+    // No app on the other end any more: stop forwarding bridge events.
+    handleBridgeMessage({ type: 'overlayStatus', connected: false }).catch(() => {});
     failAllWaiting(new Error(msg || 'helper disconnected'));
     const notInstalled = msg === 'Specified native messaging host not found.' || /host not found/i.test(msg);
     enqueue(() => setHelper(notInstalled
@@ -1402,7 +1404,10 @@ chrome.bookmarks.onRemoved.addListener((id, info) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'archive-sweep') enqueue(sweep).catch(() => {});
+  // Reconnect to the Mac app if it was restarted (the connector won't relaunch it after "Quit Sidebar").
+  if (alarm.name === 'helper-retry' && !port) connectHelper();
 });
+chrome.alarms.get('helper-retry').then((a) => { if (!a) chrome.alarms.create('helper-retry', { periodInMinutes: 1 }); }).catch(() => {});
 
 // Runs a side-panel command (also used by the overlay bridge's sidebar.cmd). Resolves to the response object.
 function dispatchCommand(msg, sender) {

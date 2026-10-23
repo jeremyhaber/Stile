@@ -11,10 +11,6 @@
 </head>
 <body>
   <div id="app">
-    <div id="overlay-bar" class="overlay-bar" hidden>
-      <span class="ob-title">Sidebar</span>
-      <button type="button" id="pin-toggle" class="icon-btn" data-testid="pin-toggle" aria-pressed="false" aria-label="Pin sidebar" title="Pin sidebar"></button>
-    </div>
     <section id="view-main" class="view" data-testid="view-main">
       <div class="top">
         <div id="profiles" class="profiles" data-testid="profile-switcher" hidden></div>
@@ -32,6 +28,13 @@
         </div>
       </div>
       <div class="scroll" id="scroll-main">
+        <div id="vt-hint" class="hint-card" data-testid="vertical-tabs-hint" hidden>
+          <div class="hc-body">
+            <strong>Turn on vertical tabs to get the full sidebar</strong>
+            <span>Right-click Chrome's tab bar → Show tabs vertically. Then collapse them.</span>
+          </div>
+          <button type="button" class="icon-btn" id="vt-hint-close" aria-label="Dismiss" title="Dismiss" data-testid="vertical-tabs-hint-dismiss"></button>
+        </div>
         <div id="left-hint" class="hint-card" data-testid="left-hint" hidden>
           <div class="hc-body">
             <strong>Put this panel on the left</strong>
@@ -106,7 +109,7 @@
           <label class="check sub"><input type="checkbox" id="set-merge-on-close" data-testid="settings-merge-on-close"><span>When you close a pop-out window, move its tabs back to the main window</span></label>
           <p class="hint">Closing a pop-out that has a single tab archives that tab instead. The main window is the first window of the session; right-click a window in Today to change it.</p>
         </div>
-        <div class="field" id="field-pin-mode" hidden>
+        <div class="field" id="field-pin-mode" hidden><!-- legacy; kept for the testid, never shown -->
           <label for="set-pin-mode">When pinned</label>
           <select id="set-pin-mode" data-testid="settings-pin-mode">
             <option value="push">Move the page over</option>
@@ -124,12 +127,26 @@
           <div id="profile-styles" class="pstyles" data-testid="settings-profiles"></div>
         </div>
         <div class="field">
-          <label>Profile helper</label>
+          <label>Sidebar app</label>
           <div class="status-line">
             <span class="status-dot" id="helper-dot"></span>
             <span id="helper-status" data-testid="helper-status"></span>
             <button type="button" class="btn small" id="helper-retry" data-testid="helper-retry">Retry</button>
           </div>
+        </div>
+        <div class="field app" id="field-app" data-testid="settings-app" hidden>
+          <label>App</label>
+          <label class="check sub"><input type="checkbox" id="app-pinned" data-testid="app-pinned"><span>Pinned sidebar</span></label>
+          <label class="check sub"><input type="checkbox" id="app-login" data-testid="app-launch-login"><span>Launch at login</span></label>
+          <div class="status-line">
+            <span class="status-dot" id="app-ax-dot"></span>
+            <span id="app-ax-status" data-testid="app-accessibility"></span>
+            <button type="button" class="btn small" id="app-ax-open" data-testid="app-accessibility-open">Open settings</button>
+          </div>
+          <p class="hint" id="app-float-note" data-testid="app-float-note" hidden>Couldn't control Chrome's tab rail; pinned sidebar will float over the page.</p>
+          <button type="button" class="btn" id="app-rescan" data-testid="app-rescan">Find Chrome's tab rail again</button>
+          <p class="hint" id="app-version" data-testid="app-version"></p>
+          <button type="button" class="btn danger" id="app-quit" data-testid="app-quit">Quit Sidebar</button>
         </div>
         <div class="field tips">
           <label>Tips</label>
@@ -143,10 +160,16 @@
     <!-- BOOST HOOK 3 slot: setView('boost') empties this element and calls renderBoostView(rootEl, ctx) on it -->
     <section id="view-boost" class="view" hidden></section>
 
+    <!-- Compact strip (overlay mode, Chrome's rail collapsed): icons only, built by drawCompact() -->
+    <section id="view-compact" class="view" data-testid="compact-strip" aria-label="Sidebar">
+      <div id="compact-list" class="compact-list"></div>
+    </section>
+
     <footer id="footer" class="footer">
       <button type="button" id="archive-btn" class="foot-btn" aria-label="Archive" title="Archive" data-testid="archive-button"><span class="foot-ic" id="archive-ic"></span><span>Archive</span><span class="badge" id="archive-count" data-testid="archive-count" hidden></span></button>
       <span class="spacer"></span>
       <button type="button" id="newwin-btn" class="icon-btn" aria-label="New window" title="New window" data-testid="new-window-button"></button>
+      <button type="button" id="pin-toggle" class="icon-btn" data-testid="pin-toggle" aria-pressed="false" aria-label="Pin sidebar" title="Pin sidebar" hidden></button>
       <button type="button" id="settings-btn" class="icon-btn" aria-label="Settings" title="Settings" data-testid="settings-button"></button>
     </footer>
   </div>

@@ -3,18 +3,21 @@ import AppKit
 /// Owns the tracker, the window mapper and one OverlayController per Chrome window.
 @MainActor
 final class OverlayManager {
-    let server: BridgeServer
+    let server: HostServer
     let tracker = ChromeTracker()
     let mapper = WindowMapper()
     private(set) var controllers: [Int: OverlayController] = [:]
 
     private var followTimer: Timer?
+    private var railTimer: Timer?
+    private var lastFocusedKey: Int?
+    private var tickCount = 0
     private var monitors: [Any] = []
     private var bridgeSubscriptions: [UUID: (ProfileBridge, UUID)] = [:]
     private var observers: [NSObjectProtocol] = []
     private var started = false
 
-    init(server: BridgeServer) {
+    init(server: HostServer) {
         self.server = server
     }
 
@@ -52,7 +55,28 @@ final class OverlayManager {
         }) {
             monitors.append(l)
         }
+        let rt = Timer(timeInterval: 1.0, target: self, selector: #selector(secondTick), userInfo: nil, repeats: true)
+        RunLoop.main.add(rt, forMode: .common)
+        railTimer = rt
         bridgesChanged()
+    }
+
+    /// Once a second: re-validate rails (and re-scan while unmatched), host state, missing-extension cards.
+    @objc private func secondTick() {
+        tickCount += 1
+        let quiet = Date().timeIntervalSince(tracker.lastGeometryEvent) < 0.5
+        if tickCount % 5 == 0, !server.identified.isEmpty, controllers.values.contains(where: { $0.isUnmapped }) {
+            mapper.schedule()   // retry matching windows to extension windows
+        }
+        var candidates: [(dir: String, name: String)]?
+        for c in controllers.values {
+            c.railTick(quiet: quiet)
+            if c.needsSetupCheck {
+                if candidates == nil { candidates = server.missingProfiles() }
+                c.applySetup(candidates: candidates ?? [])
+            }
+            c.pushHostState()
+        }
     }
 
     // MARK: Events
@@ -104,6 +128,13 @@ final class OverlayManager {
         }
         mapper.schedule()
         if Date().timeIntervalSince(tracker.lastGeometryEvent) < 0.3 { startFollowing() }
+
+        // Focus change: look at Chrome's rail again for the newly focused window.
+        let focused = tracker.focusedWindowKey()
+        if focused != lastFocusedKey {
+            lastFocusedKey = focused
+            if let k = focused, let c = controllers[k] { c.rescan(reason: "focus change") }
+        }
     }
 
     private func applyMapping() {

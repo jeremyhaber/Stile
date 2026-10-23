@@ -1,9 +1,0 @@
-{
-  "name": "com.sidebar.helper",
-  "description": "Sidebar helper: profile list, profile switching and shared settings",
-  "path": "__HELPER_PATH__",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://ffblekellgdmlecjablfojaaadpkmdgg/"
-  ]
-}

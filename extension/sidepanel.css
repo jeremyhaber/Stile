@@ -35,7 +35,7 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme]) {
     --bg-base: #1f2023;
     --fg: #ececf0;
     --dim: rgba(236, 236, 240, 0.58);
@@ -59,6 +59,33 @@
     --scrim: rgba(0, 0, 0, 0.5);
   }
 }
+
+/* Overlay mode sets data-theme itself (a Chrome colour scheme forced to light/dark beats the OS setting). Keep in sync with the block above. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+    --bg-base: #1f2023;
+    --fg: #ececf0;
+    --dim: rgba(236, 236, 240, 0.58);
+    --faint: rgba(236, 236, 240, 0.36);
+    --hover: rgba(255, 255, 255, 0.07);
+    --active: rgba(255, 255, 255, 0.12);
+    --ring: rgba(255, 255, 255, 0.16);
+    --tile-base: rgba(255, 255, 255, 0.06);
+    --input-base: rgba(255, 255, 255, 0.08);
+    --dash: rgba(255, 255, 255, 0.24);
+    --accent: #8d98ff;
+    --accent-soft: rgba(141, 152, 255, 0.2);
+    --p-bg: 16%;
+    --p-active: 26%;
+    --g-grey: #a1a6b0; --g-blue: #6ea8fe; --g-red: #ff7b80; --g-yellow: #f5c542; --g-green: #5ccf7f;
+    --g-pink: #ff7ab8; --g-purple: #b78cf0; --g-cyan: #4cd2e0; --g-orange: #ffa24d;
+    --danger: #ff7a70;
+    --menu-bg: #2c2d31;
+    --menu-line: rgba(255, 255, 255, 0.1);
+    --menu-shadow: 0 6px 24px rgba(0, 0, 0, 0.5), 0 1px 3px rgba(0, 0, 0, 0.4);
+    --scrim: rgba(0, 0, 0, 0.5);
+}
+:root[data-theme="light"] { color-scheme: light; }
 
 /* Profile theme: --profile is set from script; everything below derives from it. */
 :root.has-profile {
@@ -455,16 +482,76 @@ select:disabled { opacity: 0.5; }
 .boost-slot:empty { display: none; }
 #boost-settings-slot:empty { display: none; }
 
-/* ---- overlay mode (?mode=overlay, hosted by Sidebar.app) ---- */
-.overlay-bar { display: none; }
-html.overlay .overlay-bar { display: flex; align-items: center; justify-content: space-between; height: 30px; padding: 2px 6px 0 12px; flex: none; }
-html.overlay .overlay-bar[hidden] { display: none; }
-html.overlay .ob-title { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--faint); }
-html.overlay #pin-toggle { width: 26px; height: 26px; }
-html.overlay #pin-toggle[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent-text); }
-html.overlay #pin-toggle[aria-pressed="true"] svg { fill: currentColor; fill-opacity: 0.25; }
-html.overlay #left-hint, html.overlay .field.tips { display: none !important; }
-html.overlay { background: var(--bg); }
-html.overlay body { background: var(--bg); }
+/* ---- overlay mode (?mode=overlay, hosted by Sidebar.app): looks like Chrome's own vertical tab rail ---- */
+html.overlay {
+  --ov-base: var(--chrome-user, #0b57d0);
+  --bg: #e9eef6;
+  --accent: var(--ov-base);
+  --row-h: 32px;
+  --active: color-mix(in oklab, var(--ov-base) 18%, var(--bg));
+  --hover: color-mix(in oklab, var(--ov-base) 9%, var(--bg));
+  --tile: color-mix(in oklab, var(--ov-base) 7%, var(--bg));
+  --input: color-mix(in oklab, var(--ov-base) 7%, var(--bg));
+  --ring: color-mix(in oklab, var(--ov-base) 30%, var(--bg));
+  --accent-soft: color-mix(in oklab, var(--ov-base) 24%, transparent);
+  --accent-text: var(--ov-base);
+  --menu-hl: color-mix(in oklab, var(--ov-base) 18%, var(--menu-bg));
+  --menu-hl-fg: var(--fg);
+}
+html.overlay.has-chrome-color { --bg: color-mix(in oklab, var(--chrome-user) 22%, white); }
+html.overlay[data-theme="dark"] {
+  --bg: #1f1f1f;
+  --accent: var(--chrome-user, #a8c7fa);
+  --on-accent: #062e6f;
+  --active: color-mix(in oklab, var(--ov-base) 30%, var(--bg));
+  --hover: color-mix(in oklab, var(--ov-base) 15%, var(--bg));
+  --tile: color-mix(in oklab, var(--ov-base) 12%, var(--bg));
+  --input: color-mix(in oklab, var(--ov-base) 12%, var(--bg));
+  --ring: color-mix(in oklab, var(--ov-base) 45%, var(--bg));
+  --accent-soft: color-mix(in oklab, var(--ov-base) 30%, transparent);
+  --accent-text: color-mix(in oklab, var(--chrome-user, #a8c7fa) 55%, white);
+}
+html.overlay[data-theme="dark"].has-chrome-color { --bg: color-mix(in oklab, var(--chrome-user) 28%, #1f1f1f); --accent: color-mix(in oklab, var(--chrome-user) 60%, white); }
+html.overlay, html.overlay body { background: var(--bg); }
 html.overlay.overlay-float { background: transparent; }
 html.overlay.overlay-float body { border-radius: 0 10px 10px 0; overflow: hidden; }
+html.overlay #left-hint, html.overlay .field.tips { display: none !important; }
+/* pills: no borders, 8px radius */
+html.overlay .row.active, html.overlay .split-row .half.active { box-shadow: none; }
+html.overlay .fav-tile { border-radius: 8px; }
+html.overlay .fav-tile.active { box-shadow: none; }
+html.overlay #pin-toggle { width: 28px; height: 28px; }
+html.overlay #pin-toggle[aria-pressed="true"] { background: var(--active); color: var(--accent-text); }
+html.overlay #pin-toggle[aria-pressed="true"] svg { fill: currentColor; fill-opacity: 0.25; }
+html.overlay .footer .icon-btn { width: 28px; height: 28px; }
+#view-compact { display: none; }
+.field.app .hint { margin-left: 0; margin-right: 0; }
+.field.app .btn { margin-top: 6px; }
+.field.app .btn.small { margin: 0 0 0 auto; }
+
+/* compact strip: icons in 36px squares, 8px gap */
+html.compact .view:not(#view-compact) { display: none !important; }
+html.compact #view-compact { display: flex; }
+.compact-list {
+  flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 8px 0;
+  overflow-y: auto; overflow-x: hidden; scrollbar-width: none;
+}
+.compact-list::-webkit-scrollbar { display: none; }
+.cbtn, html.compact #archive-btn, html.compact #pin-toggle {
+  position: relative; width: 36px; height: 36px; flex: none; border-radius: 8px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center; color: var(--dim);
+  transition: background-color var(--t), color var(--t);
+}
+.cbtn:hover, html.compact #archive-btn:hover, html.compact #pin-toggle:hover { background: var(--hover); color: var(--fg); }
+.cbtn.active { background: var(--active); color: var(--fg); }
+.cbtn .fav-ic { width: 16px; height: 16px; }
+.cbtn .odot { position: absolute; bottom: 3px; left: 50%; width: 4px; height: 4px; margin-left: -2px; border-radius: 50%; background: var(--dim); }
+.cbtn.active .odot { background: var(--accent-text); }
+.cbtn .adot { position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent-text); box-shadow: 0 0 0 2px var(--bg); }
+.cdiv { width: 24px; height: 1px; margin: 0; border: 0; background: var(--ring); flex: none; }
+.compact-list .pbtn { width: 28px; height: 28px; opacity: 1; flex: none; }
+html.compact .footer { flex-direction: column; align-items: center; gap: 8px; padding: 8px 0; }
+html.compact .footer .spacer, html.compact #newwin-btn, html.compact #settings-btn, html.compact #archive-btn > span:not(.foot-ic) { display: none; }
+html.compact #archive-btn > #archive-count:not([hidden]) {
+  display: block; position: absolute; top: 5px; right: 5px; min-width: 0; width: 7px; height: 7px; padding: 0; border-radius: 50%; font-size: 0; background: var(--accent-text);
+}

@@ -77,7 +77,7 @@
       if (!set) return;
       for (const fn of [...set]) { try { fn(...(Array.isArray(m.args) ? m.args : [])); } catch (e) { console.error(e); } }
     } else if (m.type === 'hostState') {
-      const st = { pinned: !!m.pinned, pinMode: m.pinMode, state: m.state };
+      const st = { ...m }; delete st.type;
       host.last = st;
       if (typeof window.__sidebarHostState === 'function') { try { window.__sidebarHostState(st); } catch (e) { console.error(e); } }
     }

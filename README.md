@@ -13,20 +13,11 @@ Open the panel with the toolbar button or **Option+S** (change it at `chrome://e
 
 **Put the panel on the left:** Chrome Settings → Appearance → Side panel position → Left.
 
-## 2. Install the profile helper (once)
+## 2. Install Sidebar.app (Mac)
 
-The helper lets the panel switch profiles and share the "default for all profiles" archive setting. Everything else works without it.
+Sidebar.app draws the sidebar over Chrome's vertical tabs and also handles profile switching and settings shared across profiles. See `mac/README.md` for building and setup. In short: open Sidebar.app, allow Accessibility, then in Chrome right-click the tab bar → **Show tabs vertically** and collapse them.
 
-```bash
-cd ~/Applications/Sidebar/helper
-bash install.sh
-```
-
-Then open the panel's settings (gear icon) and click **Retry**, or restart Chrome. The status should read **Connected**. If a profile isn't signed in to Google, pick it once under **This profile**.
-
-To remove it: `bash uninstall.sh` (add `--purge` to also delete its settings and log).
-
-The helper uses the Perl that ships with macOS (`/usr/bin/perl`). If `install.sh` says Perl is missing, tell me and I'll provide a version that doesn't need it.
+Without Sidebar.app the extension still works as a normal Chrome side panel, minus profile switching and the shared archive default.
 
 ## 3. Optional: allow custom JavaScript in Boosts
 
@@ -52,7 +43,7 @@ Zap and custom CSS work straight away. To run your own JavaScript on a site, ope
 
 ## Known limits
 
-- Chrome's own tab strip can't be hidden by an extension.
+- Without Sidebar.app, Chrome's own tab strip stays visible (an extension alone can't hide it).
 - Profile switching is two windows trading places, so there's a brief flicker.
 - Typed searches open in Chrome's last-focused window.
 - Boosts can't run on Chrome's own pages or the Chrome Web Store.
@@ -62,5 +53,6 @@ Zap and custom CSS work straight away. To run your own JavaScript on a site, ope
 
 - `node tools/e2e.mjs` — end-to-end test in Chromium (extension + real helper with a fake Chrome profile list).
 - `node tools/boost-e2e.mjs` — Boost (Zap/Code) tests.
-- `perl helper/test-helper.pl` — helper protocol tests.
-- `SPEC.md`, `SPEC-v1.1.md`, `SPEC-v1.2.md` — design and the extension ⇄ helper protocol.
+- `node tools/fake-app/test-host.mjs` — host protocol tests against the Node reference of Sidebar.app's host.
+- `node tools/overlay-e2e.mjs` — the sidebar UI in overlay mode, driven like Sidebar.app does.
+- `SPEC*.md` — design notes and the extension ⇄ app protocol.

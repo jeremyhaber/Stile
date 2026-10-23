@@ -2,19 +2,29 @@ import AppKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let server = BridgeServer()
+    private let server = HostServer()
     private var manager: OverlayManager?
-    private var statusMenu: StatusMenu?
     private let permissions = Permissions()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        Log.write("Sidebar launching")
+        // One instance only: it owns host.sock.
+        if let bundleID = Bundle.main.bundleIdentifier {
+            let me = ProcessInfo.processInfo.processIdentifier
+            let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                .filter { $0.processIdentifier != me && !$0.isTerminated }
+            if !others.isEmpty {
+                Log.write("Sidebar already running (pid \(others[0].processIdentifier)); exiting")
+                NSApp.terminate(nil)
+                return
+            }
+        }
+        Log.write("Sidebar \(AppInfo.version) launching (no menu bar icon, no Dock icon)")
         installMainMenu()
 
+        HostSetup.runAtLaunch()
         server.start()
         let mgr = OverlayManager(server: server)
         manager = mgr
-        statusMenu = StatusMenu(manager: mgr, server: server)
 
         HotKey.register { [weak mgr] in
             Task { @MainActor in
@@ -22,8 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        permissions.ensure { [weak mgr] in
-            mgr?.start()
+        permissions.ensure { [weak self] in
+            guard let self = self else { return }
+            self.manager?.start()
+            self.server.setOverlayRunning(true)
         }
     }
 
@@ -60,6 +72,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 enum SidebarMain {
     static func main() {
+        // Connector mode: Chrome started this executable as a native messaging host.
+        // Must happen before anything touches AppKit.
+        if Connector.isConnectorLaunch() {
+            Connector.run()
+        }
+        // Started normally (Finder, login item): clear any earlier "quit by user" so Chrome can wake us again.
+        try? FileManager.default.removeItem(atPath: HostPaths.quitFlagPath)
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate

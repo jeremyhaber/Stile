@@ -2,54 +2,62 @@ import AppKit
 import ApplicationServices
 
 enum SidebarState {
-    case hidden
-    case peek
-    case pinned
+    case hidden      // no vertical-tab rail and not peeking: nothing on screen
+    case collapsed   // compact strip over Chrome's collapsed rail
+    case peek        // full sidebar sliding over the page
+    case pinned      // covering Chrome's expanded rail (or floating over the page as the fallback)
 
-    var name: String {
+    /// Name sent to the page ("collapsed" | "peek" | "pinned").
+    var hostName: String {
         switch self {
-        case .hidden: return "hidden"
         case .peek: return "peek"
         case .pinned: return "pinned"
+        case .hidden, .collapsed: return "collapsed"
         }
     }
 }
 
-/// One per Chrome window: owns the tab-strip cover and the sidebar panel and follows the window.
+/// One per Chrome window: owns the sidebar panel, finds the window's vertical tab rail and follows it.
 @MainActor
 final class OverlayController {
+    static let shadowWidth: CGFloat = 8
+    static let fallbackContentTop: CGFloat = 88
+
     let key: Int
     private(set) var window: ChromeWindow
-    let cover = TopCoverPanel()
     let sidebar = SidebarPanel()
 
-    private(set) var state: SidebarState = .hidden
     private var visible = false
     private var chromeFrontmost = false
     private var busy = false
     private var animating = false
     private var animToken = 0
     private var resizing = false
+    private var resizeStartWidth: CGFloat = 0
+    private var resizeSplitterStart: CGPoint?
 
-    private var tabH: CGFloat = 40
-    private var trafficW: CGFloat = 78
-    private var metricsAt = Date.distantPast
-    private var metricsOverride = -1
-    private var metricsDetected = false
+    // Rail discovery
+    private var rail: RailInfo?
+    private var contentTopRel: CGFloat?
+    private var lastScan = Date.distantPast
+    private var lastScanSize = CGSize.zero
+    private var loggedFound = false
+    private var loggedMissing = false
+    private var controlFailed = false   // Chrome's expand/collapse button could not be pressed or had no effect
 
-    private var pinnedPush = false      // geometry mode captured when pinned
-    private var shrunkBy: CGFloat = 0   // how much we shrank Chrome's window from the left
-    private var sidebarWidth: CGFloat = Settings.sidebarWidth
-
-    private var themeColor: NSColor?
-    private var themeDark = CoverView.systemIsDark()
+    // State inputs (the visible state is derived, see `state`)
+    private var peeking = false
+    private var floatPin = false        // fallback pin: floating over the page at peek width
+    private var peekWidth: CGFloat = Settings.peekWidth
 
     private var bridge: ProfileBridge?
     private var chromeWindowId: Int?
+    private var unmappedSince: Date? = Date()
 
     private let dwell = OneShot()
     private let hideTimer = OneShot()
-    private var dragOrigin = CGPoint.zero
+    private let rescanTimer = OneShot()
+    private let pressTimer = OneShot()
 
     /// Tell the manager that a geometry change was made locally (so it runs the follow timer).
     var onLocalGeometryChange: (() -> Void)?
@@ -61,28 +69,36 @@ final class OverlayController {
     }
 
     private func wireUp() {
-        cover.coverView.onToggleSidebar = { [weak self] in
-            guard let self = self else { return }
-            self.setPinned(self.state != .pinned)
-        }
-        cover.coverView.onNewTab = { [weak self] in self?.newTab() }
-        cover.coverView.onDragBegan = { [weak self] in
-            guard let self = self else { return }
-            self.dragOrigin = self.window.frame.origin
-        }
-        cover.coverView.onDrag = { [weak self] delta in self?.dragWindow(by: delta) }
-        cover.coverView.onDoubleClick = { [weak self] in self?.doubleClickTitleBar() }
-
         sidebar.onHost = { [weak self] action, value in self?.handleHost(action, value) }
         sidebar.onBridgeCall = { [weak self] call in self?.pageCalled(call) }
         sidebar.onDidBecomeKey = { [weak self] in self?.reorderSidebar() }
-        sidebar.onResizeBegan = { [weak self] in self?.resizing = true }
+        sidebar.onResizeBegan = { [weak self] in self?.beginResize() }
         sidebar.onResize = { [weak self] w in self?.liveResize(to: w) }
         sidebar.onResizeEnded = { [weak self] in
             guard let self = self else { return }
             self.resizing = false
-            Settings.sidebarWidth = self.sidebarWidth
+            if self.isFloating(self.state) { Settings.peekWidth = self.peekWidth }
         }
+    }
+
+    // MARK: Derived state
+
+    private var railExpanded: Bool { rail?.expanded ?? false }
+
+    var railControllable: Bool { rail != nil && rail?.button != nil && !controlFailed }
+
+    var state: SidebarState {
+        if rail != nil {
+            if railExpanded || floatPin { return .pinned }
+            return peeking ? .peek : .collapsed
+        }
+        if floatPin { return .pinned }
+        return peeking ? .peek : .hidden
+    }
+
+    /// Floating over the page (peek, or the fallback pin) rather than sitting on Chrome's rail.
+    private func isFloating(_ s: SidebarState) -> Bool {
+        s == .peek || (s == .pinned && !railExpanded)
     }
 
     // MARK: Lifecycle
@@ -90,23 +106,44 @@ final class OverlayController {
     func teardown() {
         dwell.cancel()
         hideTimer.cancel()
-        if state == .pinned { restoreWindowFromPush() }
-        cover.orderOut(nil)
+        rescanTimer.cancel()
+        pressTimer.cancel()
         sidebar.teardown()
     }
 
     func attach(_ mapping: WindowMapper.Mapping?) {
         if let m = mapping, !m.bridge.closed {
+            unmappedSince = nil
             if bridge !== m.bridge || chromeWindowId != m.windowId {
                 bridge = m.bridge
                 chromeWindowId = m.windowId
                 sidebar.connect(bridge: m.bridge, windowId: m.windowId)
             }
-        } else if bridge != nil || chromeWindowId != nil {
-            bridge = nil
-            chromeWindowId = nil
+        } else {
+            if bridge != nil || chromeWindowId != nil {
+                bridge = nil
+                chromeWindowId = nil
+                sidebar.showWaiting()
+                unmappedSince = Date()
+            }
+            if unmappedSince == nil { unmappedSince = Date() }
+        }
+    }
+
+    /// Visible but not matched to an extension window.
+    var isUnmapped: Bool { visible && bridge == nil }
+
+    /// True when this window has had no extension for more than 10 s (the manager then asks for the setup card).
+    var needsSetupCheck: Bool {
+        guard bridge == nil, visible, let since = unmappedSince else { return false }
+        return Date().timeIntervalSince(since) > 10
+    }
+
+    func applySetup(candidates: [(dir: String, name: String)]) {
+        if candidates.isEmpty {
             sidebar.showWaiting()
-            cover.coverView.setTitle("")
+        } else {
+            sidebar.showSetup(candidates: candidates)
         }
     }
 
@@ -119,73 +156,158 @@ final class OverlayController {
             hideAll()
             return
         }
-        refreshMetrics(force: !wasVisible)
+        if lastScan == .distantPast || !wasVisible {
+            rescan(reason: wasVisible ? "first" : "shown")
+        } else if w.frame.size != lastScanSize {
+            rescanTimer.schedule(after: 0.3) { [weak self] in
+                self?.rescanTimer.clear()
+                self?.rescan(reason: "window resized")
+            }
+        }
         layout()
     }
 
     func settingsChanged() {
-        sidebarWidth = Settings.sidebarWidth
-        if state == .pinned {
-            let wantPush = Settings.pinMode == "push"
-            if wantPush != pinnedPush {
-                restoreWindowFromPush()
-                applyPinGeometry()
-            } else if pinnedPush && shrunkBy > 0 {
-                adjustShrink(toWidth: sidebarWidth)
-            }
-        }
-        refreshMetrics(force: true)
+        peekWidth = Settings.peekWidth
         layout()
         pushHostState()
     }
 
-    // MARK: Metrics
+    // MARK: Rail discovery
 
-    private func refreshMetrics(force: Bool) {
-        let override = Settings.tabBarHeight
-        if override != metricsOverride { metricsOverride = override; metricsAt = .distantPast }
-        let stale = !metricsDetected && Date().timeIntervalSince(metricsAt) > 4
-        guard force || stale else { return }
-        metricsAt = Date()
-        metricsDetected = false
-        if override > 0 {
-            tabH = CGFloat(override)
-            metricsDetected = true
-        } else if let top = AX.toolbarTop(in: window.element, maxDepth: 6, maxNodes: 150) {
-            let h = top - window.frame.minY
-            if (20...80).contains(h) {
-                tabH = h
-                metricsDetected = true
-            } else {
-                tabH = 40
+    /// Scans the window's AX tree for the vertical tab rail and its collapse/expand button.
+    func rescan(reason: String) {
+        guard visible else { return }
+        lastScan = Date()
+        lastScanSize = window.frame.size
+        let scan = RailFinder.scan(window: window.element, windowFrame: window.frame,
+                                   wantLog: !(loggedFound && loggedMissing))
+        let nowFound = scan.rail != nil
+        // The first outcome of each kind (found / not found) per window is logged with the tree path.
+        if (nowFound && !loggedFound) || (!nowFound && !loggedMissing) {
+            Log.write("rail[window \(key)] scan (\(reason)):\n" + scan.logLines.joined(separator: "\n"))
+            if nowFound { loggedFound = true } else { loggedMissing = true }
+        }
+        apply(scan)
+    }
+
+    private func apply(_ scan: RailScan) {
+        rail = scan.rail
+        contentTopRel = scan.contentTopRel
+        if rail == nil { controlFailed = false }
+        if railExpanded {
+            // Chrome's own rail is open: it is the pinned state; fallback floating pin no longer applies.
+            floatPin = false
+            peeking = false
+        }
+        layout()
+        pushHostState()
+    }
+
+    /// Forced re-scan from the page's "Find Chrome's tab rail again" button.
+    func forceRescan() {
+        controlFailed = false
+        loggedFound = false
+        loggedMissing = false
+        rescan(reason: "requested")
+    }
+
+    /// Called by the manager about once a second.
+    func railTick(quiet: Bool) {
+        guard visible, !quiet else { return }
+        if let r = rail {
+            guard let f = AX.frame(r.railElement) else {
+                rescan(reason: "rail element gone")
+                return
             }
-        } else {
-            tabH = 40
+            let rel = CGRect(x: f.minX - window.frame.minX, y: f.minY - window.frame.minY, width: f.width, height: f.height)
+            if abs(rel.minX - r.rel.minX) > 1.5 || abs(rel.minY - r.rel.minY) > 1.5
+                || abs(rel.width - r.rel.width) > 1.5 || abs(rel.height - r.rel.height) > 1.5 {
+                rail?.rel = rel
+                if railExpanded { floatPin = false; peeking = false }
+                layout()
+                pushHostState()
+            }
+        } else if Date().timeIntervalSince(lastScan) > 2 {
+            rescan(reason: "no rail yet")
         }
-        if let zoom = AX.element(window.element, AXName.zoomButton), let zf = AX.frame(zoom) {
-            let w = zf.maxX - window.frame.minX + 8
-            trafficW = (40...200).contains(w) ? w : 78
-        } else {
-            trafficW = 78
+    }
+
+    /// Ask Chrome to expand or collapse its rail by pressing its button, then check the result.
+    private func pressRail(wantExpanded: Bool) {
+        guard let button = rail?.button else { return }
+        if !AX.perform(button, AXName.actionPress) {
+            Log.write("rail[window \(key)]: pressing Chrome's collapse/expand button failed; falling back to floating")
+            railControlFailed(wantExpanded: wantExpanded)
+            return
         }
+        checkRailAfterPress(wantExpanded: wantExpanded, attempt: 1)
+    }
+
+    private func checkRailAfterPress(wantExpanded: Bool, attempt: Int) {
+        pressTimer.schedule(after: attempt == 1 ? 0.25 : 0.4) { [weak self] in
+            guard let self = self else { return }
+            self.pressTimer.clear()
+            self.rescan(reason: "after pressing the rail button")
+            if self.rail != nil && self.railExpanded == wantExpanded { return }
+            if attempt < 2 {
+                self.checkRailAfterPress(wantExpanded: wantExpanded, attempt: attempt + 1)
+            } else {
+                Log.write("rail[window \(self.key)]: pressing the rail button did not change the rail; falling back to floating")
+                self.railControlFailed(wantExpanded: wantExpanded)
+            }
+        }
+    }
+
+    private func railControlFailed(wantExpanded: Bool) {
+        controlFailed = true
+        if wantExpanded { floatPin = true; peeking = false }
+        layout()
+        pushHostState()
     }
 
     // MARK: Geometry
 
     private var windowAX: CGRect { window.frame }
 
-    private func sidebarAXRect(width: CGFloat? = nil) -> CGRect {
+    /// Rail frame in AX coordinates, from the cached window-relative frame.
+    private func railAXRect() -> CGRect? {
+        guard let r = rail else { return nil }
         let w = windowAX
-        let sw = width ?? sidebarWidth
-        if state == .pinned && pinnedPush {
-            return CGRect(x: w.minX - sw, y: w.minY, width: sw, height: w.height)
-        }
-        return CGRect(x: w.minX, y: w.minY + tabH, width: sw, height: max(0, w.height - tabH))
+        return CGRect(x: w.minX + r.rel.minX, y: w.minY + r.rel.minY, width: r.rel.width, height: r.rel.height)
     }
 
+    private func contentTopAX() -> CGFloat {
+        windowAX.minY + (contentTopRel ?? Self.fallbackContentTop)
+    }
+
+    /// The sidebar's own frame (without the shadow strip) in AX coordinates for a state.
+    private func logicalAXRect(for s: SidebarState) -> CGRect {
+        let w = windowAX
+        let sw = max(peekWidth, Settings.minWidth)
+        switch s {
+        case .collapsed:
+            return railAXRect() ?? CGRect(x: w.minX, y: contentTopAX(), width: 48, height: max(0, w.maxY - contentTopAX()))
+        case .pinned where railExpanded:
+            return railAXRect() ?? CGRect(x: w.minX, y: contentTopAX(), width: sw, height: max(0, w.maxY - contentTopAX()))
+        case .peek, .pinned, .hidden:
+            if let r = railAXRect() {
+                return CGRect(x: r.minX, y: r.minY, width: max(sw, r.width), height: r.height)
+            }
+            let top = contentTopAX()
+            return CGRect(x: w.minX, y: top, width: sw, height: max(0, w.maxY - top))
+        }
+    }
+
+    private func currentLogicalNS() -> CGRect {
+        Geometry.flip(logicalAXRect(for: state))
+    }
+
+    /// 4 px hover zone on Chrome's left edge, only used when no rail was found.
     private var edgeZoneNS: CGRect {
         let w = windowAX
-        return Geometry.flip(CGRect(x: w.minX, y: w.minY + tabH, width: 4, height: max(0, w.height - tabH)))
+        let top = contentTopAX()
+        return Geometry.flip(CGRect(x: w.minX, y: top, width: 4, height: max(0, w.maxY - top)))
     }
 
     private func orderAbove(_ panel: NSPanel) {
@@ -201,28 +323,40 @@ final class OverlayController {
         orderAbove(sidebar)
     }
 
+    private func panelFrame(logical ns: NSRect, state s: SidebarState) -> NSRect {
+        var f = ns
+        if isFloating(s) { f.size.width += Self.shadowWidth }
+        return f
+    }
+
+    private func applyChrome(ax: CGRect, state s: SidebarState) {
+        let floating = isFloating(s)
+        let w = windowAX
+        let touchesBottomLeft = abs(ax.minX - w.minX) <= 2 && abs(ax.maxY - w.maxY) <= 2
+        sidebar.setCorners(right: floating, bottomLeft: touchesBottomLeft)
+        sidebar.handle.isHidden = !canResize(s)
+    }
+
+    private func canResize(_ s: SidebarState) -> Bool {
+        if isFloating(s) { return true }
+        if s == .pinned { return rail?.splitter != nil }
+        return false
+    }
+
     func layout() {
         guard visible else { return }
-        let w = windowAX
-        if Settings.coverEnabled {
-            let r = CGRect(x: w.minX + trafficW, y: w.minY, width: max(0, w.width - trafficW), height: tabH)
-            cover.setFrame(Geometry.flip(r), display: true)
-            orderAbove(cover)
-        } else {
-            cover.orderOut(nil)
-        }
-
-        switch state {
-        case .hidden:
+        let s = state
+        if s == .hidden {
             if !animating { sidebar.orderOut(nil) }
-        case .peek, .pinned:
-            if !animating {
-                let target = Geometry.flip(sidebarAXRect())
-                sidebar.setFrame(target, display: true)
-                sidebar.fitContent(width: target.width)
-                orderAbove(sidebar)
-            }
+            return
         }
+        if animating { return }
+        let ax = logicalAXRect(for: s)
+        let ns = Geometry.flip(ax)
+        sidebar.setFrame(panelFrame(logical: ns, state: s), display: true)
+        sidebar.fitContent(width: ns.width, shadow: isFloating(s) ? Self.shadowWidth : 0)
+        applyChrome(ax: ax, state: s)
+        orderAbove(sidebar)
     }
 
     private func hideAll() {
@@ -230,8 +364,7 @@ final class OverlayController {
         hideTimer.cancel()
         animToken += 1
         animating = false
-        if state == .peek { state = .hidden }
-        cover.orderOut(nil)
+        peeking = false
         sidebar.orderOut(nil)
     }
 
@@ -242,52 +375,69 @@ final class OverlayController {
         layout()
     }
 
-    // MARK: State
+    // MARK: State changes
 
     func setPinned(_ on: Bool) {
-        if on {
-            guard state != .pinned else { return }
-            dwell.cancel()
-            hideTimer.cancel()
-            animToken += 1
-            animating = false
-            applyPinGeometry()
-            state = .pinned
+        dwell.cancel()
+        hideTimer.cancel()
+        animToken += 1
+        animating = false
+        if railControllable {
+            if on {
+                if !railExpanded { pressRail(wantExpanded: true) }
+            } else {
+                floatPin = false
+                if railExpanded { pressRail(wantExpanded: false) }
+                peeking = false
+            }
+        } else if rail != nil && railExpanded {
+            // Chrome's rail is open but we cannot collapse it.
+            if !on { Log.write("rail[window \(key)]: cannot collapse Chrome's rail (no usable button)") }
         } else {
-            guard state == .pinned else { return }
-            restoreWindowFromPush()
-            state = .peek
-            animToken += 1
-            animating = false
-            scheduleHideIfOutside()
+            // No rail, or a rail we cannot control: pinned floats over the page at peek width.
+            floatPin = on
+            peeking = false
         }
         layout()
         pushHostState()
     }
 
     private func showPeek() {
-        guard state == .hidden, visible else { return }
-        state = .peek
-        let target = Geometry.flip(sidebarAXRect())
+        let before = state
+        guard before == .collapsed || before == .hidden, visible else { return }
+        peeking = true
+        let ax = logicalAXRect(for: .peek)
+        let ns = Geometry.flip(ax)
+        let target = panelFrame(logical: ns, state: .peek)
         var start = target
-        if !sidebar.isVisible { start.size.width = 1 } else { start = sidebar.frame }
+        if before == .collapsed && sidebar.isVisible { start = sidebar.frame } else { start.size.width = 1 }
         sidebar.setFrame(start, display: false)
-        sidebar.fitContent(width: target.width)
+        sidebar.fitContent(width: ns.width, shadow: Self.shadowWidth)
+        applyChrome(ax: ax, state: .peek)
         orderAbove(sidebar)
-        animateSidebar(to: target, duration: 0.14) { [weak self] in self?.layout() }
         pushHostState()
+        animateSidebar(to: target, duration: 0.14) { [weak self] in self?.layout() }
     }
 
     private func hidePeek() {
         guard state == .peek else { return }
-        state = .hidden
+        peeking = false
+        let after = state   // .collapsed (rail found) or .hidden
         var end = sidebar.frame
-        end.size.width = 1
+        if after == .collapsed {
+            end = Geometry.flip(logicalAXRect(for: .collapsed))
+        } else {
+            end.size.width = 1
+        }
         animateSidebar(to: end, duration: 0.12) { [weak self] in
             guard let self = self else { return }
-            if self.state == .hidden { self.sidebar.orderOut(nil) }
+            if self.state == .hidden {
+                self.sidebar.orderOut(nil)
+            } else {
+                self.layout()
+            }
+            self.pushHostState()
         }
-        pushHostState()
     }
 
     private func animateSidebar(to target: NSRect, duration: TimeInterval, completion: @escaping @MainActor () -> Void) {
@@ -307,76 +457,50 @@ final class OverlayController {
         })
     }
 
-    // MARK: Pin geometry (push mode)
+    // MARK: Resizing
 
-    private func applyPinGeometry() {
-        pinnedPush = Settings.pinMode == "push"
-        shrunkBy = 0
-        guard pinnedPush else { return }
-        let f = window.frame
-        let sw = sidebarWidth
-        let visibleMinX = Geometry.screen(forAXRect: f)?.visibleFrame.minX ?? 0
-        if f.minX - sw >= visibleMinX { return }   // free space on the left; nothing to resize
-
-        let newWidth = f.width - sw
-        guard newWidth >= 400 else {
-            pinnedPush = false                      // window too small to push; float instead
-            return
+    private func beginResize() {
+        resizing = true
+        resizeStartWidth = sidebar.container.frame.width
+        resizeSplitterStart = nil
+        if state == .pinned && !isFloating(state), let sp = rail?.splitter {
+            resizeSplitterStart = AX.point(sp, AXName.position)
         }
-        AX.setPosition(window.element, CGPoint(x: f.minX + sw, y: f.minY))
-        AX.setSize(window.element, CGSize(width: newWidth, height: f.height))
-        if let actual = AX.frame(window.element) {
-            // Chrome may have refused the full shrink (minimum width). Keep the right edge in place.
-            if abs(actual.maxX - f.maxX) > 1 {
-                AX.setPosition(window.element, CGPoint(x: f.maxX - actual.width, y: f.minY))
-            }
-            let now = AX.frame(window.element) ?? actual
-            shrunkBy = max(0, now.minX - f.minX)
-            window.frame = now
-        } else {
-            shrunkBy = sw
-        }
-        onLocalGeometryChange?()
-    }
-
-    private func adjustShrink(toWidth newW: CGFloat) {
-        let delta = newW - shrunkBy
-        guard abs(delta) >= 1, let f = AX.frame(window.element) else { return }
-        let nw = f.width - delta
-        guard nw >= 400 else { return }
-        AX.setPosition(window.element, CGPoint(x: f.minX + delta, y: f.minY))
-        AX.setSize(window.element, CGSize(width: nw, height: f.height))
-        if let now = AX.frame(window.element) {
-            shrunkBy = max(0, shrunkBy + (now.minX - f.minX))
-            window.frame = now
-        }
-        onLocalGeometryChange?()
-    }
-
-    private func restoreWindowFromPush() {
-        defer { shrunkBy = 0 }
-        guard shrunkBy > 0, let f = AX.frame(window.element) else { return }
-        AX.setPosition(window.element, CGPoint(x: f.minX - shrunkBy, y: f.minY))
-        AX.setSize(window.element, CGSize(width: f.width + shrunkBy, height: f.height))
-        if let now = AX.frame(window.element) { window.frame = now }
-        onLocalGeometryChange?()
     }
 
     private func liveResize(to proposed: CGFloat) {
-        let w = min(max(proposed, Settings.minWidth), Settings.maxWidth)
-        guard abs(w - sidebarWidth) >= 1 else { return }
-        if state == .pinned && pinnedPush && shrunkBy > 0 {
-            adjustShrink(toWidth: w)
+        let s = state
+        if isFloating(s) {
+            let w = min(max(proposed, Settings.minWidth), Settings.maxWidth)
+            guard abs(w - peekWidth) >= 1 else { return }
+            peekWidth = w
+            layout()
+        } else if s == .pinned, let sp = rail?.splitter, let start = resizeSplitterStart {
+            // Drag Chrome's own rail splitter, if it lets us.
+            let delta = proposed - resizeStartWidth
+            if !AX.setPosition(sp, CGPoint(x: start.x + delta, y: start.y)) {
+                Log.write("rail[window \(key)]: cannot move the rail splitter")
+            }
+            refreshRailFrame()
         }
-        sidebarWidth = w
+    }
+
+    private func refreshRailFrame() {
+        guard let r = rail, let f = AX.frame(r.railElement) else { return }
+        rail?.rel = CGRect(x: f.minX - window.frame.minX, y: f.minY - window.frame.minY, width: f.width, height: f.height)
         layout()
     }
 
     // MARK: Pointer / hover
 
     private func pointerInsideSidebar(_ p: NSPoint) -> Bool {
-        if sidebar.isVisible && sidebar.frame.insetBy(dx: -2, dy: -2).contains(p) { return true }
-        return edgeZoneNS.contains(p)
+        currentLogicalNS().insetBy(dx: -2, dy: -2).contains(p)
+    }
+
+    /// The pointer is over our visible strip and nothing of another app is on top of it.
+    private func overStrip(_ p: NSPoint) -> Bool {
+        guard sidebar.isVisible, sidebar.frame.contains(p) else { return false }
+        return NSWindow.windowNumber(at: p, belowWindowWithWindowNumber: 0) == sidebar.windowNumber
     }
 
     func pointerMoved(_ p: NSPoint, chromeFrontmost f: Bool) {
@@ -384,16 +508,9 @@ final class OverlayController {
         guard visible else { return }
         switch state {
         case .hidden:
-            if f && edgeZoneNS.contains(p) {
-                if !dwell.isScheduled {
-                    dwell.schedule(after: 0.08) { [weak self] in
-                        self?.dwell.clear()
-                        self?.dwellFired()
-                    }
-                }
-            } else {
-                dwell.cancel()
-            }
+            if f && edgeZoneNS.contains(p) { scheduleDwell() } else { dwell.cancel() }
+        case .collapsed:
+            if overStrip(p) { scheduleDwell() } else { dwell.cancel() }
         case .peek:
             if pointerInsideSidebar(p) || resizing {
                 hideTimer.cancel()
@@ -405,9 +522,25 @@ final class OverlayController {
         }
     }
 
+    private func scheduleDwell() {
+        if dwell.isScheduled { return }
+        dwell.schedule(after: 0.12) { [weak self] in
+            self?.dwell.clear()
+            self?.dwellFired()
+        }
+    }
+
     private func dwellFired() {
-        guard state == .hidden, visible, chromeFrontmost else { return }
-        if edgeZoneNS.contains(NSEvent.mouseLocation) { showPeek() }
+        guard visible else { return }
+        let p = NSEvent.mouseLocation
+        switch state {
+        case .hidden:
+            if chromeFrontmost && edgeZoneNS.contains(p) { showPeek() }
+        case .collapsed:
+            if overStrip(p) { showPeek() }
+        default:
+            break
+        }
     }
 
     private func scheduleHideIfOutside() {
@@ -427,76 +560,56 @@ final class OverlayController {
 
     // MARK: Host messages from the web UI
 
+    private func boolValue(_ v: Any?) -> Bool {
+        (v as? Bool) ?? ((v as? NSNumber)?.boolValue ?? false)
+    }
+
     private func handleHost(_ action: String, _ value: Any?) {
         switch action {
         case "ready", "pageLoaded":
-            pushHostState()
+            pushHostState(force: true)
         case "setPinned":
-            setPinned((value as? Bool) ?? ((value as? NSNumber)?.boolValue ?? false))
-        case "setPinMode":
-            if let s = value as? String, s == "push" || s == "float" {
-                Settings.pinMode = s    // posts a notification; the manager calls settingsChanged on every controller
-            }
-        case "theme":
-            if let d = value as? [String: Any] {
-                if let c = d["color"] as? String { themeColor = ColorParse.parse(c) }
-                if let dark = d["dark"] as? Bool { themeDark = dark }
-                applyTheme()
-            }
+            setPinned(boolValue(value))
+        case "setPeekWidth":
+            if let d = JSONUtil.double(value) { Settings.peekWidth = CGFloat(d) }   // posts; the manager calls settingsChanged
+        case "quitApp":
+            FileManager.default.createFile(atPath: HostPaths.quitFlagPath, contents: nil)
+            NSApp.terminate(nil)
+        case "setLaunchAtLogin":
+            LoginItem.set(boolValue(value))
+            Settings.post()
+        case "openAccessibilitySettings":
+            Permissions.openSettings()
+        case "rescanRail":
+            forceRescan()
+        case "openExtensions":
+            if let dir = value as? String, !dir.isEmpty { HostActions.openExtensionsPage(profileDir: dir) }
+        case "revealExtension":
+            HostActions.revealExtensionFolder()
         case "busy":
-            busy = (value as? Bool) ?? ((value as? NSNumber)?.boolValue ?? false)
+            busy = boolValue(value)
             if busy { hideTimer.cancel() } else { scheduleHideIfOutside() }
-        case "activeTitle":
-            if let d = value as? [String: Any] {
-                cover.coverView.setTitle((d["title"] as? String) ?? "")
-            }
         default:
-            break
+            break   // theme, activeTitle: nothing to do now that the app draws no chrome of its own
         }
     }
 
-    private func applyTheme() {
-        let base = themeDark ? NSColor(srgbRed: 0.125, green: 0.129, blue: 0.141, alpha: 1)
-                             : NSColor(srgbRed: 0.945, green: 0.953, blue: 0.957, alpha: 1)
-        let bg = themeColor.map { ColorParse.mix(base, $0, amount: 0.14) } ?? base
-        cover.coverView.applyTheme(background: bg, dark: themeDark)
-        cover.backgroundColor = bg
+    func pushHostState(force: Bool = false) {
+        let s = state
+        let obj: [String: Any] = [
+            "state": s.hostName,
+            "pinned": s == .pinned,
+            "railFound": rail != nil,
+            "railControllable": railControllable,
+            "launchAtLogin": LoginItem.enabled,
+            "accessibility": Permissions.isTrusted,
+            "appVersion": AppInfo.version,
+            "peekWidth": Int(peekWidth),
+        ]
+        sidebar.sendHostState(obj, force: force)
     }
 
-    func pushHostState() {
-        sidebar.sendHostState(pinned: state == .pinned, pinMode: Settings.pinMode, state: state == .pinned ? "pinned" : "peek")
-    }
-
-    // MARK: Actions
-
-    private func newTab() {
-        guard let b = bridge, let id = chromeWindowId else { return }
-        b.callDetached("tabs.create", [["windowId": id]])
-        reassertChrome()
-    }
-
-    private func dragWindow(by delta: CGSize) {
-        let origin = CGPoint(x: dragOrigin.x + delta.width, y: dragOrigin.y + delta.height)
-        if AX.setPosition(window.element, origin) {
-            window.frame.origin = origin
-            layout()
-            onLocalGeometryChange?()
-        }
-    }
-
-    private func doubleClickTitleBar() {
-        let pref = UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") ?? "Maximize"
-        switch pref {
-        case "Minimize":
-            AX.setBool(window.element, AXName.minimized, true)
-        case "None":
-            break
-        default:
-            if let zoom = AX.element(window.element, AXName.zoomButton) {
-                AX.perform(zoom, AXName.actionPress)
-            }
-        }
-    }
+    // MARK: Page calls
 
     private func pageCalled(_ call: String) {
         if call == "sidebar.cmd" || call.hasPrefix("tabs.") || call.hasPrefix("windows.") {

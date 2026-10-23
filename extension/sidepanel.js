@@ -398,6 +398,12 @@ function draw() {
     return k && (k === a || !a.matches('input,select')) ? k.dataset.key + (k === a ? '' : '|child') : null;
   })();
   drawTheme();
+  if (OVERLAY && HOSTS.state === 'collapsed') {
+    drawCompact();
+    drawFooter();
+    postActiveTitle();
+    return;
+  }
   drawProfiles();
   drawPopoutBar();
   if (S.view === 'main') { drawHint(); drawFavs(); drawPinned(); drawToday(); }
@@ -429,6 +435,15 @@ function currentProfile() {
 function drawTheme() {
   const cur = currentProfile();
   const root = document.documentElement;
+  if (OVERLAY) {
+    // Overlay mode matches Chrome's own theme (see drawChromeTheme); the v1.1 profile tint is not used.
+    root.classList.remove('has-profile');
+    root.style.removeProperty('--profile');
+    root.style.removeProperty('--on-profile');
+    drawChromeTheme(cur);
+    postTheme(cur ? cur.style.color : null);
+    return;
+  }
   if (cur) {
     root.classList.add('has-profile');
     root.style.setProperty('--profile', cur.style.color);
@@ -438,7 +453,20 @@ function drawTheme() {
     root.style.removeProperty('--profile');
     root.style.removeProperty('--on-profile');
   }
-  if (OVERLAY) postTheme(cur ? cur.style.color : null);
+}
+
+// Overlay mode: colours come from the Chrome profile's theme (`chromeTheme`, read from Preferences by the host).
+// data-theme is always "light" or "dark" here: a forced Chrome colour scheme wins over the OS setting.
+let resolvedDark = false;
+function drawChromeTheme(cur) {
+  const root = document.documentElement;
+  const ct = (cur && cur.p && cur.p.chromeTheme) || null;
+  const color = ct && typeof ct.userColor === 'string' && /^#[0-9a-f]{6}$/i.test(ct.userColor) ? ct.userColor : null;
+  if (color) root.style.setProperty('--chrome-user', color); else root.style.removeProperty('--chrome-user');
+  root.classList.toggle('has-chrome-color', !!color);
+  const scheme = ct && ct.colorScheme;
+  resolvedDark = scheme === 'dark' ? true : scheme === 'light' ? false : !!(darkMq && darkMq.matches);
+  root.dataset.theme = resolvedDark ? 'dark' : 'light';
 }
 
 // Round avatar (button or span) for a profile in its resolved style.
@@ -517,6 +545,62 @@ function editProfileStyle(dir) {
 
 function drawHint() {
   $('left-hint').hidden = S.leftHintDismissed;
+  // Chrome is in horizontal-tabs mode (the app found no rail): explain how to get the full sidebar.
+  $('vt-hint').hidden = !(OVERLAY && HOSTS.railFound === false && !vtHintDismissed);
+}
+
+// ---- compact strip (overlay mode, state "collapsed"): icons only, like Chrome's collapsed vertical tab rail
+function compactBtn(testid, props, ...kids) {
+  return h('button', { type: 'button', class: 'cbtn' + (props.active ? ' active' : ''), 'data-testid': testid, 'data-nav': '',
+    'data-active': props.active ? 'true' : 'false', title: props.title, 'aria-label': props.title, onclick: props.onclick,
+    ...props.attrs }, ...kids);
+}
+
+function drawCompact() {
+  // The full lists are not rendered in compact mode (no text rows, no drag and drop).
+  for (const id of ['favs', 'pinned', 'today']) $(id).replaceChildren();
+  const act = activeTab();
+  const items = [];
+  const cur = currentProfile();
+  if (cur) {
+    items.push(avatarEl('button', cur.p, cur.style, {
+      type: 'button', 'data-testid': 'compact-profile', 'aria-label': `Profile ${cur.p.name}`, title: cur.p.name || 'Profile',
+      onclick: () => setView('main')
+    }));
+  }
+  const openDot = (tab) => (tab ? h('span', { class: 'odot', 'data-testid': 'open-dot' }) : null);
+  const favs = S.favs.map((n) => {
+    const tab = S.boundByBm.get(n.id);
+    const isActive = !!(tab && act && tab.id === act.id);
+    return compactBtn('compact-favourite', {
+      title: n.title || n.url, active: isActive, onclick: () => cmd('openItem', { bookmarkId: n.id, windowId: S.windowId }),
+      attrs: { 'data-id': n.id, 'data-url': n.url, 'data-open': tab ? 'true' : 'false' }
+    }, favEl(n.url, (tab || S.boundAny.get(n.id) || {}).favIconUrl), openDot(tab));
+  });
+  items.push(...favs);
+  if (favs.length) items.push(h('hr', { class: 'cdiv', 'data-testid': 'compact-divider' }));
+  for (const e of S.flat) {
+    const n = e.n;
+    const tab = n.url ? S.boundByBm.get(n.id) : null;
+    if (!tab) continue; // only pinned items that are open
+    const isActive = !!(act && tab.id === act.id);
+    items.push(compactBtn('compact-pinned', {
+      title: n.title || n.url, active: isActive, onclick: () => cmd('openItem', { bookmarkId: n.id, windowId: S.windowId }),
+      attrs: { 'data-id': n.id, 'data-url': n.url }
+    }, favEl(n.url, tab.favIconUrl)));
+  }
+  for (const tab of S.today) {
+    const isActive = !!(act && act.id === tab.id);
+    const url = tab.url || tab.pendingUrl || '';
+    const title = nameOf(tab) || tab.title || url || 'New Tab';
+    items.push(compactBtn('compact-tab', {
+      title, active: isActive, onclick: () => openTab(tab),
+      attrs: { 'data-tab-id': tab.id, 'data-url': url, 'data-window-id': tab.windowId, 'data-audible': tab.audible ? 'true' : null }
+    }, favEl(url, tab.favIconUrl), tab.audible ? h('span', { class: 'adot', 'data-testid': 'compact-audible', title: 'Playing audio' }) : null));
+  }
+  items.push(compactBtn('compact-new-tab', { title: 'New tab', onclick: () => safe(chrome.tabs.create({ windowId: S.windowId, active: true })) },
+    h('span', { class: 'fav-ic' }, icon('plus'))));
+  $('compact-list').replaceChildren(...items);
 }
 
 // ---- favourites
@@ -967,7 +1051,7 @@ function drawSettings() {
 
   $('set-archive-grouped').checked = S.archiveGrouped;
   $('set-merge-on-close').checked = S.mergeOnClose;
-  if (OVERLAY) { $('field-pin-mode').hidden = false; $('set-pin-mode').value = HOSTS.pinMode; }
+  if (OVERLAY) drawAppSettings();
   drawStyleList();
   const profiles = (connected && hs.profiles) || [];
   $('field-profile').hidden = !connected || !profiles.length;
@@ -986,7 +1070,7 @@ function drawSettings() {
   dot.className = 'status-dot';
   if (!hs || !hs.status) { status.textContent = 'Checking…'; }
   else if (hs.status === 'connected') { status.textContent = 'Connected'; dot.classList.add('ok'); }
-  else if (hs.status === 'not_installed') { status.textContent = 'Not installed — run helper/install.sh, then Retry'; dot.classList.add('bad'); }
+  else if (hs.status === 'not_installed') { status.textContent = 'Sidebar app not running — open Sidebar.app, then Retry'; dot.classList.add('bad'); }
   else { status.textContent = `Error: ${hs.error || 'unknown'}`; dot.classList.add('bad'); }
   status.dataset.status = (hs && hs.status) || 'checking';
   $('helper-retry').hidden = connected;
@@ -1789,7 +1873,7 @@ function setupListeners() {
   chrome.storage.onChanged.addListener((changes, area) => {
     const keys = Object.keys(changes);
     const rel = {
-      session: ['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge'],
+      session: ['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'overlayConnected'],
       local: ['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'roots', 'collapsedWindows', 'leftHintDismissed', 'tabNames'],
       sync: ['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose']
     }[area];
@@ -1804,7 +1888,10 @@ function setupListeners() {
 }
 
 // ------------------------------------------------------------------ overlay mode (host protocol)
-const HOSTS = { pinned: false, pinMode: 'push', state: 'peek' };
+// Host state pushed by the app (`__sidebarHostState`): state is "collapsed" | "peek" | "pinned".
+const HOSTS = { state: 'peek', railFound: null, railControllable: true, launchAtLogin: false, accessibility: null, appVersion: '', pinMode: 'push' };
+let vtHintDismissed = false;
+try { vtHintDismissed = localStorage.getItem('vtHintDismissed') === '1'; } catch { /* storage unavailable */ }
 const hostPost = (action, value) => { try { if (window.__sidebarHost) window.__sidebarHost.post(action, value); } catch { /* ignore */ } };
 const lastPosted = {};
 function postOnce(action, value) {
@@ -1817,7 +1904,7 @@ const darkMq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dar
 let themeColor = null;
 function postTheme(color) {
   if (color !== undefined) themeColor = color;
-  postOnce('theme', { color: themeColor, dark: !!(darkMq && darkMq.matches) });
+  postOnce('theme', { color: themeColor, dark: OVERLAY ? resolvedDark : !!(darkMq && darkMq.matches) });
 }
 function postActiveTitle() {
   const t = activeTab();
@@ -1830,29 +1917,72 @@ function isBusy() {
 }
 function updateBusy() { postOnce('busy', isBusy()); }
 
+const isPinned = () => HOSTS.state === 'pinned';
+
 function applyHostState(st) {
   if (!st) return;
-  HOSTS.pinned = !!st.pinned;
-  if (st.pinMode === 'push' || st.pinMode === 'float') HOSTS.pinMode = st.pinMode;
-  if (st.state === 'peek' || st.state === 'pinned') HOSTS.state = st.state;
+  const wasCompact = HOSTS.state === 'collapsed';
+  if (st.state === 'collapsed' || st.state === 'peek' || st.state === 'pinned') HOSTS.state = st.state;
+  else if (typeof st.pinned === 'boolean') HOSTS.state = st.pinned ? 'pinned' : 'peek'; // older hosts
+  if ('railFound' in st) HOSTS.railFound = typeof st.railFound === 'boolean' ? st.railFound : null;
+  if ('railControllable' in st) HOSTS.railControllable = st.railControllable !== false;
+  if ('launchAtLogin' in st) HOSTS.launchAtLogin = !!st.launchAtLogin;
+  if ('accessibility' in st) HOSTS.accessibility = typeof st.accessibility === 'boolean' ? st.accessibility : null;
+  if (typeof st.appVersion === 'string') HOSTS.appVersion = st.appVersion;
+  const root = document.documentElement;
+  // Chrome's own rail makes room when pinned, so the panel is only "floating" (rounded, over the page) in peek,
+  // or when pinned but the rail cannot be controlled.
+  root.classList.toggle('compact', HOSTS.state === 'collapsed');
+  root.classList.toggle('overlay-float', HOSTS.state === 'peek' || (isPinned() && !HOSTS.railControllable));
   const btn = $('pin-toggle');
-  btn.setAttribute('aria-pressed', HOSTS.pinned ? 'true' : 'false');
-  const lbl = HOSTS.pinned ? 'Unpin sidebar' : 'Pin sidebar';
+  btn.setAttribute('aria-pressed', isPinned() ? 'true' : 'false');
+  const lbl = isPinned() ? 'Unpin sidebar' : 'Pin sidebar';
   btn.title = lbl; btn.setAttribute('aria-label', lbl);
-  const sel = $('set-pin-mode');
-  if (sel) sel.value = HOSTS.pinMode;
-  document.documentElement.classList.toggle('overlay-float', HOSTS.state === 'peek' || HOSTS.pinMode === 'float');
+  drawAppSettings();
+  if (loaded) {
+    if (wasCompact !== (HOSTS.state === 'collapsed')) draw(); else drawHint();
+  }
+}
+
+// Settings > App (overlay mode only): mirrors the host state; changes are posted to the app.
+function drawAppSettings() {
+  if (!OVERLAY) return;
+  $('field-app').hidden = false;
+  $('app-pinned').checked = isPinned();
+  $('app-login').checked = HOSTS.launchAtLogin;
+  const ax = HOSTS.accessibility;
+  $('app-ax-status').textContent = ax === true ? 'Accessibility access granted' : ax === false ? 'Accessibility access needed' : 'Accessibility access unknown';
+  $('app-ax-dot').className = 'status-dot' + (ax === true ? ' ok' : ax === false ? ' bad' : '');
+  $('app-ax-open').hidden = ax !== false;
+  $('app-float-note').hidden = !(HOSTS.railFound !== false && !HOSTS.railControllable);
+  $('app-version').textContent = HOSTS.appVersion ? `Sidebar ${HOSTS.appVersion}` : '';
 }
 
 function setupOverlay() {
   document.documentElement.classList.add('overlay');
-  $('overlay-bar').hidden = false;
+  drawChromeTheme(null);
+  $('pin-toggle').hidden = false;
   $('pin-toggle').append(icon('pin', 15));
-  $('pin-toggle').addEventListener('click', () => hostPost('setPinned', !HOSTS.pinned));
+  $('pin-toggle').addEventListener('click', () => hostPost('setPinned', !isPinned()));
   $('set-pin-mode').addEventListener('change', (e) => hostPost('setPinMode', e.target.value));
+  $('app-pinned').addEventListener('change', (e) => hostPost('setPinned', e.target.checked));
+  $('app-login').addEventListener('change', (e) => hostPost('setLaunchAtLogin', e.target.checked));
+  $('app-ax-open').addEventListener('click', () => hostPost('openAccessibilitySettings', true));
+  $('app-rescan').addEventListener('click', () => hostPost('rescanRail', true));
+  $('app-quit').addEventListener('click', async () => {
+    const ok = await confirmDialog({ title: 'Quit Sidebar?', message: 'The sidebar will disappear until you open Sidebar again.', okLabel: 'Quit Sidebar', danger: true });
+    if (ok) hostPost('quitApp', true);
+  });
+  $('vt-hint-close').append(icon('x', 14));
+  $('vt-hint-close').addEventListener('click', () => {
+    vtHintDismissed = true;
+    try { localStorage.setItem('vtHintDismissed', '1'); } catch { /* ignore */ }
+    drawHint();
+  });
   window.__sidebarHostState = applyHostState;
+  drawAppSettings();
   if (window.__sidebarHost && window.__sidebarHost.last) applyHostState(window.__sidebarHost.last);
-  if (darkMq && darkMq.addEventListener) darkMq.addEventListener('change', () => postTheme());
+  if (darkMq && darkMq.addEventListener) darkMq.addEventListener('change', () => { if (loaded) drawTheme(); });
   new MutationObserver(updateBusy).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['class'] });
   document.addEventListener('dragstart', () => setTimeout(updateBusy, 0), true);
   document.addEventListener('dragend', () => setTimeout(updateBusy, 0), true);

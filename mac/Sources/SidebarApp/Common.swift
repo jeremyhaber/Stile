@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ServiceManagement
 
 extension Notification.Name {
     static let sidebarSettingsChanged = Notification.Name("ca.simplistics.sidebar.settingsChanged")
@@ -41,6 +42,14 @@ enum Log {
     }
 }
 
+// MARK: - App info
+
+enum AppInfo {
+    static var version: String {
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "2.1.0"
+    }
+}
+
 // MARK: - Settings (UserDefaults)
 
 enum Settings {
@@ -50,39 +59,49 @@ enum Settings {
         NotificationCenter.default.post(name: .sidebarSettingsChanged, object: nil)
     }
 
-    /// "push" or "float"
-    static var pinMode: String {
-        get { d.string(forKey: "pinMode") == "float" ? "float" : "push" }
-        set {
-            d.set(newValue == "float" ? "float" : "push", forKey: "pinMode")
-            post()
-        }
-    }
-
-    static var coverEnabled: Bool {
-        get { (d.object(forKey: "coverEnabled") as? Bool) ?? true }
-        set { d.set(newValue, forKey: "coverEnabled"); post() }
-    }
-
-    /// 0 = auto-detect, otherwise points.
-    static var tabBarHeight: Int {
-        get { d.integer(forKey: "tabBarHeight") }
-        set { d.set(newValue, forKey: "tabBarHeight"); post() }
-    }
-
     static let minWidth: CGFloat = 220
     static let maxWidth: CGFloat = 420
 
-    static var sidebarWidth: CGFloat {
+    /// Width of the sidebar while it peeks over the page (default 280, persisted).
+    static var peekWidth: CGFloat {
         get {
-            let v = CGFloat(d.double(forKey: "sidebarWidth"))
-            if v < minWidth { return 280 }
+            let v = CGFloat(d.double(forKey: "peekWidth"))
+            if v < minWidth {
+                let old = CGFloat(d.double(forKey: "sidebarWidth"))   // value stored by earlier versions
+                return old >= minWidth ? min(old, maxWidth) : 280
+            }
             return min(v, maxWidth)
         }
         set {
-            d.set(Double(min(max(newValue, minWidth), maxWidth)), forKey: "sidebarWidth")
+            d.set(Double(min(max(newValue, minWidth), maxWidth)), forKey: "peekWidth")
             post()
         }
+    }
+}
+
+// MARK: - Launch at login
+
+enum LoginItem {
+    private static var cache: (value: Bool, at: Date)?
+
+    static var enabled: Bool {
+        if let c = cache, Date().timeIntervalSince(c.at) < 5 { return c.value }
+        let v = SMAppService.mainApp.status == .enabled
+        cache = (v, Date())
+        return v
+    }
+
+    static func set(_ on: Bool) {
+        do {
+            if on {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            Log.write("login item change failed: \(error.localizedDescription)")
+        }
+        cache = nil
     }
 }
 
@@ -209,8 +228,14 @@ enum ColorParse {
 enum JSONUtil {
     static func string(_ obj: Any) -> String? {
         guard JSONSerialization.isValidJSONObject(obj),
-              let data = try? JSONSerialization.data(withJSONObject: obj, options: []) else { return nil }
+              let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return nil }
         return String(data: data, encoding: .utf8)
+    }
+
+    /// JSON bytes without escaped slashes (used for native messaging frames).
+    static func data(_ obj: Any) -> Data? {
+        guard JSONSerialization.isValidJSONObject(obj) else { return nil }
+        return try? JSONSerialization.data(withJSONObject: obj, options: [.withoutEscapingSlashes])
     }
 
     /// A JS string literal (with quotes) for arbitrary text.

@@ -53,10 +53,10 @@ final class Permissions: NSObject {
         w.title = "Sidebar needs Accessibility access"
         w.isReleasedWhenClosed = false
 
-        let heading = NSTextField(labelWithString: "Allow Sidebar to control Chrome's windows")
+        let heading = NSTextField(labelWithString: "Allow Sidebar to see Chrome's windows")
         heading.font = NSFont.boldSystemFont(ofSize: 14)
         let body = NSTextField(wrappingLabelWithString:
-            "Sidebar follows Chrome's windows and draws its sidebar and tab-bar cover on top of them. " +
+            "Sidebar follows Chrome's windows and draws its sidebar over Chrome's vertical tab rail. " +
             "That needs Accessibility permission. Open System Settings, enable Sidebar under Privacy & Security > Accessibility, " +
             "and this window will close by itself.")
         body.font = NSFont.systemFont(ofSize: 12)

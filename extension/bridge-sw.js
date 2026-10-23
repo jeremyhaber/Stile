@@ -126,6 +126,8 @@ export async function handleBridgeMessage(msg) {
   if (msg.type === 'overlayStatus') {
     connected = !!msg.connected;
     try { await chrome.storage.session.set({ overlayConnected: connected }); } catch { /* ignore */ }
+    // Tell the (re)connected app/page to refresh what it may have missed while no connection existed.
+    if (connected) send({ type: 'bridgeEvent', name: 'storage.onChanged', args: [{ overlayConnected: { newValue: true } }, 'session'] });
     return;
   }
   if (msg.type !== 'bridge') return;

@@ -1,5 +1,5 @@
-// End-to-end test: loads the extension in Chromium with the real helper wired up
-// through a fake Chrome "Local State" and a fake Chrome binary.
+// End-to-end test: loads the extension in Chromium, wired to the Node reference host (tools/fake-app, which
+// plays the Sidebar Mac app) through connector.js, a fake Chrome "Local State" and a fake Chrome binary.
 import { createRequire } from 'module';
 import fs from 'fs';
 import path from 'path';
@@ -14,16 +14,13 @@ const OUT = process.env.E2E_OUT || path.join(os.tmpdir(), 'sidebar-e2e-out');
 fs.mkdirSync(OUT, { recursive: true });
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbe2e-'));
 const udd = path.join(tmp, 'udd');
-const helperDir = path.join(tmp, 'helper');
+const helperDir = path.join(tmp, 'app'); // the reference app's data dir (state.json, host.sock)
 fs.mkdirSync(path.join(udd, 'NativeMessagingHosts'), { recursive: true });
 fs.mkdirSync(helperDir, { recursive: true });
 
-// Helper + native host manifest
-const helperPath = path.join(tmp, 'sidebar-helper.pl');
-fs.copyFileSync(path.join(ROOT, 'helper/sidebar-helper.pl'), helperPath);
-fs.chmodSync(helperPath, 0o755);
-const tpl = fs.readFileSync(path.join(ROOT, 'helper/com.sidebar.helper.json.template'), 'utf8');
-fs.writeFileSync(path.join(udd, 'NativeMessagingHosts/com.sidebar.helper.json'), tpl.replace('__HELPER_PATH__', helperPath));
+// Native host manifest -> the reference connector
+const { HostServer, writeHostManifest } = require('./fake-app/host-server.js');
+writeHostManifest(path.join(udd, 'NativeMessagingHosts'), path.join(ROOT, 'tools/fake-app/connector.js'));
 
 const localState = path.join(tmp, 'Local State');
 fs.writeFileSync(localState, JSON.stringify({ profile: { profiles_order: ['Default', 'Profile 1'], info_cache: {
@@ -36,6 +33,8 @@ const fakeChromeLog = path.join(tmp, 'chrome-args.log');
 const fakeChrome = path.join(tmp, 'fake-chrome.sh');
 fs.writeFileSync(fakeChrome, `#!/bin/sh\necho "$@" >> '${fakeChromeLog}'\n`);
 fs.chmodSync(fakeChrome, 0o755);
+const host = new HostServer({ appDir: helperDir, localState, chromeBin: fakeChrome });
+await host.listen();
 
 // Local pages
 const site = path.join(tmp, 'site');
@@ -58,7 +57,7 @@ async function main() {
     channel: 'chromium',
     headless: true,
     viewport: { width: 1200, height: 800 },
-    env: { ...process.env, SIDEBAR_HELPER_DIR: helperDir, SIDEBAR_LOCAL_STATE: localState, SIDEBAR_CHROME_BIN: fakeChrome },
+    env: { ...process.env, SIDEBAR_APP_DIR: helperDir },
     args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`],
   });
   let [sw] = ctx.serviceWorkers();
@@ -229,7 +228,7 @@ async function main() {
   await sleep(1200);
   const launched = fs.existsSync(fakeChromeLog) ? fs.readFileSync(fakeChromeLog, 'utf8') : '';
   check('switching profile launches Chrome with --profile-directory', launched.includes('--profile-directory=Profile 1'), launched.trim());
-  check('pending handoff written for target profile', fs.readdirSync(path.join(helperDir, 'pending')).some((f) => f.startsWith('Profile')));
+  check('pending handoff remembered for target profile', host.pending.has('Profile 1'));
 
   // Address field
   await panel.locator('[data-testid="address-field"]').fill('127.0.0.1:8765/bravo.html');
@@ -467,9 +466,8 @@ async function main() {
   await sleep(800);
 
   // Incoming "activate" from another profile's helper → window takes the given bounds
-  const net = await import('net');
   await swEval(async (w) => chrome.windows.update(w, { focused: true }), mainWin);
-  await new Promise((res, rej) => { const s = net.createConnection(path.join(helperDir, 'sock/Default.sock'), () => { s.end(JSON.stringify({ type: 'activate', bounds: { left: 40, top: 30, width: 900, height: 640, state: 'normal' } }) + '\n'); res(); }); s.on('error', rej); });
+  host.sendToProfile('Default', { type: 'activate', bounds: { left: 40, top: 30, width: 900, height: 640, state: 'normal' } });
   await sleep(1200);
   const wb = await swEval(async () => { const w = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }); return { left: w.left, top: w.top, width: w.width, height: w.height }; });
   check('activate from another profile applies window bounds', wb.width === 900 && wb.height === 640, JSON.stringify(wb));
@@ -477,6 +475,7 @@ async function main() {
   check('no page errors in panel', errors.length === 0, errors.slice(0, 3).join(' | '));
   const swErrs = await swEval(() => (self.__errs || []).length).catch(() => 0);
   await ctx.close();
+  await host.close();
   server.kill();
   console.log(`\n${pass} passed, ${fail} failed. Screenshots in ${OUT}`);
   process.exit(fail ? 1 : 0);
