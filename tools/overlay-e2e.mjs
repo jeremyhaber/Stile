@@ -41,6 +41,17 @@ await refApp.listen();
 let pass = 0, fail = 0;
 const check = (name, ok, extra = '') => { ok ? pass++ : fail++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? '  — ' + extra : ''}`); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Drag with a real gesture: press, move past the drag threshold, wait for empty Favourites/Pinned to be revealed (v2.5), then drop.
+async function dragReveal(page, src, tgt) {
+  await src.hover();
+  const b = await src.boundingBox();
+  await page.mouse.down();
+  await page.mouse.move(b.x + b.width / 2 + 8, b.y + b.height / 2 + 8, { steps: 4 });
+  await sleep(400);
+  await tgt.hover();
+  await page.mouse.up();
+}
 async function until(fn, ms = 8000, step = 100) {
   const t0 = Date.now();
   for (;;) { const v = await fn(); if (v) return v; if (Date.now() - t0 > ms) return v; await sleep(step); }
@@ -59,7 +70,7 @@ const U = (n) => `http://127.0.0.1:${SITE}/${n}.html`;
 // ------------------------------------------------------------------ the "Mac app"
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml', '.json': 'application/json' };
 const app = {
-  fromExt: [], bridgeEvents: [], sse: new Set(), hostLog: [],
+  fromExt: [], bridgeEvents: [], bridgeCalls: [], sse: new Set(), hostLog: [],
   host: { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: false, railFound: true, railControllable: true, launchAtLogin: false, accessibility: true, appVersion: '2.1.0-test' },
 };
 // TEST-ONLY split hook: Chromium 141 has no split API, so tabs served to the page through this test transport can be stamped with a
@@ -98,7 +109,7 @@ const appSrv = http.createServer((req, res) => {
     req.on('data', (d) => { body += d; });
     req.on('end', () => {
       let m; try { m = JSON.parse(body); } catch { res.writeHead(400).end(); return; }
-      if (m.type === 'bridge') { res.writeHead(toHelper(m) ? 204 : 503).end(); return; }
+      if (m.type === 'bridge') { app.bridgeCalls.push(m); res.writeHead(toHelper(m) ? 204 : 503).end(); return; }
       if (m.type === 'host') {
         app.hostLog.push({ action: m.action, value: m.value, t: Date.now() });
         if (m.action === 'ready') hostState();
@@ -317,6 +328,8 @@ async function main() {
       pill: act ? r(act.querySelector('.rbg')) : null, pillBg: act ? getComputedStyle(act.querySelector('.rbg')).backgroundColor : null,
       pinEmpty: cs('[data-testid="pinned-empty"]'), favEmpty: cs('[data-testid="favourites-empty"]'),
       pinEmptyO: cs('[data-testid="pinned-empty"]')?.opacity, favEmptyO: cs('[data-testid="favourites-empty"]')?.opacity,
+      secFavH: document.querySelector('.sec-favs').getBoundingClientRect().height, secPinH: document.getElementById('sec-pinned').getBoundingClientRect().height,
+      secFavVis: getComputedStyle(document.querySelector('.sec-favs')).visibility, secPinVis: getComputedStyle(document.getElementById('sec-pinned')).visibility,
       pinEmptyH: document.querySelector('[data-testid="pinned-empty"]').getBoundingClientRect().height,
       favEmptyH: document.querySelector('[data-testid="favourites-empty"]').getBoundingClientRect().height,
       dividerO: cs('.sec-h', '::after').opacity, dividerW: cs('.sec-h', '::after').width, dividerH: cs('.sec-h', '::after').height,
@@ -330,7 +343,7 @@ async function main() {
   check('v2.4 compact: every row keeps its y and height (railWidth 56)', gExp.rows.length === gCmp.rows.length && gExp.rows.every((b, i) => Math.abs(b.y - gCmp.rows[i].y) <= 1 && Math.abs(b.h - gCmp.rows[i].h) <= 1) && gExp.heads.every((b, i) => Math.abs(b.y - gCmp.heads[i].y) <= 1), JSON.stringify([gExp.rows.length, gCmp.rows.length]));
   check('v2.4 compact: active row background is a rounded square (<=44) centred on the icon column (x=28)', gCmp.pill && gCmp.pill.w <= 44 && gCmp.pill.h <= 44 && Math.abs(gCmp.pill.x + gCmp.pill.w / 2 - 28) <= 1 && gCmp.pillBg !== 'rgba(0, 0, 0, 0)', JSON.stringify(gCmp.pill));
   check('v2.4 expanded: the same pill element is the full-width row background', gExp.pill && gExp.pill.w > 250, JSON.stringify(gExp.pill));
-  check('v2.4 compact: empty placeholders are invisible (opacity 0) but keep their 32px height; expanded they are 32px and visible', gCmp.pinEmptyO === '0' && gCmp.favEmptyO === '0' && Math.abs(gCmp.pinEmptyH - 32) <= 1 && Math.abs(gCmp.favEmptyH - 32) <= 1 && Math.abs(gExp.pinEmptyH - 32) <= 1 && Math.abs(gExp.favEmptyH - 32) <= 1 && gExp.pinEmptyO === '1', JSON.stringify([gExp.pinEmptyH, gCmp.pinEmptyH, gCmp.pinEmptyO]));
+  check('v2.5 (both modes): empty Favourites / Pinned sections take no space and are hidden; their placeholders are still 32px lines', ['gExp', 'gCmp'].every((k) => true) && [gExp, gCmp].every((g) => g.secFavH === 0 && g.secPinH === 0 && g.secFavVis === 'hidden' && g.secPinVis === 'hidden') && Math.abs(gExp.pinEmptyH - 32) <= 1 && Math.abs(gExp.favEmptyH - 32) <= 1 && gCmp.pinEmptyO === '0' && gCmp.favEmptyO === '0', JSON.stringify([gExp.secFavH, gExp.secPinH, gCmp.secFavVis, gExp.pinEmptyH]));
   check('v2.4 compact: section headers swap their label for a 20x1 divider', gCmp.dividerO === '1' && gCmp.h2O === '0' && gExp.dividerO === '0' && gCmp.dividerW === '20px' && gCmp.dividerH === '1px', JSON.stringify([gExp.dividerO, gCmp.dividerO, gCmp.dividerW, gCmp.dividerH]));
   setHost({ compact: false, railWidth: 48 }); await sleep(450);
   const posBack = await POS();
@@ -370,6 +383,54 @@ async function main() {
   check('chromeColor: host theme post follows the sampled luminance', th2?.value.dark === false);
   setHost({ chromeColor: null }); await sleep(500);
   check('chromeColor null -> falls back to the Chrome theme estimate', (await panel.evaluate(() => getComputedStyle(document.body).backgroundColor)) === bgBefore);
+
+  // ---- Sidebar colour setting
+  {
+    const bg = () => panel.evaluate(() => getComputedStyle(document.body).backgroundColor);
+    const pushP = () => refApp.sendToProfile('Default', { type: 'profiles', profiles: refApp.profilesCapped() });
+    const NEUTRAL = ['rgb(233, 238, 246)', 'rgb(31, 31, 31)'];
+    const themeBg = await bg();
+    writePrefs({}); pushP();
+    const profBg = await until(async () => { const b = await bg(); return !NEUTRAL.includes(b) && b !== themeBg ? b : null; }, 20000, 200);
+    check('sidebar colour: auto with no chromeColor/theme seeds from the profile colour (not neutral grey)', !!profBg, String(profBg));
+    await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
+    check('sidebar colour: Automatic is selected and the note says "From your profile colour"',
+      (await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').getAttribute('aria-pressed')) === 'true' &&
+      /From your profile colour/.test(await panel.locator('[data-testid="sidebar-color-note"]').innerText()));
+    check('sidebar colour: no swatches while Automatic', (await panel.locator('[data-testid="sidebar-color-swatch"]:visible').count()) === 0);
+    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="custom"]').click(); await sleep(400);
+    check('sidebar colour: Custom shows 14 swatches and the picker', (await panel.locator('[data-testid="sidebar-color-swatch"]:visible').count()) === 14 && await panel.locator('[data-testid="sidebar-color-picker"]').isVisible());
+    await panel.locator('[data-testid="sidebar-color-swatch"][data-color="#f3e8ff"]').click(); await sleep(400);
+    check('sidebar colour: custom swatch sets the exact background', (await bg()) === hexToRgb('#f3e8ff'), await bg());
+    const storedSb = JSON.stringify(await swEval(async () => (await chrome.storage.sync.get('sidebarColor')).sidebarColor));
+    check('sidebar colour: stored in chrome.storage.sync', (() => { try { const o = JSON.parse(storedSb); return o.mode === 'custom' && o.color === '#f3e8ff'; } catch { return false; } })(), storedSb);
+    await panel.screenshot({ path: path.join(SHOTS, 'sidebar-colour-settings.png') });
+    await panel.locator('[data-testid="sidebar-color-picker"]').fill('#204060'); await sleep(500);
+    check('sidebar colour: picker value applies exactly (dark colour -> dark theme, light text)', (await bg()) === hexToRgb('#204060') && (await panel.evaluate(() => document.documentElement.dataset.theme)) === 'dark', await bg());
+    await panel.screenshot({ path: path.join(SHOTS, 'sidebar-colour-settings-dark.png') });
+    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(400);
+    await panel.screenshot({ path: path.join(SHOTS, 'sidebar-colour-custom-panel-dark.png') });
+    await panel.locator('[data-testid="settings-button"]').click(); await sleep(300);
+    // another open panel of the profile follows live through storage.onChanged
+    await swEval(async () => chrome.storage.sync.set({ sidebarColor: { mode: 'custom', color: '#e6f4ea' } })); await sleep(700);
+    check('sidebar colour: storage change applies live', (await bg()) === hexToRgb('#e6f4ea'), await bg());
+    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(400);
+    await panel.screenshot({ path: path.join(SHOTS, 'sidebar-colour-custom-panel.png') });
+    await panel.locator('[data-testid="settings-button"]').click(); await sleep(300);
+    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').click(); await sleep(500);
+    check('sidebar colour: back to Automatic restores the profile-derived colour', (await bg()) === profBg, await bg());
+    setHost({ chromeColor: '#3c4043' }); await sleep(500);
+    check('sidebar colour: auto + chromeColor still wins, note says "Matching Chrome exactly"', (await bg()) === hexToRgb('#3c4043') && /Matching Chrome exactly/.test(await panel.locator('[data-testid="sidebar-color-note"]').innerText()), await bg());
+    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="custom"]').click(); await sleep(300);
+    await panel.locator('[data-testid="sidebar-color-swatch"][data-color="#ff9f0a"]').click(); await sleep(400);
+    check('sidebar colour: custom beats chromeColor', (await bg()) === hexToRgb('#ff9f0a'), await bg());
+    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').click(); await sleep(300);
+    setHost({ chromeColor: null }); await sleep(300);
+    writePrefs({ user_color: GREEN }); pushP();
+    const thBg = await until(async () => { const b = await bg(); return b === themeBg ? b : null; }, 20000, 200);
+    check('sidebar colour: auto with a Chrome theme colour uses the theme estimate', !!thBg && /From your Chrome theme colour/.test(await panel.locator('[data-testid="sidebar-color-note"]').innerText()), String(thBg));
+    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+  }
 
   // ---- Settings > App
   await panel.locator('[data-testid="settings-button"]').click(); await sleep(300);
@@ -432,11 +493,60 @@ async function main() {
   await until(async () => (await todayRows()) === 5, 6000);
   check('live update: closed tab disappears', (await todayRows()) === 5, String(await todayRows()));
 
+  // ---- v2.5: new tab row, hidden empty sections, editing reports, Today menu
+  {
+    await panel.bringToFront();
+    setHost({ state: 'peek', compact: false }); await sleep(400);
+    const ntr = await panel.evaluate(() => {
+      const r = document.querySelector('[data-testid="new-tab-row"]'); const b = r.getBoundingClientRect(); const hint = r.querySelector('.kbd-hint');
+      const hb = hint && hint.getBoundingClientRect();
+      return { cls: r.className, h: b.height, label: r.querySelector('.title').textContent, hint: hint && hint.textContent, hintOp: hint && getComputedStyle(hint).opacity, hintRight: hb && Math.round(b.right - hb.right), visible: b.height > 0 };
+    });
+    check('v2.5: "New tab" row uses the tab-row pill style with a faint ⌘T hint on the right', ntr.visible && /\brow\b/.test(ntr.cls) && ntr.label === 'New tab' && ntr.hint === '⌘T' && ntr.hintOp === '1' && ntr.hintRight <= 12, JSON.stringify(ntr));
+    const secs = () => panel.evaluate(() => ({ f: document.querySelector('.sec-favs').getBoundingClientRect().height, p: document.getElementById('sec-pinned').getBoundingClientRect().height, fe: document.querySelector('[data-testid="favourites-empty"]')?.getBoundingClientRect().height, pe: document.querySelector('[data-testid="pinned-empty"]')?.getBoundingClientRect().height }));
+    const s0 = await secs();
+    check('v2.5: with nothing pinned, Favourites and Pinned are not shown', s0.f === 0 && s0.p === 0 && !(await panel.locator('[data-testid="new-folder-button"]').isVisible()), JSON.stringify(s0));
+    const topBefore = await panel.evaluate(() => document.querySelector('[data-testid="new-tab-row"]').getBoundingClientRect().top);
+    const row0 = panel.locator('[data-testid="today-row"]').nth(1);
+    await row0.hover(); const rb = await row0.boundingBox();
+    await panel.mouse.down(); await panel.mouse.move(rb.x + rb.width / 2 + 8, rb.y + rb.height / 2 + 8, { steps: 4 }); await sleep(450);
+    const s1 = await secs();
+    check('v2.5: starting a tab drag reveals the empty Favourites and Pinned drop areas (32px placeholders)', s1.f > 30 && s1.p > 50 && Math.abs(s1.fe - 32) <= 1 && Math.abs(s1.pe - 32) <= 1 && (await panel.locator('[data-testid="new-folder-button"]').isVisible()), JSON.stringify(s1));
+    await panel.screenshot({ path: path.join(SHOTS, 'drag-reveal-empty-sections.png') });
+    await panel.mouse.move(250, 3, { steps: 4 }); await panel.mouse.up(); await sleep(500);
+    const s2 = await secs();
+    check('v2.5: the empty sections disappear again after the drag ends', s2.f === 0 && s2.p === 0 && !(await panel.evaluate(() => document.body.classList.contains('drag-reveal'))), JSON.stringify(s2));
+    check('v2.5: layout returns to where it was', Math.abs((await panel.evaluate(() => document.querySelector('[data-testid="new-tab-row"]').getBoundingClientRect().top)) - topBefore) <= 1);
+    // Today's own context menu offers a new pinned folder
+    const nCtx = hostCount('contextMenu');
+    await panel.locator('.sec-today .sec-h').click({ button: 'right', position: { x: 60, y: 8 } });
+    await until(() => hostCount('contextMenu') > nCtx, 3000);
+    check('v2.5: right-click on the Today header offers "New pinned folder"', (lastHost('contextMenu')?.value.items || []).some((i) => i.label === 'New pinned folder'), JSON.stringify(lastHost('contextMenu')?.value.items?.map((i) => i.label)));
+    await panel.evaluate(() => window.__sidebarMenuResult(null)); await sleep(200);
+    // editing reports
+    const edits = () => app.hostLog.filter((x) => x.action === 'editing').map((x) => x.value);
+    const addr = panel.locator('[data-testid="address-field"]');
+    await addr.focus(); await until(() => lastHost('editing')?.value === true, 2000);
+    check('v2.5: focusing the address field posts editing:true', lastHost('editing')?.value === true, JSON.stringify(edits()));
+    await panel.locator('[data-testid="today-row"]').first().focus(); await until(() => lastHost('editing')?.value === false, 2000);
+    check('v2.5: moving focus to a row posts editing:false', lastHost('editing')?.value === false, JSON.stringify(edits()));
+    const nEd = hostCount('editing');
+    await panel.locator('[data-testid="today-row"]').first().press('F2'); await sleep(300);
+    await until(() => lastHost('editing')?.value === true, 2000);
+    check('v2.5: the rename input counts as editing', lastHost('editing')?.value === true && await panel.locator('.rename-input').count() === 1, JSON.stringify(edits()));
+    await panel.keyboard.press('Escape'); await until(() => lastHost('editing')?.value === false, 2000);
+    check('v2.5: leaving the rename input posts editing:false', lastHost('editing')?.value === false && hostCount('editing') >= nEd + 2, JSON.stringify(edits()));
+    await addr.focus(); await sleep(150);
+    await panel.evaluate(() => window.dispatchEvent(new Event('blur'))); await sleep(150);
+    check('v2.5: window blur posts editing:false', lastHost('editing')?.value === false);
+    await panel.locator('body').click({ position: { x: 300, y: 600 } }); await sleep(100);
+  }
+
   // ---- drag and drop
-  await panel.locator('[data-testid="today-row"][data-url*="charlie"]').dragTo(panel.locator('[data-testid="favourites-grid"]'));
+  await dragReveal(panel, panel.locator('[data-testid="today-row"][data-url*="charlie"]'), panel.locator('[data-testid="favourites-grid"]'));
   await sleep(900);
   check('drag tab -> favourites creates a tile', (await panel.locator('[data-testid="favourite-tile"]').count()) === 1);
-  await panel.locator('[data-testid="today-row"][data-url*="delta"]').dragTo(panel.locator('[data-testid="pinned-tree"]'));
+  await dragReveal(panel, panel.locator('[data-testid="today-row"][data-url*="delta"]'), panel.locator('[data-testid="pinned-tree"]'));
   await sleep(900);
   check('drag tab -> pinned creates a row', (await panel.locator('[data-testid="pinned-row"]').count()) === 1);
   check('busy was reported true during a drag', app.hostLog.some((x) => x.action === 'busy' && x.value === true));
@@ -660,6 +770,32 @@ async function main() {
   setHost({ state: 'peek', compact: false }); await sleep(500);
   check('compact -> peek restores the expanded view of the same rows', (await panel.locator('[data-testid="today-row"]').count()) >= 3 && (await panel.locator('[data-testid="compact-strip"]').count()) === 0);
 
+  // ---- v2.5: swap the halves of a split row by dragging one onto the other
+  {
+    setHost({ state: 'peek', compact: false }); await sleep(500);
+    const order = () => swEval(async ([w, a, b]) => { const ts = await chrome.tabs.query({ windowId: w }); return [ts.find((t) => t.id === a).index, ts.find((t) => t.id === b).index]; }, [mainWin, splitIds[0], splitIds[1]]);
+    const o0 = await order();
+    const row = panel.locator('[data-testid="split-row"]');
+    const hA = row.locator('[data-testid="split-half"]').nth(0), hB = row.locator('[data-testid="split-half"]').nth(1);
+    check('v2.5: both split halves are draggable', (await hA.getAttribute('draggable')) === 'true' && (await hB.getAttribute('draggable')) === 'true');
+    const ba = await hA.boundingBox(), bb = await hB.boundingBox();
+    const nCalls = app.bridgeCalls.length;
+    await panel.mouse.move(ba.x + 30, ba.y + ba.height / 2); await panel.mouse.down();
+    await panel.mouse.move(ba.x + 40, ba.y + ba.height / 2 + 2, { steps: 3 });
+    await panel.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2, { steps: 8 }); await sleep(250);
+    const ind = await panel.evaluate(() => ({ half: document.querySelector('.half.swap-over')?.dataset.tabId, row: !!document.querySelector('.split-row.swap-target') }));
+    check('v2.5: dragging a half over the other shows the swap indicator on that half', ind.row && ind.half === String(splitIds[1]), JSON.stringify(ind));
+    await panel.screenshot({ path: path.join(SHOTS, 'split-swap-indicator.png') });
+    await panel.mouse.up(); await sleep(900);
+    const o1 = await order();
+    const swapCall = app.bridgeCalls.slice(nCalls).find((m) => m.call === 'sidebar.cmd' && m.args?.[0]?.cmd === 'swapSplit');
+    check('v2.5: dropping onto the other half sends swapSplit with the split id and tab ids', !!swapCall && swapCall.args[0].splitViewId === 77 && swapCall.args[0].tabIds.join() === splitIds.join(), JSON.stringify(swapCall?.args));
+    check('v2.5: swapSplit flips the order of the two tabs', o0[0] < o0[1] && o1[0] > o1[1], JSON.stringify([o0, o1]));
+    const halvesNow = await panel.evaluate(() => [...document.querySelectorAll('[data-testid="split-half"]')].map((e) => Number(e.dataset.tabId)));
+    check('v2.5: the split row shows the halves in the new order', halvesNow.join() === [splitIds[1], splitIds[0]].join(), JSON.stringify(halvesNow));
+    check('v2.5: swap marks are cleared after the drop', await panel.evaluate(() => !document.querySelector('.swap-over, .swap-target')));
+  }
+
   // ---- boost
   await panel.locator('[data-testid="today-list"] [data-testid="today-row"][data-url^="http"]').first().click(); await sleep(400);
   await panel.locator('[data-testid="boost-button"]').click(); await sleep(900);
@@ -729,13 +865,58 @@ async function main() {
   writePrefs({});
   pushProfiles();
   await until(async () => (await bgOf()) === DEF_LIGHT, 20000, 200);
-  check('theme: no user colour -> default light background (#e9eef6)', (await bgOf()) === DEF_LIGHT, await bgOf());
+  check('theme: no user colour -> seeded from the profile colour, never the neutral default (light)', (await bgOf()) !== DEF_LIGHT, await bgOf());
   await panel.emulateMedia({ colorScheme: 'dark' }); await sleep(400);
-  check('theme: no user colour -> default dark background (#1f1f1f)', (await bgOf()) === DEF_DARK, await bgOf());
+  check('theme: no user colour -> seeded from the profile colour, never the neutral default (dark)', (await bgOf()) !== DEF_DARK, await bgOf());
   await panel.emulateMedia({ colorScheme: 'light' });
   writePrefs({ user_color: GREEN });
   pushProfiles();
   await until(async () => (await bgOf()) === bgLight, 20000, 200);
+
+  // ---- v2.6 (spec 2.5 section 6): window roles bridge call/event, live merge of a pop-out
+  {
+    const roles = async () => (await rawCall('sidebar.windowRoles'))?.result;
+    const dbgMain = async () => (await rawCall('sidebar.cmd', [{ cmd: 'debugState' }]))?.result?.mainWindowId;
+    const r0 = await roles();
+    check('windowRoles: returns mainWindowId (the effective main window) and mergeOnClose', r0 && r0.mainWindowId === await dbgMain() && r0.mainWindowId != null && r0.mergeOnClose === true, JSON.stringify(r0));
+    const evs = () => app.bridgeEvents.filter((e) => e.name === 'sidebar.windowRolesChanged');
+    const nE0 = evs().length;
+    await swEval(async () => chrome.storage.sync.set({ mergeOnClose: false })); await sleep(700);
+    const e1 = evs();
+    check('windowRolesChanged fires when merge-on-close changes', e1.length === nE0 + 1 && e1[e1.length - 1].args[0].mergeOnClose === false && e1[e1.length - 1].args[0].mainWindowId === r0.mainWindowId, JSON.stringify(e1.slice(nE0)));
+    check('windowRoles reflects the new setting', (await roles()).mergeOnClose === false);
+    await swEval(async () => chrome.storage.sync.set({ mergeOnClose: true })); await sleep(500);
+    // a pop-out window with two tabs
+    const pop = await swEval(async ([a, b]) => { const w = await chrome.windows.create({ url: [a, b], focused: true }); return { id: w.id, tabs: (await chrome.tabs.query({ windowId: w.id })).map((t) => t.id) }; }, [U('alpha'), U('bravo')]);
+    await sleep(1500);
+    const nE1 = evs().length;
+    const rP = await roles();
+    check('windowRoles: a new window does not become the main window', rP.mainWindowId === r0.mainWindowId && pop.id !== rP.mainWindowId, JSON.stringify([rP, pop.id]));
+    await rawCall('sidebar.cmd', [{ cmd: 'setMainWindow', windowId: pop.id }]); await sleep(800);
+    const e2 = evs();
+    check('windowRolesChanged fires when the main window changes', e2.length > nE1 && e2[e2.length - 1].args[0].mainWindowId === pop.id, JSON.stringify(e2.slice(nE1)));
+    check('windowRoles follows the main window change', (await roles()).mainWindowId === pop.id);
+    await rawCall('sidebar.cmd', [{ cmd: 'setMainWindow', windowId: r0.mainWindowId }]); await sleep(800);
+    check('windowRolesChanged fires again when main is restored', evs().length > e2.length && evs()[evs().length - 1].args[0].mainWindowId === r0.mainWindowId);
+    // live merge: the pop-out is focused while it is merged; tab ids are preserved and nothing is reopened from a snapshot
+    await swEval(async (id) => chrome.windows.update(id, { focused: true }), pop.id);
+    await swEval(async () => { await new Promise((r) => setTimeout(r, 500)); }); // let a snapshot of the pop-out be taken
+    const snapBefore = await swEval(async (id) => ((await chrome.storage.session.get('windowSnapshots')).windowSnapshots || {})[id]?.length ?? 0, pop.id);
+    const mainBefore = await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).map((t) => t.id), r0.mainWindowId);
+    const mres = await rawCall('sidebar.cmd', [{ cmd: 'mergeWindow', windowId: pop.id }]);
+    await sleep(1500);
+    const mainAfter = await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).map((t) => t.id), r0.mainWindowId);
+    const popGone = await swEval(async (id) => (await chrome.windows.getAll()).every((w) => w.id !== id), pop.id);
+    check('mergeWindow over the bridge succeeds', mres?.ok && mres.result?.ok && mres.result.count === 2, JSON.stringify(mres));
+    check('mergeWindow moves the live tabs: the same tab ids end up in the main window', pop.tabs.every((id) => mainAfter.includes(id)) && mainAfter.length === mainBefore.length + 2, JSON.stringify({ pop: pop.tabs, mainAfter: mainAfter.length, mainBefore: mainBefore.length }));
+    check('the emptied pop-out window is closed and its snapshot is gone', popGone && (await swEval(async (id) => !(id in ((await chrome.storage.session.get('windowSnapshots')).windowSnapshots || {})), pop.id)), 'snapshot tabs before: ' + snapBefore);
+    check('the merged window is not reopened from its snapshot afterwards', await (async () => { await sleep(3500); const n = await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).length, r0.mainWindowId); return n === mainAfter.length; })());
+    check('the main window is focused after the merge', await swEval(async (w) => (await chrome.windows.get(w)).focused, r0.mainWindowId));
+    const bad = await rawCall('sidebar.cmd', [{ cmd: 'mergeWindow', windowId: 999999 }]);
+    check('mergeWindow on a window that does not exist fails cleanly', bad?.ok && bad.result?.ok === false, JSON.stringify(bad?.result));
+    await swEval(async (ids) => { for (const id of ids) await chrome.tabs.remove(id).catch(() => {}); }, pop.tabs);
+    await sleep(500);
+  }
 
   // ---- connection drop: the extension stops forwarding; reconnecting resumes
   const nBefore = refApp.isConnected('Default');

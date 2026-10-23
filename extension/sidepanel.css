@@ -723,3 +723,35 @@ html.overlay.compact #archive-btn { margin-left: calc(var(--pill-l) - var(--gut)
 /* scrolling: vertical, no visible scrollbar in compact */
 html.compact .scroll { scrollbar-width: none; }
 html.compact .scroll::-webkit-scrollbar { display: none; }
+
+/* ---- sidebar colour setting ---- */
+.seg { display: flex; margin: 0 6px; padding: 2px; gap: 2px; background: var(--input); border-radius: var(--radius); }
+.seg-b { flex: 1; padding: 5px 8px; border-radius: 6px; text-align: center; }
+.seg-b[aria-pressed="true"] { background: var(--bg); box-shadow: 0 0 0 1px var(--ring); font-weight: 600; }
+.sbc-custom { margin: 8px 6px 0; display: flex; flex-direction: column; gap: 8px; }
+.sbc-swatches { display: flex; flex-wrap: wrap; gap: 8px; }
+.sbc-sw { width: 24px; height: 24px; border-radius: 50%; background: var(--sw); box-shadow: inset 0 0 0 1px rgba(0,0,0,.18); }
+.sbc-sw[aria-pressed="true"] { box-shadow: inset 0 0 0 1px rgba(0,0,0,.18), 0 0 0 2px var(--bg), 0 0 0 4px var(--fg); }
+.sbc-pick { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sbc-pick input { width: 40px; height: 26px; padding: 0; border: 0; background: none; }
+
+/* ---- v2.5: empty Favourites / Pinned stay out of the way until a drag starts; new-tab hint; split swap ---- */
+.sec-favs, .sec-pinned {
+  transition: max-height 160ms var(--ease, ease), opacity 160ms var(--ease, ease), margin-top 160ms var(--ease, ease), visibility 0s linear 0s;
+}
+.sec.sec-empty { max-height: 0; opacity: 0; margin-top: 0; overflow: hidden; visibility: hidden; pointer-events: none; transition-delay: 0s, 0s, 0s, 160ms; }
+body.drag-reveal .sec.sec-empty { max-height: 120px; opacity: 1; margin-top: 10px; visibility: visible; pointer-events: auto; transition-delay: 0s; }
+html.compact .sec.sec-empty { max-height: 0 !important; opacity: 0 !important; margin-top: 0 !important; }
+
+.new-tab-row { color: var(--fg); }
+.new-tab-row .fav-ic { color: var(--fg); }
+.kbd-hint { flex: none; margin-left: auto; padding-right: 4px; font-size: 11px; letter-spacing: 0.02em; color: var(--faint); transition: opacity 160ms var(--ease, ease); }
+html.compact .kbd-hint { opacity: 0; pointer-events: none; }
+
+.split-row .half[draggable="true"] { cursor: grab; }
+.split-row.swap-target .rbg { background: transparent !important; box-shadow: none !important; }
+.split-row .half.swap-over { background: var(--accent-soft) !important; box-shadow: inset 0 0 0 1.5px var(--accent); }
+.split-row .half.swap-over::after {
+  content: "\21C4\FE0E"; position: absolute; right: 6px; top: 50%; transform: translateY(-50%); font-size: 13px; line-height: 1; color: var(--accent-text); pointer-events: none;
+}
+.split-row .half { position: relative; }

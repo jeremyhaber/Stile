@@ -99,6 +99,14 @@ final class OverlayController {
 
     private func wireUp() {
         sidebar.onHost = { [weak self] action, value in self?.handleHost(action, value) }
+        sidebar.chromePid = { [weak self] in
+            guard let self = self else { return 0 }
+            return AX.pid(self.window.element)
+        }
+        sidebar.onNonEditingClick = { [weak self] in
+            guard let self = self else { return }
+            AX.setBool(self.window.element, AXName.main, true)
+        }
         sidebar.onBridgeCall = { [weak self] call in self?.pageCalled(call) }
         sidebar.onDidBecomeKey = { [weak self] in self?.reorderSidebar() }
         sidebar.onResizeBegan = { [weak self] in self?.beginResize() }
@@ -935,6 +943,8 @@ final class OverlayController {
             HostActions.revealExtensionFolder()
         case "contextMenu":
             showContextMenu(value)
+        case "editing":
+            sidebar.isEditing = boolValue(value)
         case "busy":
             busy = boolValue(value)
             if busy { hideTimer.cancel() } else { scheduleHideIfOutside() }

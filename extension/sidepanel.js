@@ -170,6 +170,7 @@ const S = {
   collapsedWindows: {},
   archiveGrouped: false,
   ownStyle: null,
+  sidebarColor: { mode: 'auto' },
   leftHintDismissed: false,
   mergeOnClose: true,
   tabNames: {},
@@ -210,7 +211,7 @@ async function load() {
     (chrome.tabGroups ? chrome.tabGroups.query({}).catch(() => []) : Promise.resolve([])),
     chrome.storage.session.get(['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge']).catch(() => ({})),
     chrome.storage.local.get(['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'faviconCache']).catch(() => ({})),
-    chrome.storage.sync.get(['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose']).catch(() => ({}))
+    chrome.storage.sync.get(['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor']).catch(() => ({}))
   ]);
   let roots = await getRoots().catch(() => null);
   if (!roots && !triedEnsure) {
@@ -244,6 +245,7 @@ async function load() {
     if (Object.keys(kept).length !== Object.keys(cw).length) chrome.storage.local.set({ collapsedWindows: kept }).catch(() => {});
   }
   S.archiveGrouped = !!syn.archiveGrouped;
+  S.sidebarColor = normSidebarColor(syn.sidebarColor);
   S.mergeOnClose = syn.mergeOnClose !== false;
   S.normalCount = wins.filter((w) => w.type === 'normal' && !w.incognito).length;
   {
@@ -430,6 +432,14 @@ function currentProfile() {
   return null;
 }
 
+const HEX6 = /^#[0-9a-f]{6}$/i;
+function normSidebarColor(v) {
+  if (v && v.mode === 'custom' && typeof v.color === 'string' && HEX6.test(v.color)) return { mode: 'custom', color: v.color.toLowerCase() };
+  return { mode: 'auto' };
+}
+const customColor = () => (S.sidebarColor.mode === 'custom' ? S.sidebarColor.color : null);
+const CUSTOM_VARS = ['--bg', '--fg', '--dim', '--faint', '--hover', '--active', '--ring', '--tile', '--input', '--dash'];
+
 function drawTheme() {
   const cur = currentProfile();
   const root = document.documentElement;
@@ -440,8 +450,10 @@ function drawTheme() {
     root.style.removeProperty('--on-profile');
     drawChromeTheme(cur);
     postTheme(cur ? cur.style.color : null);
+    drawSidebarColorUi();
     return;
   }
+  const cc = customColor();
   if (cur) {
     root.classList.add('has-profile');
     root.style.setProperty('--profile', cur.style.color);
@@ -451,6 +463,20 @@ function drawTheme() {
     root.style.removeProperty('--profile');
     root.style.removeProperty('--on-profile');
   }
+  if (cc) {
+    // Custom colour: exactly as picked; text/hover/active derived from its luminance.
+    const dark = hexLuminance(cc) < 0.5;
+    const fg = dark ? '#ececf0' : '#1c1c1e';
+    const mix = (pct) => `color-mix(in srgb, ${fg} ${pct}%, ${cc})`;
+    const v = { '--bg': cc, '--fg': fg, '--dim': `color-mix(in srgb, ${fg} 58%, transparent)`, '--faint': `color-mix(in srgb, ${fg} 36%, transparent)`,
+      '--hover': mix(6), '--active': mix(12), '--ring': mix(24), '--tile': mix(6), '--input': mix(8), '--dash': `color-mix(in srgb, ${fg} 24%, transparent)` };
+    for (const k in v) root.style.setProperty(k, v[k]);
+    root.style.colorScheme = dark ? 'dark' : 'light';
+  } else {
+    for (const k of CUSTOM_VARS) root.style.removeProperty(k);
+    root.style.colorScheme = '';
+  }
+  drawSidebarColorUi();
 }
 
 // Overlay mode: colours come from the Chrome profile's theme (`chromeTheme`, read from Preferences by the host).
@@ -466,14 +492,23 @@ function drawChromeTheme(cur) {
   resolvedDark = scheme === 'dark' ? true : scheme === 'light' ? false : !!(darkMq && darkMq.matches);
   // The host's sampled Chrome colour is the exact background; text colour follows its luminance and the
   // hover/active colours are mixed from it in CSS.
-  const cc = HOSTS.chromeColor;
-  root.classList.toggle('has-chrome-bg', !!cc);
-  if (cc) {
-    root.style.setProperty('--overlay-bg', cc);
-    resolvedDark = hexLuminance(cc) < 0.5;
-  } else root.style.removeProperty('--overlay-bg');
+  // Effective background: custom > exact host sample > theme colour estimate > profile colour (seeds are softened).
+  const custom = customColor();
+  const sample = HOSTS.chromeColor;
+  const seed = color || (cur && cur.style && cur.style.color) || null;
+  let bg = null, src = 'none';
+  if (custom) { bg = custom; src = 'custom'; resolvedDark = hexLuminance(custom) < 0.5; }
+  else if (sample) { bg = sample; src = 'chrome'; resolvedDark = hexLuminance(sample) < 0.5; }
+  else if (seed) {
+    bg = resolvedDark ? `color-mix(in oklab, ${seed} 28%, #1f1f1f)` : `color-mix(in oklab, ${seed} 22%, white)`;
+    src = color ? 'theme' : 'profile';
+  }
+  sbColorSource = src;
+  root.classList.toggle('has-chrome-bg', !!bg);
+  if (bg) root.style.setProperty('--overlay-bg', bg); else root.style.removeProperty('--overlay-bg');
   root.dataset.theme = resolvedDark ? 'dark' : 'light';
 }
+let sbColorSource = 'none';
 function hexLuminance(hex) {
   const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
   return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
@@ -563,6 +598,7 @@ function drawHint() {
 function drawFavs() {
   const grid = $('favs');
   grid.classList.remove('drop-into');
+  grid.closest('.sec').classList.toggle('sec-empty', !S.favs.length);
   if (!S.favs.length) {
     grid.replaceChildren(h('div', { class: 'fav-empty', 'data-testid': 'favourites-empty', text: 'Drag tabs here for favourites' }));
     return;
@@ -591,6 +627,7 @@ function drawFavs() {
 function drawPinned() {
   const tree = $('pinned');
   tree.classList.remove('drop-end', 'drop-into');
+  $('sec-pinned').classList.toggle('sec-empty', !S.flat.length);
   if (!S.flat.length) {
     tree.replaceChildren(h('div', { class: 'empty-drop', 'data-testid': 'pinned-empty', text: 'Drag tabs here to pin them' }));
     return;
@@ -698,7 +735,7 @@ function drawToday() {
     class: 'row new-tab-row', role: 'button', tabindex: '0', 'data-testid': 'new-tab-row', 'data-key': 'newtab', 'data-nav': '', 'aria-label': 'New tab',
     onclick: () => safe(chrome.tabs.create({ windowId: S.windowId, active: true })),
     onkeydown: (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); safe(chrome.tabs.create({ windowId: S.windowId, active: true })); } }
-  }, rbg(), h('span', { class: 'fav-ic' }, icon('plus')), h('span', { class: 'title', text: 'New tab' }));
+  }, rbg(), h('span', { class: 'fav-ic' }, icon('plus')), h('span', { class: 'title', text: 'New tab' }), h('span', { class: 'kbd-hint', 'aria-hidden': 'true', text: '\u2318T' }));
   list.replaceChildren(newRow, ...renderUnits(S.ownUnits, false), ...S.sections.map(sectionEl));
 }
 
@@ -853,7 +890,9 @@ function splitRow(u, act, other) {
     const renaming = renamingId === 'n' + t.id;
     const isActive = !other && !!(act && act.id === t.id);
     return h('div', {
-      class: 'half' + (isActive ? ' active' : ''), tabindex: '0', title: named ? `${named} — ${real}` : title, 'data-testid': 'split-half', 'data-tab-id': t.id, 'data-key': 't' + t.id, 'data-nav': '',
+      class: 'half' + (isActive ? ' active' : ''), tabindex: '0', draggable: renaming || other ? null : 'true',
+      ondragstart: (ev) => { ev.stopPropagation(); startDrag(ev, { type: 'tab', tabId: t.id, windowId: t.windowId, fromSplit: u.splitId, splitTabIds: [a.id, b.id] }, ev.currentTarget); },
+      ondragend: endDrag, title: named ? `${named} — ${real}` : title, 'data-testid': 'split-half', 'data-tab-id': t.id, 'data-key': 't' + t.id, 'data-nav': '',
       'data-active': isActive ? 'true' : 'false',
       onclick: (ev) => { if (!ev.target.closest('.act, .rename-input')) openTab(t); },
       onkeydown: (ev) => {
@@ -1002,7 +1041,43 @@ function fillSelect(sel, values, withDefault, current) {
   sel.value = String(current);
 }
 
+function drawSidebarColorUi() {
+  const f = $('field-sidebar-color');
+  if (!f) return;
+  const custom = customColor();
+  for (const b of f.querySelectorAll('.seg-b')) b.setAttribute('aria-pressed', String((b.dataset.mode === 'custom') === !!custom));
+  $('sbc-custom').hidden = !custom;
+  const cur = currentProfile();
+  const hasSwatches = $('sbc-swatches').children.length > 0;
+  if (!hasSwatches) {
+    const tones = ['#e9eef6', '#f3e8ff', '#e6f4ea', '#fff4e5'];
+    $('sbc-swatches').replaceChildren(...[...PROFILE_COLORS.map((c) => ({ hex: c.hex, name: c.name })), ...tones.map((t) => ({ hex: t, name: t }))].map((c) =>
+      h('button', { type: 'button', class: 'sbc-sw', 'data-testid': 'sidebar-color-swatch', 'data-color': c.hex, title: c.name, 'aria-label': c.name,
+        onclick: () => setSidebarColor({ mode: 'custom', color: c.hex }, true) })));
+    for (const b of $('sbc-swatches').children) b.style.setProperty('--sw', b.dataset.color);
+  }
+  for (const b of $('sbc-swatches').children) b.setAttribute('aria-pressed', String(!!custom && b.dataset.color === custom));
+  if (custom && document.activeElement !== $('sbc-picker')) $('sbc-picker').value = custom;
+  const note = $('sbc-note');
+  let text = '';
+  if (!custom) {
+    if (OVERLAY) text = sbColorSource === 'chrome' ? 'Matching Chrome exactly' : sbColorSource === 'theme' ? 'From your Chrome theme colour' : sbColorSource === 'profile' ? 'From your profile colour' : 'Using the default colour';
+    else text = cur ? 'From your profile colour' : 'Using the default colour';
+  }
+  note.textContent = text;
+  note.hidden = !text;
+}
+let sbSaveTimer = 0;
+function setSidebarColor(v, save) {
+  S.sidebarColor = normSidebarColor(v);
+  drawTheme();
+  clearTimeout(sbSaveTimer);
+  const persist = () => chrome.storage.sync.set({ sidebarColor: S.sidebarColor }).catch(() => {});
+  if (save) persist(); else sbSaveTimer = setTimeout(persist, 300);
+}
+
 function drawSettings() {
+  drawSidebarColorUi();
   const hs = S.helper;
   const connected = !!(hs && hs.status === 'connected');
   fillSelect($('set-profile-archive'), ARCHIVE_CHOICES, true, S.archiveMinutes === null ? '' : S.archiveMinutes);
@@ -1369,7 +1444,9 @@ async function unsplit(t) {
 
 async function swapSides(u) {
   const [a, b] = u.tabs;
-  await safe(chrome.tabs.move(b.id, { index: a.index }));
+  if (!b) return;
+  const r = await cmd('swapSplit', { splitViewId: u.splitId != null ? u.splitId : sidOf(a), tabIds: [a.id, b.id] });
+  if (r && !r.ok) toast(r.error || 'Could not swap the split view');
 }
 
 function showTabMenu(ev, tab, opts = {}) {
@@ -1477,13 +1554,14 @@ function startDrag(e, payload, el) {
   // defer so the drag image is captured before dimming
   requestAnimationFrame(() => {
     el.classList.add('dragged');
+    if (dragging) document.body.classList.add('drag-reveal');   // v2.5: empty Favourites / Pinned appear while dragging
     if (dragging && dragging.type !== 'bm') $('new-window-drop').hidden = false;
   });
 }
 
 function endDrag() {
   dragging = null;
-  document.body.classList.remove('dragging');
+  document.body.classList.remove('dragging', 'drag-reveal');
   $('new-window-drop').hidden = true;
   $('new-window-drop').classList.remove('over');
   clearMarks();
@@ -1492,7 +1570,7 @@ function endDrag() {
 }
 
 function clearMarks() {
-  document.querySelectorAll('.drop-before,.drop-after,.drop-into,.drop-end,.split-target').forEach((x) => x.classList.remove('drop-before', 'drop-after', 'drop-into', 'drop-end', 'split-target'));
+  document.querySelectorAll('.drop-before,.drop-after,.drop-into,.drop-end,.split-target,.swap-target,.swap-over').forEach((x) => x.classList.remove('drop-before', 'drop-after', 'drop-into', 'drop-end', 'split-target', 'swap-target', 'swap-over'));
 }
 
 function isDescendantOrSelf(id, ancestorId) {
@@ -1671,6 +1749,17 @@ function todayTarget(e) {
     // tab or split row
     let ref;
     let where = y < 0.5 ? 'before' : 'after';
+    if (isSplit && d.type === 'tab' && d.fromSplit != null) {
+      const ids = rowEl.dataset.tabIds.split(',').map(Number);
+      const halfEl = tgt.closest('.half');
+      if (ids.includes(d.tabId) && halfEl && Number(halfEl.dataset.tabId) !== d.tabId) {
+        return {
+          swap: true,
+          mark: () => { rowEl.classList.add('swap-target'); halfEl.classList.add('swap-over'); },
+          apply: () => cmd('swapSplit', { splitViewId: Number(rowEl.dataset.splitId), tabIds: ids })
+        };
+      }
+    }
     if (isSplit) {
       const ids = rowEl.dataset.tabIds.split(',').map(Number);
       ref = tabById(where === 'before' ? ids[0] : ids[1]);
@@ -1730,6 +1819,8 @@ function setupDnd() {
     else await safe(chrome.bookmarks.move(d.id, { parentId: t.parentId, index: t.index }));
   });
   wireDrop($('today'), 'today', todayTarget, async (d, t) => {
+    // a half dragged out of its split row: separate the pair first, then place the tab (existing reorder logic)
+    if (d.type === 'tab' && d.fromSplit != null && !t.swap && typeof chrome.tabs.unsplit === 'function') await safe(chrome.tabs.unsplit(d.fromSplit));
     const r = await t.apply(d);
     if (r && r.ok === false && r.error) toast(r.error);
   });
@@ -1814,6 +1905,12 @@ function setupStatic() {
     $(id).addEventListener('click', () => setView('main'));
   }
   $('new-folder').addEventListener('click', () => newFolder(null));
+  // v2.5: Pinned is hidden while empty, so offer a new pinned folder from the Today section's own context menu
+  $('today').closest('.sec').addEventListener('contextmenu', (ev) => {
+    if (ev.target.closest('.today-row, .split-row, .group-row, .window-head, input, textarea')) return;
+    ev.preventDefault();
+    showMenu(ev, [{ label: 'New pinned folder', action: 'new-pinned-folder', run: () => newFolder(null) }]);
+  });
   $('clear').addEventListener('click', async () => {
     const r = await cmd('clearToday', { windowId: S.windowId });
     if (!r || !r.ok) toast((r && r.error) || 'Could not clear Today');
@@ -1853,6 +1950,14 @@ function setupStatic() {
     chrome.storage.local.set({ leftHintDismissed: true }).catch(() => {});
     drawHint();
   });
+  for (const b of document.querySelectorAll('#field-sidebar-color .seg-b')) {
+    b.addEventListener('click', () => {
+      if (b.dataset.mode === 'auto') setSidebarColor({ mode: 'auto' }, true);
+      else setSidebarColor({ mode: 'custom', color: $('sbc-picker').value || '#e9eef6' }, true);
+    });
+  }
+  $('sbc-picker').addEventListener('input', (e) => setSidebarColor({ mode: 'custom', color: e.target.value }, false));
+  $('sbc-picker').addEventListener('change', (e) => setSidebarColor({ mode: 'custom', color: e.target.value }, true));
   $('set-archive-grouped').addEventListener('change', (e) => {
     S.archiveGrouped = e.target.checked;
     chrome.storage.sync.set({ archiveGrouped: e.target.checked }).catch(() => {});
@@ -1902,7 +2007,7 @@ function setupListeners() {
     const rel = {
       session: ['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'overlayConnected'],
       local: ['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'roots', 'collapsedWindows', 'leftHintDismissed', 'tabNames'],
-      sync: ['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose']
+      sync: ['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor']
     }[area];
     if (rel && keys.some((k) => rel.includes(k))) {
       // lastActive changes constantly; only the Today list reads it
@@ -2028,6 +2133,28 @@ function drawAppSettings() {
   $('app-version').textContent = HOSTS.appVersion ? `Sidebar ${HOSTS.appVersion}` : '';
 }
 
+// v2.5: tell the app whether an editable element has focus, so it can pass other keys through to Chrome.
+const NON_TEXT_INPUT = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'range', 'color', 'file', 'image']);
+function isEditableEl(el) {
+  if (!el || el.nodeType !== 1) return false;
+  const tag = el.tagName;
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag === 'INPUT') return !NON_TEXT_INPUT.has((el.getAttribute('type') || 'text').toLowerCase());
+  return !!el.isContentEditable;
+}
+function setupEditingReport() {
+  let timer = 0;
+  lastPosted.editing = 'false';
+  const sync = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => postOnce('editing', isEditableEl(document.activeElement) && document.hasFocus()), 30);
+  };
+  document.addEventListener('focusin', sync, true);
+  document.addEventListener('focusout', sync, true);
+  window.addEventListener('focus', sync);
+  window.addEventListener('blur', () => { clearTimeout(timer); postOnce('editing', false); });
+}
+
 function setupOverlay() {
   document.documentElement.classList.add('overlay');
   drawChromeTheme(null);
@@ -2050,6 +2177,7 @@ function setupOverlay() {
     try { localStorage.setItem('vtHintDismissed', '1'); } catch { /* ignore */ }
     drawHint();
   });
+  setupEditingReport();
   window.__sidebarHostState = applyHostState;
   drawAppSettings();
   if (window.__sidebarHost && window.__sidebarHost.last) applyHostState(window.__sidebarHost.last);

@@ -14,6 +14,15 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     var onResizeEnded: (() -> Void)?
     var onPointerEnter: (() -> Void)?
     var onPointerExit: (() -> Void)?
+    /// Chrome's process id (0 when unknown); key events are forwarded there.
+    var chromePid: (() -> pid_t)?
+    /// A click inside the panel that did not land on an editable element (Chrome's window should become main again).
+    var onNonEditingClick: (() -> Void)?
+
+    /// True while an editable element inside the page has focus (host message `editing`).
+    var isEditing = false
+    /// Key codes whose keyDown was forwarded to Chrome while editing, so the matching keyUp follows.
+    private var forwardedKeyCodes = Set<UInt16>()
 
     /// True while a left-button press that began inside this panel is held (a tab being dragged out of the sidebar).
     var pressedHere = false
@@ -130,9 +139,63 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     override func mouseExited(with event: NSEvent) { onPointerExit?() }
 
     override func sendEvent(_ event: NSEvent) {
-        if event.type == .leftMouseDown { pressedHere = true }
-        else if event.type == .leftMouseUp { pressedHere = false }
+        switch event.type {
+        case .leftMouseDown:
+            pressedHere = true
+            super.sendEvent(event)
+            // The page reports `editing` asynchronously after focus moves; check once it settled.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                guard let self = self, !self.isEditing else { return }
+                self.onNonEditingClick?()
+            }
+            return
+        case .leftMouseUp:
+            pressedHere = false
+        case .keyDown, .keyUp, .flagsChanged:
+            if forwardKey(event) { return }
+        default:
+            break
+        }
         super.sendEvent(event)
+    }
+
+    /// Returns true when the event was sent to Chrome instead of the web view.
+    private func forwardKey(_ event: NSEvent) -> Bool {
+        guard let pid = chromePid?(), pid > 0 else { return false }
+        var forward = !isEditing
+        if isEditing {
+            switch event.type {
+            case .keyDown:
+                if SidebarPanel.isChromeShortcut(event) {
+                    forwardedKeyCodes.insert(event.keyCode)
+                    forward = true
+                }
+            case .keyUp:
+                forward = forwardedKeyCodes.remove(event.keyCode) != nil
+            default:
+                break
+            }
+        }
+        guard forward, let cg = event.cgEvent?.copy() else { return false }
+        cg.postToPid(pid)
+        return true
+    }
+
+    /// Cmd-shortcuts Chrome should get even while a text field has focus.
+    private static func isChromeShortcut(_ e: NSEvent) -> Bool {
+        let f = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard f.contains(.command), !f.contains(.control) else { return false }
+        let shift = f.contains(.shift), opt = f.contains(.option)
+        if opt {
+            return !shift && (e.keyCode == 123 || e.keyCode == 124)   // Cmd+Option+Left/Right
+        }
+        if shift && (e.keyCode == 33 || e.keyCode == 30) { return true }   // Cmd+Shift+[ / ]
+        let c = e.charactersIgnoringModifiers?.lowercased() ?? ""
+        if shift { return c == "t" }
+        switch c {
+        case "t", "n", "w", "l", "r", ",", "q", "1", "2", "3", "4", "5", "6", "7", "8", "9": return true
+        default: return false
+        }
     }
 
     /// Lay the content out. `panelWidth` is the visible strip (the panel itself clips anything wider),

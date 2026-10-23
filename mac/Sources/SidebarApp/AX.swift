@@ -17,6 +17,7 @@ enum AXName {
     static let fullScreen = "AXFullScreen"
     static let closeButton = "AXCloseButton"
     static let zoomButton = "AXZoomButton"
+    static let main = "AXMain"
     static let focusedWindow = "AXFocusedWindow"
     static let axTitle = "AXTitle"
     static let axDescription = "AXDescription"

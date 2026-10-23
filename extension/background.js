@@ -2,7 +2,7 @@
 // Nothing here relies on in-memory state surviving a restart (the only module-level
 // state is the live native port and its pending-request table, which die with the worker).
 import { registerBoostListeners, handleBoostCommand } from './boosts-sw.js';
-import { registerBridgeListeners, handleBridgeMessage } from './bridge-sw.js';
+import { registerBridgeListeners, handleBridgeMessage, emitBridgeEvent } from './bridge-sw.js';
 import { getRoots, isBlankUrl, DEFAULT_ARCHIVE_MINUTES, GROUP_COLORS, hashStr } from './shared.js';
 
 const HOST = 'com.sidebar.helper';
@@ -416,6 +416,7 @@ async function rebuildSnapshot() {
   const used = {};
   for (const w of wins) {
     if (w.type !== 'normal' || w.incognito || closingWindows.has(w.id)) continue;
+    if (mergingWindows.has(w.id)) { delete snaps[w.id]; continue; }   // v2.5: a window being emptied by a merge has no snapshot
     const list = [];
     for (const t of (w.tabs || []).slice().sort((a, b) => a.index - b.index)) {
       const url = t.url || t.pendingUrl || '';
@@ -527,6 +528,7 @@ async function onWindowClosed(windowId) {
   const groupInfo = snaps.groups || {};
   if (windowId in snaps) { delete snaps[windowId]; await chrome.storage.session.set({ windowSnapshots: snaps }); }
   closingWindows.delete(windowId);
+  const mergedAway = mergingWindows.delete(windowId);
   const order = await sget('session', 'windowOrder', []);
   const explicit = await sget('session', 'mainWindowId', null);
   const wasMain = explicit != null ? explicit === windowId : order[0] === windowId;
@@ -536,9 +538,16 @@ async function onWindowClosed(windowId) {
     if (nextOrder.length) await chrome.storage.session.set({ mainWindowId: nextOrder[0] });
     else await chrome.storage.session.remove('mainWindowId');
   }
-  if (wasMain || mergingWindows.has(windowId) || !entries.length) return;
+  if (wasMain || mergedAway || !entries.length) return;
   if (!(await sget('sync', 'mergeOnClose', true))) return;
   setTimeout(() => enqueue(() => restoreClosed(entries, groupInfo)).catch((e) => console.warn('[sidebar] merge back failed', e)), 1500);
+}
+
+async function dropWindowSnapshot(winId) {
+  const snaps = await sget('session', 'windowSnapshots', null);
+  if (!snaps || !(String(winId) in snaps)) return;
+  delete snaps[winId];
+  await chrome.storage.session.set({ windowSnapshots: snaps });
 }
 
 // Move every tab of `winId` into `main`, live (no reloads). Returns the number of tabs moved.
@@ -547,7 +556,8 @@ async function mergeIntoMain(winId, main) {
   try { tabs = (await chrome.tabs.query({ windowId: winId })).sort((a, b) => a.index - b.index); } catch { return 0; }
   if (!tabs.length) return 0;
   mergingWindows.add(winId);
-  setTimeout(() => mergingWindows.delete(winId), 8000);
+  setTimeout(() => mergingWindows.delete(winId), 15000);
+  await dropWindowSnapshot(winId);
   const active = tabs.find((t) => t.active);
   const done = new Set();
   let moved = 0;
@@ -583,6 +593,7 @@ async function mergeIntoMain(winId, main) {
     } catch (e) { console.warn('[sidebar] merge move failed', e && e.message); }
   }
   await sleep(500);
+  await dropWindowSnapshot(winId);
   let left = 0;
   try { left = (await chrome.tabs.query({ windowId: winId })).length; } catch { left = -1; }
   if (left === 0) { try { await chrome.windows.remove(winId); } catch { /* already gone */ } }
@@ -1152,6 +1163,33 @@ const commands = {
     } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
   },
 
+  // Swap the two halves of a split view: move the right tab before the left one. Chrome may break the split when tabs move;
+  // recreate it (new left, new right) when split view is supported. `tabIds` is a fallback for hosts without splitViewId.
+  async swapSplit({ splitViewId, tabIds }) {
+    try {
+      let pair = [];
+      if (typeof splitViewId === 'number' && splitViewId >= 0) {
+        const all = await chrome.tabs.query({});
+        pair = all.filter((t) => splitId(t) === splitViewId);
+      }
+      if (pair.length < 2 && Array.isArray(tabIds) && tabIds.length === 2) {
+        pair = await Promise.all(tabIds.map((id) => chrome.tabs.get(id)));
+      }
+      if (pair.length !== 2) return { ok: false, error: 'split view not found' };
+      pair.sort((a, b) => a.index - b.index);
+      const [left, right] = pair;
+      if (left.windowId !== right.windowId) return { ok: false, error: 'split halves are in different windows' };
+      await chrome.tabs.move(right.id, { index: left.index });
+      if (SPLIT_OK && typeof chrome.tabs.createSplit === 'function') {
+        const now = await Promise.all([right.id, left.id].map((id) => chrome.tabs.get(id)));
+        if (now.some((t) => splitId(t) < 0 || splitId(t) !== splitId(now[0]))) {
+          try { await chrome.tabs.createSplit([right.id, left.id]); } catch (err) { console.warn('[sidebar] resplit failed', err && err.message); }
+        }
+      }
+      return { ok: true };
+    } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+  },
+
   async setProfileStyle({ dir, style }) {
     const okColor = style && typeof style.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(style.color);
     if (!style || !PROFILE_ICONS.includes(style.icon) || !okColor) return { ok: false, error: 'invalid style' };
@@ -1197,6 +1235,8 @@ const commands = {
     const { main } = await resolveMain();
     if (main == null) return { ok: false, error: 'No main window' };
     if (windowId === main) return { ok: false, error: 'That is already the main window' };
+    const live = await liveNormalIds();
+    if (!live || !live.includes(windowId)) return { ok: false, error: 'No such window' };
     const count = await mergeIntoMain(windowId, main);
     if (count) await setLastMerge({ count, fromClose: false });
     return { ok: true, count };
@@ -1427,7 +1467,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 registerBoostListeners();
-registerBridgeListeners({ dispatchCommand, post: (m) => { if (port) port.postMessage(m); } });
+// v2.5: the app learns which window is the main one and whether merge-on-close is on (sidebar.windowRoles / sidebar.windowRolesChanged).
+async function windowRoles() {
+  let main = null;
+  try { main = (await resolveMain()).main; } catch { /* ignore */ }
+  return { mainWindowId: main, mergeOnClose: (await sget('sync', 'mergeOnClose', true)) !== false };
+}
+let rolesTimer = null;
+let lastRoles = null;
+function scheduleRolesEvent() {
+  clearTimeout(rolesTimer);
+  rolesTimer = setTimeout(async () => {
+    try {
+      const r = await windowRoles();
+      const k = JSON.stringify(r);
+      if (k === lastRoles) return;
+      lastRoles = k;
+      emitBridgeEvent('sidebar.windowRolesChanged', [r]);
+    } catch { /* ignore */ }
+  }, 60);
+}
+chrome.storage.onChanged.addListener((changes, area) => {
+  const keys = Object.keys(changes);
+  if ((area === 'session' && keys.some((k) => k === 'mainWindowId' || k === 'windowOrder')) || (area === 'sync' && keys.includes('mergeOnClose'))) scheduleRolesEvent();
+});
+chrome.windows.onRemoved.addListener(() => setTimeout(scheduleRolesEvent, 300));
+chrome.windows.onCreated.addListener(() => setTimeout(scheduleRolesEvent, 300));
+
+registerBridgeListeners({ dispatchCommand, windowRoles, post: (m) => { if (port) port.postMessage(m); } });
 
 // Runs every time the worker starts (including after idle shutdown).
 enqueue(boot).catch((e) => console.warn('[sidebar] boot failed', e));

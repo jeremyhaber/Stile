@@ -51,6 +51,17 @@ let pass = 0, fail = 0;
 const check = (name, ok, extra = '') => { ok ? pass++ : fail++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? '  — ' + extra : ''}`); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Drag with a real gesture: press, move past the drag threshold, wait for empty Favourites/Pinned to be revealed (v2.5), then drop.
+async function dragReveal(page, src, tgt) {
+  await src.hover();
+  const b = await src.boundingBox();
+  await page.mouse.down();
+  await page.mouse.move(b.x + b.width / 2 + 8, b.y + b.height / 2 + 8, { steps: 4 });
+  await sleep(400);
+  await tgt.hover();
+  await page.mouse.up();
+}
+
 async function main() {
   await sleep(500);
   const ctx = await chromium.launchPersistentContext(udd, {
@@ -115,14 +126,28 @@ async function main() {
   const activeUrl = await swEval(async (w) => (await chrome.tabs.query({ windowId: w, active: true }))[0].url, mainWin);
   check('clicking a Today row activates its tab', activeUrl.includes('bravo'), activeUrl);
 
+  // v2.5: empty Favourites / Pinned are hidden until a drag starts; the New tab row has a hint
+  {
+    const hs = await panel.evaluate(() => ({ f: document.querySelector('.sec-favs').getBoundingClientRect().height, p: document.getElementById('sec-pinned').getBoundingClientRect().height, hint: document.querySelector('[data-testid="new-tab-row"] .kbd-hint')?.textContent }));
+    check('v2.5: side panel hides empty Favourites and Pinned', hs.f === 0 && hs.p === 0, JSON.stringify(hs));
+    check('v2.5: New tab row shows the \u2318T hint', hs.hint === '\u2318T');
+    const r = panel.locator('[data-testid="today-row"]').first(); await r.hover(); const b = await r.boundingBox();
+    await panel.mouse.down(); await panel.mouse.move(b.x + b.width / 2 + 8, b.y + b.height / 2 + 8, { steps: 4 }); await sleep(450);
+    const h2 = await panel.evaluate(() => ({ f: document.querySelector('.sec-favs').getBoundingClientRect().height, p: document.getElementById('sec-pinned').getBoundingClientRect().height }));
+    check('v2.5: a tab drag reveals them', h2.f > 30 && h2.p > 50, JSON.stringify(h2));
+    await panel.mouse.move(b.x + b.width / 2, 3, { steps: 3 }); await panel.mouse.up(); await sleep(500);
+    const h3 = await panel.evaluate(() => document.querySelector('.sec-favs').getBoundingClientRect().height + document.getElementById('sec-pinned').getBoundingClientRect().height);
+    check('v2.5: and they hide again after the drag', h3 === 0, String(h3));
+  }
+
   // Drag charlie into favourites
-  await panel.locator('[data-testid="today-row"][data-url*="charlie"]').dragTo(panel.locator('[data-testid="favourites-grid"]'));
+  await dragReveal(panel, panel.locator('[data-testid="today-row"][data-url*="charlie"]'), panel.locator('[data-testid="favourites-grid"]'));
   await sleep(700);
   check('drag tab → favourites creates a tile', (await panel.locator('[data-testid="favourite-tile"]').count()) === 1);
   check('pinned tab leaves Today', (await todayRows()) === 4, String(await todayRows()));
 
   // Drag delta into pinned
-  await panel.locator('[data-testid="today-row"][data-url*="delta"]').dragTo(panel.locator('[data-testid="pinned-tree"]'));
+  await dragReveal(panel, panel.locator('[data-testid="today-row"][data-url*="delta"]'), panel.locator('[data-testid="pinned-tree"]'));
   await sleep(700);
   const pinnedRows = await panel.locator('[data-testid="pinned-row"]').count();
   check('drag tab → pinned creates a row', pinnedRows === 1, String(pinnedRows));
@@ -135,7 +160,7 @@ async function main() {
   const folders = await panel.locator('[data-testid="pinned-folder"]').count();
   check('new folder created', folders === 1, String(folders));
   // Pin echo into the folder
-  await panel.locator('[data-testid="today-row"][data-url*="echo"]').dragTo(panel.locator('[data-testid="pinned-folder"]').first());
+  await dragReveal(panel, panel.locator('[data-testid="today-row"][data-url*="echo"]'), panel.locator('[data-testid="pinned-folder"]').first());
   await sleep(700);
   const echoParent = await swEval(async () => { const [b] = await chrome.bookmarks.search({ url: 'http://127.0.0.1:8765/echo.html' }); if (!b) return null; const [p] = await chrome.bookmarks.get(b.parentId); return p.title; });
   check('drag tab onto folder pins it inside the folder', echoParent === 'Reading', String(echoParent));
@@ -263,6 +288,27 @@ async function main() {
   check('panel themed with current profile colour', /^#|rgb|oklab|color/.test(tint) && !/^#8e8e93/i.test(tint), tint);
   // Style editor
   await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
+  // Sidebar colour setting (side-panel mode)
+  {
+    const bg = () => panel.evaluate(() => getComputedStyle(document.body).backgroundColor);
+    const rgb = (h) => `rgb(${parseInt(h.slice(1, 3), 16)}, ${parseInt(h.slice(3, 5), 16)}, ${parseInt(h.slice(5, 7), 16)})`;
+    const profBg = await bg();
+    check('sidebar colour: default auto uses the profile tint (not the neutral grey)', profBg !== 'rgb(243, 243, 246)' && profBg !== 'rgb(31, 32, 35)', profBg);
+    check('sidebar colour: Automatic selected, note says "From your profile colour"',
+      (await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').getAttribute('aria-pressed')) === 'true' &&
+      /From your profile colour/.test(await panel.locator('[data-testid="sidebar-color-note"]').innerText()));
+    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="custom"]').click(); await sleep(400);
+    check('sidebar colour: Custom shows 14 swatches and the picker', (await panel.locator('[data-testid="sidebar-color-swatch"]:visible').count()) === 14 && await panel.locator('[data-testid="sidebar-color-picker"]').isVisible());
+    await panel.locator('[data-testid="sidebar-color-swatch"][data-color="#e6f4ea"]').click(); await sleep(400);
+    check('sidebar colour: custom swatch sets the exact background', (await bg()) === rgb('#e6f4ea'), await bg());
+    await panel.screenshot({ path: path.join(OUT, '05-sidebar-colour.png') });
+    await panel.locator('[data-testid="sidebar-color-picker"]').fill('#204060'); await sleep(500);
+    check('sidebar colour: picker value applies exactly, with light text on dark', (await bg()) === rgb('#204060') && (await panel.evaluate(() => getComputedStyle(document.body).color)) === 'rgb(236, 236, 240)', await bg());
+    const saved = await swEval(async () => (await chrome.storage.sync.get('sidebarColor')).sidebarColor);
+    check('sidebar colour: stored in chrome.storage.sync', saved && saved.mode === 'custom' && saved.color === '#204060', JSON.stringify(saved));
+    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').click(); await sleep(500);
+    check('sidebar colour: back to Automatic restores the profile tint', (await bg()) === profBg, await bg());
+  }
   const styleRow = panel.locator('[data-testid="profile-style-row"]').first();
   await styleRow.click(); await sleep(300);
   await panel.locator('[data-testid="style-icon"][data-icon="rocket"]').first().click(); await sleep(500);

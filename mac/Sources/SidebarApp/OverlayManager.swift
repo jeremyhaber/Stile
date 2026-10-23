@@ -6,6 +6,7 @@ final class OverlayManager {
     let server: HostServer
     let tracker = ChromeTracker()
     let mapper = WindowMapper()
+    let closer = CloseInterceptor()
     private(set) var controllers: [Int: OverlayController] = [:]
 
     private var followTimer: Timer?
@@ -31,6 +32,11 @@ final class OverlayManager {
         mapper.windowsProvider = { [weak self] in self?.tracker.windows ?? [] }
         mapper.bridgesProvider = { [weak self] in self?.server.identified ?? [] }
         mapper.onChange = { [weak self] in self?.applyMapping() }
+
+        closer.mappingProvider = { [weak self] key in self?.mapper.map[key] }
+        closer.chromePid = { [weak self] in self?.tracker.pid ?? 0 }
+        closer.focusedWindowKey = { [weak self] in self?.tracker.focusedWindowKey() }
+        closer.ensureTap()
 
         tracker.onUpdate = { [weak self] in self?.trackerUpdated() }
         tracker.start()
@@ -84,6 +90,7 @@ final class OverlayManager {
     @objc private func secondTick() {
         if followActive { return }   // nothing expensive while following
         tickCount += 1
+        closer.ensureTap()
         let quiet = Date().timeIntervalSince(tracker.lastGeometryEvent) < 0.5
         if tickCount % 5 == 0, !server.identified.isEmpty, controllers.values.contains(where: { $0.isUnmapped }) {
             mapper.schedule()   // retry matching windows to extension windows
@@ -116,6 +123,7 @@ final class OverlayManager {
         for (id, entry) in bridgeSubscriptions where entry.0.closed {
             bridgeSubscriptions.removeValue(forKey: id)
         }
+        closer.bridgesChanged(live)
         mapper.schedule()
         applyMapping()
     }
@@ -152,6 +160,7 @@ final class OverlayManager {
             c.teardown()
             controllers.removeValue(forKey: k)
         }
+        closer.refreshTargets(wins)
         mapper.schedule()
         if Date().timeIntervalSince(tracker.lastGeometryEvent) < 0.3 {
             followLastActivity = Date()

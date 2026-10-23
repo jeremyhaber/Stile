@@ -3,7 +3,7 @@
 // replies/events go back as {type:'bridgeResult'|'bridgeEvent'}. No module-level state needs to survive a restart
 // except the "overlay connected" flag, which is mirrored in storage.session.overlayConnected.
 
-let deps = { dispatchCommand: null, post: null };
+let deps = { dispatchCommand: null, post: null, windowRoles: null };
 let connected = false;
 let loaded = null;
 const faviconCache = new Map();
@@ -47,6 +47,9 @@ function forward(name, args) {
     send({ type: 'bridgeEvent', name, args: safeJson(args) || [] });
   });
 }
+
+// Emit an extension-defined bridge event (e.g. sidebar.windowRolesChanged) to the app, subject to the same connected check.
+export function emitBridgeEvent(name, args) { forward(name, Array.isArray(args) ? args : [args]); }
 
 export function registerBridgeListeners(d) {
   deps = { ...deps, ...(d || {}) };
@@ -103,6 +106,10 @@ async function run(call, args) {
   if (call === 'sidebar.cmd') {
     if (!deps.dispatchCommand) throw new Error('dispatcher unavailable');
     return await deps.dispatchCommand(args[0], { bridge: true });
+  }
+  if (call === 'sidebar.windowRoles') {
+    if (!deps.windowRoles) throw new Error('window roles unavailable');
+    return await deps.windowRoles();
   }
   if (call === 'sidebar.favicon') return await favicon(args[0]);
   if (call === 'sidebar.hello') {

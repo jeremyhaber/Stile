@@ -46,7 +46,7 @@
         <section class="sec sec-favs">
           <div id="favs" class="favs" data-testid="favourites-grid" role="list" aria-label="Favourites"></div>
         </section>
-        <section class="sec">
+        <section class="sec sec-pinned" id="sec-pinned">
           <header class="sec-h">
             <h2>Pinned</h2>
             <button id="new-folder" type="button" class="icon-btn" aria-label="New folder" title="New folder" data-testid="new-folder-button"></button>
@@ -90,6 +90,18 @@
         <h1>Settings</h1>
       </div>
       <div class="scroll" id="scroll-settings">
+        <div class="field" id="field-sidebar-color" data-testid="settings-sidebar-color">
+          <label id="sbc-label">Sidebar colour</label>
+          <div class="seg" role="group" aria-labelledby="sbc-label" data-testid="sidebar-color-mode">
+            <button type="button" class="seg-b" data-mode="auto" aria-pressed="true">Automatic</button>
+            <button type="button" class="seg-b" data-mode="custom" aria-pressed="false">Custom</button>
+          </div>
+          <div class="sbc-custom" id="sbc-custom" hidden>
+            <div class="sbc-swatches" id="sbc-swatches" role="group" aria-label="Sidebar colour swatches"></div>
+            <label class="sbc-pick"><span>Pick any colour</span><input type="color" id="sbc-picker" data-testid="sidebar-color-picker" value="#e9eef6"></label>
+          </div>
+          <p class="hint" id="sbc-note" data-testid="sidebar-color-note"></p>
+        </div>
         <div class="field">
           <label for="set-profile-archive">Archive tabs after</label>
           <select id="set-profile-archive" data-testid="settings-archive-profile"></select>
