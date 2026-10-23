@@ -1241,8 +1241,73 @@ function closeMenu() {
   if (menuEl) { menuEl.remove(); menuEl = null; }
 }
 
+// Native (overlay) menus: items are serialised for the app; handlers stay here, keyed by id.
+let nativeMenu = null; // { handlers: Map } while a native menu is open
+const useNativeMenu = () => OVERLAY && !!window.__sidebarHost;
+
+// HTML menus have no nesting: a submenu is flattened inline, under a heading (unless `plain`), exactly like before.
+function flattenMenu(items) {
+  const out = [];
+  for (const it of items) {
+    if (it && it.submenu) {
+      const subs = flattenMenu(it.submenu.filter(Boolean));
+      if (!subs.length) continue;
+      if (!it.plain) out.push({ heading: it.label });
+      for (const s of subs) out.push(s.label && !s.heading && !it.plain ? { ...s, indent: true } : s);
+    } else out.push(it);
+  }
+  return out;
+}
+
+function toNativeItems(items, handlers) {
+  const out = [];
+  const add = (d) => out.push(d);
+  for (const it of items) {
+    if (!it) continue;
+    if (it === '-') { if (out.length && !out[out.length - 1].separator) add({ separator: true }); continue; }
+    if (it.heading) { add({ header: true, label: it.heading, enabled: false }); continue; }
+    if (it.swatches) {
+      add({ label: it.label || 'Colour', enabled: true, submenu: it.swatches.map((c) => {
+        const id = 'm' + (handlers.size + 1); handlers.set(id, () => it.onPick(c));
+        return { id, label: c.charAt(0).toUpperCase() + c.slice(1), enabled: true, checked: c === it.current };
+      }) });
+      continue;
+    }
+    if (it.submenu) {
+      const sub = toNativeItems(it.submenu, handlers);
+      if (sub.length) add({ label: it.label, enabled: !it.disabled && sub.some((d) => d.enabled), submenu: sub });
+      continue;
+    }
+    const id = 'm' + (handlers.size + 1);
+    handlers.set(id, it.run);
+    add({ id, label: it.label, enabled: !it.disabled, ...(it.checked ? { checked: true } : {}) });
+  }
+  while (out.length && out[out.length - 1].separator) out.pop();
+  return out;
+}
+
+window.__sidebarMenuResult = (id) => {
+  const nm = nativeMenu;
+  if (!nm) return;
+  nativeMenu = null;
+  updateBusy();
+  const fn = id != null ? nm.handlers.get(String(id)) : null;
+  if (typeof fn === 'function') { try { const r = fn(); if (r && r.catch) r.catch(console.error); } catch (e) { console.error(e); } }
+};
+
 function showMenu(ev, items) {
   closeMenu();
+  if (useNativeMenu()) {
+    if (nativeMenu) return;
+    const handlers = new Map();
+    const native = toNativeItems(items, handlers);
+    if (!native.length) return;
+    nativeMenu = { handlers };
+    updateBusy();
+    hostPost('contextMenu', { x: ev.clientX, y: ev.clientY, items: native });
+    return;
+  }
+  items = flattenMenu(items);
   const menu = h('div', { class: 'menu', role: 'menu', 'data-testid': 'context-menu' });
   for (const it of items) {
     if (!it) continue;
@@ -1357,10 +1422,8 @@ function showTabMenu(ev, tab, opts = {}) {
     items.push({ label: 'Add to new group', action: 'new-group', run: () => newGroupWith(tab) });
     const gs = [...S.groups.values()].filter((g) => g.windowId === tab.windowId && g.id !== gidOf(tab));
     if (gs.length) {
-      items.push({ heading: 'Add to group' });
-      for (const g of gs) {
-        items.push({ label: g.title || 'Unnamed group', action: 'add-to-group', indent: true, dot: g.color || 'grey', run: () => safe(chrome.tabs.group({ tabIds: [tab.id], groupId: g.id })) });
-      }
+      items.push({ label: 'Add to group', submenu: gs.map((g) => (
+        { label: g.title || 'Unnamed group', action: 'add-to-group', dot: g.color || 'grey', run: () => safe(chrome.tabs.group({ tabIds: [tab.id], groupId: g.id })) })) });
     }
     if (gidOf(tab) >= 0) items.push({ label: 'Remove from group', action: 'remove-from-group', run: () => safe(chrome.tabs.ungroup(tab.id)) });
     items.push('-');
@@ -1374,11 +1437,8 @@ function showTabMenu(ev, tab, opts = {}) {
     if (SPLIT_OK) {
       const cands = windowVisibleTabs(tab.windowId).filter((t) => t.id !== tab.id).slice(0, 8);
       if (cands.length) {
-        items.push({ heading: 'Split with…' });
-        for (const t of cands) {
-          const label = (t.title || t.url || 'New Tab').slice(0, 40);
-          items.push({ label, action: 'split-with', indent: true, run: () => splitWith(tab.id, t.id) });
-        }
+        items.push({ label: 'Split with…', submenu: cands.map((t) => (
+          { label: (t.title || t.url || 'New Tab').slice(0, 40), action: 'split-with', run: () => splitWith(tab.id, t.id) })) });
       }
     } else items.push({ label: 'Split view needs Chrome 155+', action: 'split-unsupported', disabled: true, run: () => {} });
     items.push('-', { label: 'Move to new window', action: 'new-window', run: () => toNewWindow({ tabId: tab.id }) }, '-');
@@ -1390,10 +1450,12 @@ function showTabMenu(ev, tab, opts = {}) {
     '-',
     { label: 'Duplicate tab', action: 'duplicate', run: () => safe(chrome.tabs.duplicate(tab.id)) },
     { label: 'Close tab', action: 'close', run: () => safe(chrome.tabs.remove(tab.id)) },
-    { label: 'Close tabs above', action: 'close-above', disabled: !closeScope(tab, 'above').length, run: () => closeMany(tab, 'above') },
-    { label: 'Close tabs below', action: 'close-below', disabled: !closeScope(tab, 'below').length, run: () => closeMany(tab, 'below') },
-    { label: 'Close other tabs', action: 'close-others', disabled: !closeScope(tab, 'others').length, run: () => closeMany(tab, 'others') },
-    { label: 'Close all tabs', action: 'close-all', disabled: !closeScope(tab, 'all').length, run: () => closeMany(tab, 'all') }
+    { label: 'Close…', plain: true, submenu: [
+      { label: 'Close tabs above', action: 'close-above', disabled: !closeScope(tab, 'above').length, run: () => closeMany(tab, 'above') },
+      { label: 'Close tabs below', action: 'close-below', disabled: !closeScope(tab, 'below').length, run: () => closeMany(tab, 'below') },
+      { label: 'Close other tabs', action: 'close-others', disabled: !closeScope(tab, 'others').length, run: () => closeMany(tab, 'others') },
+      { label: 'Close all tabs', action: 'close-all', disabled: !closeScope(tab, 'all').length, run: () => closeMany(tab, 'all') }
+    ] }
   );
   showMenu(ev, items);
 }
@@ -1912,7 +1974,7 @@ function postActiveTitle() {
   postOnce('activeTitle', { title: t.title || '', favIconUrl: t.favIconUrl || '' });
 }
 function isBusy() {
-  return !!(dragging || document.body.classList.contains('dragging') ||
+  return !!(dragging || nativeMenu || document.body.classList.contains('dragging') ||
     document.querySelector('#menu-root .menu, #dialog-root .scrim, .rename-input, #view-boost textarea'));
 }
 function updateBusy() { postOnce('busy', isBusy()); }

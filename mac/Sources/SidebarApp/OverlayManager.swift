@@ -105,6 +105,7 @@ final class OverlayManager {
 
     private func trackerUpdated() {
         let wins = tracker.windows
+        let focusedNow = tracker.focusedWindowKey()
         var seen = Set<Int>()
         for w in wins {
             seen.insert(w.key)
@@ -120,6 +121,7 @@ final class OverlayManager {
                 controllers[w.key] = c
                 c.attach(mapper.map[w.key])
             }
+            c.isFocusedChromeWindow = (w.key == focusedNow)
             c.update(window: w, chromeFrontmost: tracker.chromeFrontmost)
         }
         for (k, c) in controllers where !seen.contains(k) {

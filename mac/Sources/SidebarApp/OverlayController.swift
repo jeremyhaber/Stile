@@ -178,6 +178,7 @@ final class OverlayController {
     /// Scans the window's AX tree for the vertical tab rail and its collapse/expand button.
     func rescan(reason: String) {
         guard visible else { return }
+        trafficLightsBottomRel = nil
         lastScan = Date()
         lastScanSize = window.frame.size
         let scan = RailFinder.scan(window: window.element, windowFrame: window.frame,
@@ -271,14 +272,39 @@ final class OverlayController {
     private var windowAX: CGRect { window.frame }
 
     /// Rail frame in AX coordinates, from the cached window-relative frame.
+    /// Bottom of Chrome's close/minimise/zoom buttons, relative to the window top (cached per scan).
+    private var trafficLightsBottomRel: CGFloat?
+
+    private func trafficLightsBottom() -> CGFloat {
+        if let c = trafficLightsBottomRel { return c }
+        var bottom: CGFloat = 0
+        for name in [AXName.closeButton, AXName.zoomButton] {
+            if let b = AX.element(window.element, name), let f = AX.frame(b) {
+                bottom = max(bottom, f.maxY - window.frame.minY)
+            }
+        }
+        // Leave a little air under the buttons; fall back to the standard title-bar height.
+        let value = bottom > 0 ? bottom + 6 : 32
+        trafficLightsBottomRel = value
+        return value
+    }
+
     private func railAXRect() -> CGRect? {
         guard let r = rail else { return nil }
         let w = windowAX
-        return CGRect(x: w.minX + r.rel.minX, y: w.minY + r.rel.minY, width: r.rel.width, height: r.rel.height)
+        var rect = CGRect(x: w.minX + r.rel.minX, y: w.minY + r.rel.minY, width: r.rel.width, height: r.rel.height)
+        // Never cover Chrome's window buttons, whatever the rail's reported frame says.
+        let minTop = w.minY + trafficLightsBottom()
+        if rect.minY < minTop {
+            let cut = minTop - rect.minY
+            rect.origin.y = minTop
+            rect.size.height = max(0, rect.height - cut)
+        }
+        return rect
     }
 
     private func contentTopAX() -> CGFloat {
-        windowAX.minY + (contentTopRel ?? Self.fallbackContentTop)
+        windowAX.minY + max(contentTopRel ?? Self.fallbackContentTop, trafficLightsBottom())
     }
 
     /// The sidebar's own frame (without the shadow strip) in AX coordinates for a state.
@@ -310,7 +336,19 @@ final class OverlayController {
         return Geometry.flip(CGRect(x: w.minX, y: top, width: 4, height: max(0, w.maxY - top)))
     }
 
+    /// Set by OverlayManager: true when this is Chrome's focused window.
+    var isFocusedChromeWindow = false
+
     private func orderAbove(_ panel: NSPanel) {
+        // While Chrome is the active app and this is its focused window, keep the sidebar at floating
+        // level: clicking inside Chrome raises Chrome's window without any notification we could react
+        // to, so ordering relative to it isn't enough. Other apps' windows can't be above Chrome then.
+        if chromeFrontmost && isFocusedChromeWindow {
+            if panel.level != .floating { panel.level = .floating }
+            panel.orderFrontRegardless()
+            return
+        }
+        if panel.level != .normal { panel.level = .normal }
         if window.cgID != 0 {
             panel.order(.above, relativeTo: Int(window.cgID))
         } else {
@@ -586,12 +624,73 @@ final class OverlayController {
             if let dir = value as? String, !dir.isEmpty { HostActions.openExtensionsPage(profileDir: dir) }
         case "revealExtension":
             HostActions.revealExtensionFolder()
+        case "contextMenu":
+            showContextMenu(value)
         case "busy":
             busy = boolValue(value)
             if busy { hideTimer.cancel() } else { scheduleHideIfOutside() }
         default:
             break   // theme, activeTitle: nothing to do now that the app draws no chrome of its own
         }
+    }
+
+    // MARK: Native context menus
+
+    private func buildMenu(_ items: [[String: Any]], target: MenuPicker) -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for d in items {
+            if boolValue(d["separator"]) { menu.addItem(NSMenuItem.separator()); continue }
+            let label = (d["label"] as? String) ?? ""
+            let enabled = d["enabled"] == nil ? true : boolValue(d["enabled"])
+            if boolValue(d["header"]) {
+                let h = NSMenuItem(title: label, action: nil, keyEquivalent: "")
+                h.isEnabled = false
+                menu.addItem(h)
+                continue
+            }
+            if let sub = d["submenu"] as? [[String: Any]] {
+                let it = NSMenuItem(title: label, action: nil, keyEquivalent: "")
+                it.isEnabled = enabled
+                it.submenu = buildMenu(sub, target: target)
+                menu.addItem(it)
+                continue
+            }
+            let it = NSMenuItem(title: label, action: #selector(MenuPicker.pick(_:)), keyEquivalent: "")
+            it.target = target
+            it.isEnabled = enabled
+            it.state = boolValue(d["checked"]) ? .on : .off
+            it.representedObject = d["id"] as? String
+            menu.addItem(it)
+        }
+        return menu
+    }
+
+    private func showContextMenu(_ value: Any?) {
+        guard let dict = value as? [String: Any],
+              let items = dict["items"] as? [[String: Any]], !items.isEmpty else {
+            sidebar.webView.evaluateJavaScript("window.__sidebarMenuResult && window.__sidebarMenuResult(null)", completionHandler: nil)
+            return
+        }
+        let x = JSONUtil.double(dict["x"]) ?? 0
+        let y = JSONUtil.double(dict["y"]) ?? 0
+        let web = sidebar.webView
+        let py = web.isFlipped ? CGFloat(y) : web.bounds.height - CGFloat(y)
+        let point = NSPoint(x: CGFloat(x), y: py)
+        let picker = MenuPicker()
+        let menu = buildMenu(items, target: picker)
+        busy = true
+        hideTimer.cancel()
+        menu.popUp(positioning: nil, at: point, in: web)   // synchronous: returns once the menu closes
+        busy = false
+        let arg: String
+        if let id = picker.chosenId {
+            arg = JSONUtil.stringLiteral(id)
+        } else {
+            arg = "null"
+        }
+        web.evaluateJavaScript("window.__sidebarMenuResult && window.__sidebarMenuResult(\(arg))", completionHandler: nil)
+        scheduleHideIfOutside()
     }
 
     func pushHostState(force: Bool = false) {
@@ -623,5 +722,13 @@ final class OverlayController {
         if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
             AX.perform(window.element, AXName.actionRaise)
         }
+    }
+}
+
+/// Target for native context-menu items: remembers which item id was chosen.
+final class MenuPicker: NSObject {
+    var chosenId: String?
+    @objc func pick(_ sender: NSMenuItem) {
+        chosenId = sender.representedObject as? String
     }
 }

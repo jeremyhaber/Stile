@@ -319,13 +319,44 @@ async function main() {
   await until(() => lastHost('busy')?.value === false, 3000);
   check('busy returns to false after the drag', lastHost('busy')?.value === false);
 
-  // ---- rename
+  // ---- native context menu
   const eRow = panel.locator('[data-testid="today-row"][data-url*="echo"]');
-  await eRow.click({ button: 'right' }); await sleep(300);
+  const findItem = (items, pred) => { for (const it of items || []) { if (pred(it)) return it; const r = findItem(it.submenu, pred); if (r) return r; } return null; };
+  const openMenu = async (row) => {
+    const n = hostCount('contextMenu');
+    await row.first().click({ button: 'right' });
+    await until(() => hostCount('contextMenu') > n, 3000);
+    return lastHost('contextMenu')?.value;
+  };
+  const menu1 = await openMenu(eRow);
+  check('native menu: contextMenu posted with x, y, items', !!menu1 && typeof menu1.x === 'number' && typeof menu1.y === 'number' && Array.isArray(menu1.items) && menu1.items.length > 3);
+  check('native menu: no HTML menu in overlay mode', (await panel.locator('[data-testid="context-menu"]').count()) === 0);
+  const split = menu1.items.find((i) => /^Split/.test(i.label || ''));
+  check('native menu: "Split with" submenu or disabled unsupported item', !!split && (Array.isArray(split.submenu) ? split.submenu.length > 0 : split.enabled === false));
+  const closeSub = menu1.items.find((i) => /^Close…/.test(i.label || ''));
+  check('native menu: "Close…" submenu holds above/below/others/all', !!closeSub && ['above', 'below', 'other', 'all'].every((w) => closeSub.submenu.some((i) => new RegExp(w).test(i.label))));
+  check('native menu: Close… comes after Close tab', menu1.items.findIndex((i) => i.label === 'Close tab') === menu1.items.indexOf(closeSub) - 1);
+  check('native menu: descriptors are serialisable (ids, no functions)', findItem(menu1.items, (i) => i.label === 'Duplicate tab')?.id != null && !JSON.stringify(menu1).includes('function'));
   await until(() => lastHost('busy')?.value === true, 3000);
-  check('host: busy=true while a context menu is open', lastHost('busy')?.value === true);
-  await panel.locator('[data-testid="context-menu-item"][data-action="rename-tab"]').click(); await sleep(300);
-  check('host: busy=true while the rename input is open', (await panel.locator('[data-testid="rename-input"]').count()) === 1 && lastHost('busy')?.value === true);
+  check('host: busy=true while a native context menu is open', lastHost('busy')?.value === true);
+  // dismissed
+  await panel.evaluate(() => window.__sidebarMenuResult(null)); await sleep(300);
+  await until(() => lastHost('busy')?.value === false, 3000);
+  check('native menu: busy=false after dismissal', lastHost('busy')?.value === false);
+  // duplicate
+  const dupId = findItem((await openMenu(eRow)).items, (i) => i.label === 'Duplicate tab').id;
+  await panel.evaluate((id) => window.__sidebarMenuResult(id), dupId); await sleep(1200);
+  check('native menu: result id duplicates the tab', (await eRow.count()) === 2, `rows=${await eRow.count()}`);
+  await until(() => lastHost('busy')?.value === false, 3000);
+  check('native menu: busy=false after a choice', lastHost('busy')?.value === false);
+  // close the duplicate through the Close tab item
+  const closeId = findItem((await openMenu(eRow.nth(1))).items, (i) => i.label === 'Close tab').id;
+  await panel.evaluate((id) => window.__sidebarMenuResult(id), closeId); await sleep(1000);
+  check('native menu: Close tab removes the duplicate', (await eRow.count()) === 1);
+
+  // ---- rename
+  const renameId = findItem((await openMenu(eRow)).items, (i) => i.label === 'Rename tab').id;
+  await panel.evaluate((id) => window.__sidebarMenuResult(id), renameId); await sleep(300);
   await panel.locator('[data-testid="rename-input"]').fill('My renamed tab');
   await panel.locator('[data-testid="rename-input"]').press('Enter'); await sleep(1500);
   check('renamed tab shows the new name', (await panel.locator('[data-testid="today-row"]', { hasText: 'My renamed tab' }).count()) === 1);
