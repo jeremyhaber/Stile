@@ -1,0 +1,68 @@
+/* Boost view, button and settings section. Uses the panel's custom properties. */
+.bx-btn[data-active="true"] { color: var(--accent-text); background: var(--accent-soft); }
+.bx-btn[data-active="true"] svg { fill: currentColor; fill-opacity: 0.25; }
+.bx-btn[data-off="true"] { opacity: 0.4; }
+.bx-btn svg, .bx-ico svg { width: 16px; height: 16px; display: block; }
+
+.bx-view { display: flex; flex-direction: column; gap: 10px; padding: 0 2px 16px; user-select: none; }
+.bx-head { display: flex; align-items: center; gap: 6px; min-height: 32px; }
+.bx-head .bx-host { flex: 1; min-width: 0; font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bx-sub { color: var(--dim); font-size: 12px; margin: -4px 4px 0; }
+.bx-note { color: var(--dim); font-size: 12px; line-height: 1.45; margin: 4px; user-select: text; }
+.bx-empty { padding: 28px 12px; text-align: center; color: var(--dim); font-size: 13px; }
+
+.bx-switch { position: relative; width: 34px; height: 20px; flex: none; border-radius: 999px; background: var(--ring); transition: background-color var(--t); }
+.bx-switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: transform var(--t); }
+.bx-switch[aria-checked="true"] { background: var(--accent); }
+.bx-switch[aria-checked="true"]::after { transform: translateX(14px); }
+.bx-switch:focus-visible, .bx-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.bx-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%;
+  min-height: 64px; padding: 12px 16px; border-radius: 14px; text-align: left;
+  background: color-mix(in oklab, var(--profile) 16%, var(--tile-base)); color: var(--fg);
+  font-size: 16px; font-weight: 700; transition: background-color var(--t), transform var(--t);
+}
+.bx-card:hover { background: color-mix(in oklab, var(--profile) 26%, var(--tile-base)); }
+.bx-card:active { transform: scale(0.985); }
+.bx-card .bx-ico { color: var(--accent-text); display: flex; }
+.bx-card .bx-ico svg { width: 22px; height: 22px; }
+.bx-card[aria-expanded="true"] { border-bottom-left-radius: 6px; border-bottom-right-radius: 6px; }
+.bx-card.bx-armed { background: var(--accent); color: var(--on-accent); }
+.bx-card.bx-armed .bx-ico { color: var(--on-accent); }
+
+.bx-zaps { display: flex; flex-direction: column; gap: 2px; }
+.bx-zap { display: flex; align-items: center; gap: 6px; min-height: 30px; padding: 2px 4px 2px 10px; border-radius: 8px; }
+.bx-zap:hover { background: var(--hover); }
+.bx-zap .bx-zl { flex: 1; min-width: 0; }
+.bx-zap .bx-zl b { display: block; font-weight: 500; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bx-zap .bx-zl code { display: block; font-size: 10.5px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bx-zap-h { display: flex; align-items: center; justify-content: space-between; padding: 0 4px 0 10px; }
+.bx-zap-h span { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
+
+.bx-code { display: flex; flex-direction: column; gap: 8px; padding: 10px; margin-top: -8px; border-radius: 6px 6px 14px 14px; background: color-mix(in oklab, var(--profile) 10%, var(--tile-base)); }
+.bx-tabs { display: flex; gap: 4px; }
+.bx-tabs button { height: 24px; padding: 0 12px; border-radius: 6px; font-size: 12px; font-weight: 600; color: var(--dim); }
+.bx-tabs button[aria-selected="true"] { background: var(--active); color: var(--fg); }
+.bx-editor {
+  width: 100%; min-height: 160px; resize: vertical; padding: 8px; border-radius: 8px; border: 0; outline: 0;
+  background: var(--input); color: var(--fg); user-select: text;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; tab-size: 2; white-space: pre; overflow: auto;
+}
+.bx-editor:focus { box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 2px var(--accent-soft); }
+.bx-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.bx-row .bx-state { flex: 1; font-size: 11.5px; color: var(--dim); min-width: 0; }
+.bx-row .bx-state.dirty { color: var(--accent-text); }
+.bx-view .btn.small { margin-left: 0; height: 26px; }
+.bx-warn { padding: 10px 12px; border-radius: 10px; background: var(--input); font-size: 12px; line-height: 1.45; user-select: text; }
+.bx-warn p { margin: 0 0 8px; }
+.bx-del { margin-top: 6px; align-self: stretch; }
+
+.bx-sites { display: flex; flex-direction: column; gap: 2px; }
+.bx-site { display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 2px 4px 2px 8px; border-radius: 8px; }
+.bx-site:hover { background: var(--hover); }
+.bx-site .bx-sn { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bx-site .bx-sm { color: var(--faint); font-size: 11px; }
+
+/* The boost view mounts straight into #view-boost, which has no .scroll wrapper. */
+#view-boost { overflow-y: auto; overflow-x: hidden; padding: 10px 10px 12px; scrollbar-width: thin; }

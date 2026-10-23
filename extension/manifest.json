@@ -1,0 +1,70 @@
+{
+  "manifest_version": 3,
+  "name": "Sidebar",
+  "version": "1.2.0",
+  "description": "An Arc-style side panel: favourites, pinned tabs, today's tabs, auto-archive and profile switching.",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzdeEuaIu2+SMvOlZh8DQoCr4pR8Jqxi5Ln/5JnEf3shuxpT+EdRPi3Gefw25R09s1Vh/aE70n5eA4lilqf18su5+7lQ+wvJc/kCeNFwsrhyi9XK/sbbCEoPN/x+ssSuht2wCCcEZ9Z4EmQ/j9S7Mr+tm8ci/6KErXUbjNS4/EzHrj41TMpbjx/CbGb4L7Bvf4oIvoTKoYBCzQ3czmGrcFQ8q3+tuY75yUatLeZukQXPAz6nohLTncAJF4OuUSCwBVs3Y9juRbFuvmD4owNkSGCG6jEjtUgIW2SFYUqtgYiitpfAMBJb95oy4PiqBxub8zWGQZEM9zkbdyQ+HYN0yZQIDAQAB",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Sidebar",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+S",
+        "mac": "Alt+S"
+      },
+      "description": "Open Sidebar"
+    }
+  },
+  "permissions": [
+    "sidePanel",
+    "tabs",
+    "bookmarks",
+    "storage",
+    "unlimitedStorage",
+    "alarms",
+    "nativeMessaging",
+    "search",
+    "favicon",
+    "identity",
+    "identity.email",
+    "tabGroups",
+    "scripting",
+    "userScripts"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "boost-content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}
