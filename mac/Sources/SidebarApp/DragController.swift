@@ -5,8 +5,53 @@ import ApplicationServices
 /// CGEventTap (CloseInterceptor forwards mouse events here). Chrome's window is moved with synchronous AX
 /// sets and our panel is moved right after each set, so both come from the same code path.
 /// Everything runs on the main thread (the tap is attached to the main run loop).
+/// Own event tap, installed only while lockstep is on: drag events in a tap wait for our main thread, so they
+/// must not be intercepted at all when the feature is off.
+private let dragTapCallback: CGEventTapCallBack = { _, type, event, refcon in
+    guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
+    let me = Unmanaged<DragController>.fromOpaque(refcon).takeUnretainedValue()
+    var swallow = false
+    if #available(macOS 14.0, *) {
+        swallow = MainActor.assumeIsolated { me.handle(type, event) }
+    }
+    return swallow ? nil : Unmanaged.passUnretained(event)
+}
+
 @MainActor
 final class DragController {
+    private var tap: CFMachPort?
+    private var tapSource: CFRunLoopSource?
+
+    /// Installs or removes the tap to match the setting. Cheap to call often.
+    func syncTap() {
+        let want = Settings.lockstepDrag && !Self.disabledThisRun && Permissions.isTrusted
+        if want, tap == nil {
+            let types: [CGEventType] = [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
+            var mask: CGEventMask = 0
+            for t in types { mask |= (CGEventMask(1) << CGEventMask(t.rawValue)) }
+            let refcon = Unmanaged.passUnretained(self).toOpaque()
+            guard let port = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                                               options: .defaultTap, eventsOfInterest: mask,
+                                               callback: dragTapCallback, userInfo: refcon) else {
+                Log.write("lockstep: could not create event tap")
+                return
+            }
+            let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
+            CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+            CGEvent.tapEnable(tap: port, enable: true)
+            tap = port
+            tapSource = src
+            Log.write("lockstep: event tap installed")
+        } else if !want, let t = tap {
+            if session != nil { finish(at: nil, replay: false) }
+            CGEvent.tapEnable(tap: t, enable: false)
+            if let src = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
+            tap = nil
+            tapSource = nil
+            Log.write("lockstep: event tap removed")
+        }
+    }
+
     /// Value of `.eventSourceUserData` on the click we replay to Chrome, so the tap ignores it.
     nonisolated static let marker: Int64 = 0x5342_4C4B
 
@@ -56,6 +101,7 @@ final class DragController {
         switch type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
             if session != nil { finish(at: nil, replay: false) }
+            if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
             return false
         default:
             break
@@ -68,7 +114,9 @@ final class DragController {
             return mouseDown(event)
         case .leftMouseDragged:
             guard var s = session else { return false }
-            if NSEvent.pressedMouseButtons & 1 == 0 {
+            // Read the HARDWARE button state: we swallowed the mouse-down, so the window server's own state
+            // (NSEvent.pressedMouseButtons) thinks the button is up and would end every drag immediately.
+            if !CGEventSource.buttonState(.hidSystemState, button: .left) {
                 finish(at: event.location, replay: false)
                 return false
             }
@@ -282,6 +330,7 @@ final class DragController {
             Log.write("lockstep: Chrome didn't follow the drag; turning lockstep off for this session")
             Self.disabledThisRun = true
             s.failed = true
+            DispatchQueue.main.async { [weak self] in self?.syncTap() }
             return
         }
         s.lastFrame = f

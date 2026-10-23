@@ -37,8 +37,6 @@ final class CloseInterceptor {
     var focusedWindowKey: (() -> Int?)?
     /// Called after a bridge's cached roles changed (the manager re-evaluates which windows are little).
     var onRolesChanged: (() -> Void)?
-    /// v2.9: lockstep window moves / resizes share this tap (see DragController).
-    var dragHandler: ((CGEventType, CGEvent) -> Bool)?
 
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -58,7 +56,8 @@ final class CloseInterceptor {
         if tap != nil { return }
         guard Permissions.isTrusted, Date().timeIntervalSince(lastTapAttempt) > 5 else { return }
         lastTapAttempt = Date()
-        let types: [CGEventType] = [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .keyDown]
+        // No drag events here: every event in this mask waits for our main thread, and mouse-drags are hot.
+        let types: [CGEventType] = [.leftMouseDown, .leftMouseUp, .keyDown]
         var mask: CGEventMask = 0
         for t in types { mask |= (CGEventMask(1) << CGEventMask(t.rawValue)) }
         let refcon = Unmanaged.passUnretained(self).toOpaque()
@@ -191,7 +190,6 @@ final class CloseInterceptor {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
             Log.write("close-interceptor: tap was disabled, re-enabled")
-            _ = dragHandler?(type, event)
             return false
 
         case .leftMouseDown:
@@ -201,17 +199,14 @@ final class CloseInterceptor {
                 merge(bridge: q.bridge, windowId: q.windowId, target: q.target)
                 return true
             }
-            return dragHandler?(type, event) ?? false
+            return false
 
         case .leftMouseUp:
             if swallowNextMouseUp {
                 swallowNextMouseUp = false
                 return true
             }
-            return dragHandler?(type, event) ?? false
-
-        case .leftMouseDragged:
-            return dragHandler?(type, event) ?? false
+            return false
 
         case .keyDown:
             let code = event.getIntegerValueField(.keyboardEventKeycode)

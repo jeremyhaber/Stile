@@ -46,7 +46,7 @@ final class OverlayManager {
         closer.focusedWindowKey = { [weak self] in self?.tracker.focusedWindowKey() }
         closer.onRolesChanged = { [weak self] in self?.applyMapping() }
         dragger.manager = self
-        closer.dragHandler = { [weak self] type, event in self?.dragger.handle(type, event) ?? false }
+        dragger.syncTap()
         closer.ensureTap()
 
         tracker.onUpdate = { [weak self] in self?.trackerUpdated() }
@@ -102,6 +102,7 @@ final class OverlayManager {
         if followActive { return }   // nothing expensive while following
         tickCount += 1
         closer.ensureTap()
+        dragger.syncTap()
         let quiet = Date().timeIntervalSince(tracker.lastGeometryEvent) < 0.5
         let anyConnected = !server.identified.isEmpty
         let wanting = controllers.values.filter { $0.wantsMapping }
@@ -166,6 +167,7 @@ final class OverlayManager {
             closer.refreshTargets(supportedWindows())
         }
         for c in controllers.values { c.settingsChanged() }
+        dragger.syncTap()
     }
 
     private func trackerUpdated() {
