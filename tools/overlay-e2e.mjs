@@ -71,7 +71,7 @@ const U = (n) => `http://127.0.0.1:${SITE}/${n}.html`;
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml', '.json': 'application/json' };
 const app = {
   fromExt: [], bridgeEvents: [], bridgeCalls: [], sse: new Set(), hostLog: [],
-  host: { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: false, railFound: true, railControllable: true, launchAtLogin: false, accessibility: true, appVersion: '2.1.0-test' },
+  host: { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: false, railFound: true, railControllable: true, launchAtLogin: false, lockstep: true, accessibility: true, appVersion: '2.1.0-test' },
 };
 // TEST-ONLY split hook: Chromium 141 has no split API, so tabs served to the page through this test transport can be stamped with a
 // splitViewId (app.splitMap: tabId -> splitViewId). Production code paths are untouched.
@@ -131,6 +131,7 @@ const appSrv = http.createServer((req, res) => {
         if (m.action === 'ready') hostState();
         if (m.action === 'setPinned') setHost({ state: m.value ? 'pinned' : 'peek' });
         if (m.action === 'setLaunchAtLogin') setHost({ launchAtLogin: !!m.value });
+        if (m.action === 'setLockstep') setHost({ lockstep: !!m.value });
         res.writeHead(204).end(); return;
       }
       res.writeHead(400).end();
@@ -364,6 +365,25 @@ async function main() {
   setHost({ compact: false, railWidth: 48 }); await sleep(450);
   const posBack = await POS();
   check('compact -> expanded returns every position to where it was', sameCol(posExp, posBack, 'rows', 1, 1) && sameCol(posExp, posBack, 'fav', 1, 1) && sameCol(posExp, posBack, 'heads', 1, 1));
+
+  // ---- v2.9 screenshots: the camera button and its menu exist in overlay mode too (native menu through the host), hidden in compact
+  {
+    const cam = panel.locator('[data-testid="capture-button"]');
+    check('v2.9 overlay: camera button sits in the address row next to Boost and is visible when expanded', await cam.count() === 1 && await cam.isVisible() && await panel.locator('.addr-row [data-testid="boost-button"]').count() === 1);
+    const nMenu = hostCount('contextMenu');
+    await cam.click();
+    await until(() => hostCount('contextMenu') > nMenu, 3000);
+    const labels = (lastHost('contextMenu')?.value.items || []).map((i) => i.label);
+    check('v2.9 overlay: camera menu is posted to the app (Visible area / Full page / Region / Recent captures)', labels.length >= 4 && /Visible/.test(labels[0]) && /Full/.test(labels[1]) && /Region/.test(labels[2]) && labels.some((l) => /Recent captures/.test(l)), JSON.stringify(labels));
+    const recentId = (lastHost('contextMenu')?.value.items || []).find((i) => /Recent captures/.test(i.label || ''))?.id;
+    await panel.evaluate((id) => window.__sidebarMenuResult(id), recentId); await sleep(500);
+    check('v2.9 overlay: choosing "Recent captures" in the native menu opens the Recent captures view', await panel.locator('[data-testid="captures-view"]').isVisible() && await panel.locator('[data-testid="capture-recent-view"]').count() === 1);
+    await panel.locator('[data-testid="captures-view"] [data-testid="back-button"]').click(); await sleep(300);
+    check('v2.9 overlay: back returns to the list', await panel.locator('[data-testid="view-main"]').isVisible());
+    setHost({ compact: true, railWidth: 56 }); await sleep(500);
+    check('v2.9 overlay compact: the camera button fades out like the Boost button', (await panel.evaluate(() => getComputedStyle(document.querySelector('.capture-slot')).opacity)) === '0');
+    setHost({ compact: false, railWidth: 48 }); await sleep(450);
+  }
   check('no element on the panel root has a border radius, in compact, peek and pinned', await (async () => {
     const rad = () => panel.evaluate(() => ['html', 'body', '#app'].map((s) => { const c = getComputedStyle(document.querySelector(s)); return [c.borderTopLeftRadius, c.borderTopRightRadius, c.borderBottomLeftRadius, c.borderBottomRightRadius]; }).flat().every((v) => v === '0px'));
     const out = [];
@@ -460,6 +480,12 @@ async function main() {
   check('App: launch at login switch posts setLaunchAtLogin(true)', lastHost('setLaunchAtLogin')?.value === true && await panel.locator('[data-testid="app-launch-login"]').isChecked());
   setHost({ launchAtLogin: false }); await sleep(300);
   check('App: launch at login follows hostState', !(await panel.locator('[data-testid="app-launch-login"]').isChecked()));
+  const ls = panel.locator('[data-testid="app-lockstep"]');
+  check('App: lockstep switch mirrors hostState (on)', await ls.isChecked());
+  await ls.uncheck(); await sleep(300);
+  check('App: lockstep switch posts setLockstep(false) and follows hostState', lastHost('setLockstep')?.value === false && app.host.lockstep === false && !(await ls.isChecked()));
+  setHost({ lockstep: true }); await sleep(300);
+  check('App: lockstep follows hostState back on', await ls.isChecked());
   const ovSw = panel.locator('[data-testid="overlay-enabled"]');
   check('App: "Show sidebar over Chrome\'s tabs" switch present and on', (await ovSw.isVisible()) && (await ovSw.isChecked()));
   await ovSw.uncheck(); await sleep(600);

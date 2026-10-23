@@ -7,6 +7,9 @@ struct RailInfo {
     let button: AXUIElement?          // Chrome's collapse/expand button
     let splitter: AXUIElement?        // resize splitter at the rail's right edge, if exposed
     var rel: CGRect                   // rail frame relative to the window's top-left (AX points)
+    /// Distance from the rail's bottom to the window's bottom. The rail's height is derived from the live window
+    /// height minus this, so a window resize stretches the sidebar immediately instead of after the next rescan.
+    var bottomInset: CGFloat = 0
 
     var expanded: Bool { rel.width >= RailFinder.expandedMinWidth }
 }
@@ -146,7 +149,8 @@ enum RailFinder {
         result.rail = RailInfo(railElement: nodes[best].el,
                                button: buttonIndex.map { nodes[$0].el },
                                splitter: splitterIndex.map { nodes[$0].el },
-                               rel: rel)
+                               rel: rel,
+                               bottomInset: max(0, windowFrame.maxY - railFrame.maxY))
 
         if wantLog {
             result.logLines.append("rail: found, width \(Int(railFrame.width)) (\(railFrame.width < expandedMinWidth ? "collapsed" : "expanded")), \(nodes.count) nodes scanned")

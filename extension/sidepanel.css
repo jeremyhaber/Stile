@@ -594,7 +594,7 @@ html.overlay .fav-empty, html.overlay .tree .empty-drop, html.overlay .guide {
 }
 
 html.overlay.compact .pbtn:not([data-current="true"]),
-html.overlay.compact .boost-slot,
+html.overlay.compact .boost-slot, html.overlay.compact .capture-slot,
 html.overlay.compact .sec-h h2, html.overlay.compact .sec-actions, html.overlay.compact #new-folder,
 html.overlay.compact .gcount, html.overlay.compact .badge, html.overlay.compact .sub,
 html.overlay.compact .window-head .wmeta, html.overlay.compact .window-head .wsub, html.overlay.compact .window-head .wmerge,

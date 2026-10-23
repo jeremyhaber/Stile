@@ -125,6 +125,8 @@ class HostServer extends EventEmitter {
     this.byProfile = new Map();
     /** profileDir -> { bounds, ts (epoch seconds) }: handoffs waiting for that profile's identify */
     this.pending = new Map();
+    /** profileDir -> timestamps (ms) of recent replacement attempts (duplicate-profile guard) */
+    this.replacements = new Map();
     this.server = null;
   }
 
@@ -319,6 +321,18 @@ class HostServer extends EventEmitter {
     const dir = m.profileDir;
     if (typeof dir !== 'string' || dir === '') {
       return this.reply(conn, m, { type: 'identified', profileDir: dir, error: 'missing profileDir' });
+    }
+    const existing = this.byProfile.get(dir);
+    if (existing && existing !== conn) {
+      // Two different connections keep claiming the same profile: refuse the 4th replacement attempt within 60 s.
+      const now = Date.now();
+      const ts = (this.replacements.get(dir) || []).filter((t) => now - t < 60000);
+      ts.push(now);
+      this.replacements.set(dir, ts);
+      if (ts.length >= 4) {
+        this.log(`refusing duplicate claim on '${dir}'`);
+        return this.reply(conn, m, { type: 'identified', profileDir: null, error: 'duplicate profile' });
+      }
     }
     if (conn.profileDir && conn.profileDir !== dir && this.byProfile.get(conn.profileDir) === conn) this.byProfile.delete(conn.profileDir);
     const older = this.byProfile.get(dir);

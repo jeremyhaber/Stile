@@ -6,6 +6,7 @@
   <title>Sidebar</title>
   <link rel="stylesheet" href="sidepanel.css">
   <link rel="stylesheet" href="boost.css">
+  <link rel="stylesheet" href="capture/capture-view.css">
   <script src="bridge-shim.js"></script>
   <script type="module" src="sidepanel.js"></script>
 </head>
@@ -23,6 +24,7 @@
             <span class="addr-ic" id="addr-ic"></span>
             <input id="addr" data-testid="address-field" type="text" placeholder="Search or enter address" aria-label="Search or enter address" spellcheck="false" autocomplete="off" autocapitalize="off">
           </form>
+          <span id="capture-slot" class="capture-slot"></span>
           <!-- BOOST HOOK 3 slot: the button from createBoostButton(ctx) is placed here -->
           <span id="boost-slot" class="boost-slot"></span>
         </div>
@@ -170,6 +172,7 @@
         </div>
         <!-- BOOST HOOK 3 slot: renderBoostSettings(containerEl, ctx) fills this -->
         <div class="field" id="boost-settings-slot"></div>
+        <div class="field" id="capture-settings-slot"></div>
         <div class="field" id="field-profile" hidden>
           <label for="set-profile-pick">This profile</label>
           <select id="set-profile-pick" data-testid="settings-profile-picker"></select>
@@ -193,6 +196,8 @@
           <label>App</label>
           <label class="check sub"><input type="checkbox" id="app-pinned" data-testid="app-pinned"><span>Pinned sidebar</span></label>
           <label class="check sub"><input type="checkbox" id="app-login" data-testid="app-launch-login"><span>Launch at login</span></label>
+          <label class="check sub"><input type="checkbox" id="app-lockstep" data-testid="app-lockstep"><span>Move Chrome and the sidebar together</span></label>
+          <p class="hint" id="app-lockstep-note">Sidebar.app moves Chrome's window itself while you drag it, so the two stay together. Turn off if window snapping or other window tools misbehave.</p>
           <div class="status-line">
             <span class="status-dot" id="app-ax-dot"></span>
             <span id="app-ax-status" data-testid="app-accessibility"></span>
@@ -220,6 +225,7 @@
 
     <!-- BOOST HOOK 3 slot: setView('boost') empties this element and calls renderBoostView(rootEl, ctx) on it -->
     <section id="view-boost" class="view" hidden></section>
+    <section id="view-captures" class="view" data-testid="captures-view" hidden></section>
 
     <footer id="footer" class="footer">
       <button type="button" id="archive-btn" class="foot-btn" aria-label="Archive" title="Archive" data-testid="archive-button"><span class="foot-ic" id="archive-ic"></span><span>Archive</span><span class="badge" id="archive-count" data-testid="archive-count" hidden></span></button>

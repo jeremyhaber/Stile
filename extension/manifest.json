@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Sidebar",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "An Arc-style side panel: favourites, pinned tabs, today's tabs, auto-archive and profile switching.",
   "minimum_chrome_version": "116",
   "incognito": "spanning",
@@ -35,6 +35,19 @@
         "mac": "Alt+S"
       },
       "description": "Open Sidebar"
+    },
+    "capture-visible": {
+      "description": "Screenshot: visible area"
+    },
+    "capture-full": {
+      "description": "Screenshot: full page"
+    },
+    "capture-region": {
+      "suggested_key": {
+        "default": "Alt+Shift+3",
+        "mac": "Alt+Shift+3"
+      },
+      "description": "Screenshot: select a region"
     }
   },
   "permissions": [
@@ -52,7 +65,9 @@
     "tabGroups",
     "scripting",
     "userScripts",
-    "contextMenus"
+    "contextMenus",
+    "downloads",
+    "clipboardWrite"
   ],
   "host_permissions": [
     "<all_urls>"

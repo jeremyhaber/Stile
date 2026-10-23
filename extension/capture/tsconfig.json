@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": [],
+    "baseUrl": ".",
+    "paths": { "react": ["../../tools/capture-build/node_modules/@types/react"], "react/*": ["../../tools/capture-build/node_modules/@types/react/*"], "react-dom/*": ["../../tools/capture-build/node_modules/@types/react-dom/*"], "lucide-react": ["../../tools/capture-build/node_modules/lucide-react"] }
+  },
+  "include": ["src/**/*", "*.d.ts"]
+}

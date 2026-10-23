@@ -119,8 +119,13 @@ final class OverlayController {
             guard let self = self else { return 0 }
             return AX.pid(self.window.element)
         }
+        sidebar.onPanelMouseDown = { [weak self] in self?.lastPanelClick = Date() }
         sidebar.onNonEditingClick = { [weak self] in
             guard let self = self else { return }
+            // Keep Chrome's window looking active after a click in the sidebar, but only if Chrome is the
+            // frontmost app and this window is already its focused window (never steal focus from another window).
+            let pid = AX.pid(self.window.element)
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid, self.isFocusedChromeWindow else { return }
             AX.setBool(self.window.element, AXName.main, true)
         }
         sidebar.onBridgeCall = { [weak self] call in self?.pageCalled(call) }
@@ -451,6 +456,7 @@ final class OverlayController {
             if abs(rel.minX - r.rel.minX) > 1.5 || abs(rel.minY - r.rel.minY) > 1.5
                 || abs(rel.width - r.rel.width) > 1.5 || abs(rel.height - r.rel.height) > 1.5 {
                 rail?.rel = rel
+                rail?.bottomInset = max(0, window.frame.maxY - f.maxY)
                 if railExpanded { floatPin = false; peeking = false }
                 layout()
                 pushHostState()
@@ -519,7 +525,9 @@ final class OverlayController {
     private func railAXRect() -> CGRect? {
         guard let r = rail else { return nil }
         let w = windowAX
-        var rect = CGRect(x: w.minX + r.rel.minX, y: w.minY + r.rel.minY, width: r.rel.width, height: r.rel.height)
+        // Height follows the live window height (see RailInfo.bottomInset) so resizing never waits for a rescan.
+        let liveHeight = max(0, w.height - r.rel.minY - r.bottomInset)
+        var rect = CGRect(x: w.minX + r.rel.minX, y: w.minY + r.rel.minY, width: r.rel.width, height: liveHeight)
         // Never cover Chrome's window buttons, whatever the rail's reported frame says.
         let minTop = w.minY + trafficLightsBottom()
         if rect.minY < minTop {
@@ -664,6 +672,39 @@ final class OverlayController {
         animating = false
         peeking = false
         sidebar.orderOut(nil)
+    }
+
+    // MARK: Lockstep (DragController)
+
+    /// Bottom of Chrome's toolbar relative to the window top (the draggable band is window top ... this).
+    var toolbarBottomRel: CGFloat {
+        max(contentTopRel ?? Self.fallbackContentTop, trafficLightsBottom())
+    }
+
+    /// True when a click at this AX point belongs to our own panel (sidebar body or its splitter).
+    func blocksLockstep(at ax: CGPoint) -> Bool {
+        if sidebar.isVisible, sidebar.frame.contains(NSPoint(x: ax.x, y: Geometry.primaryHeight - ax.y)) { return true }
+        if let sp = rail?.splitter, let f = AX.frame(sp), f.insetBy(dx: -4, dy: -4).contains(ax) { return true }
+        return false
+    }
+
+    /// Chrome's window was just set to `f` by the lockstep drag: move/resize our panel right away.
+    func lockstepFrame(_ f: CGRect) {
+        window.frame = f
+        guard visible else { return }
+        following = true
+        movedWhileFollowing = true
+        layout(following: true)
+    }
+
+    func lockstepFinished(resized: Bool) {
+        following = false
+        movedWhileFollowing = false
+        guard visible else { return }
+        if resized {
+            rescanTimer.cancel()
+            rescan(reason: "after lockstep resize")
+        }
     }
 
     /// Update from the window server's live bounds (called once per display frame while Chrome moves or
@@ -1100,6 +1141,8 @@ final class OverlayController {
             pushHostState(force: true)
         case "setPinned":
             setPinned(boolValue(value))
+        case "setLockstep":
+            Settings.lockstepDrag = boolValue(value)   // posts; the manager calls settingsChanged
         case "setPeekWidth":
             if let d = JSONUtil.double(value) { Settings.peekWidth = CGFloat(d) }   // posts; the manager calls settingsChanged
         case "quitApp":
@@ -1205,6 +1248,7 @@ final class OverlayController {
             "compact": s == .collapsed || s == .hidden,
             "railWidth": Int(lastCollapsedRailWidth.rounded()),
             "overlayEnabled": overlayEnabled,
+            "lockstep": Settings.lockstepDrag,
         ]
         if let c = chromeColor { obj["chromeColor"] = c } else { obj["chromeColor"] = NSNull() }
         sidebar.sendHostState(obj, force: force)
@@ -1212,8 +1256,15 @@ final class OverlayController {
 
     // MARK: Page calls
 
+    /// Time of the last mouse-down inside this window's sidebar panel.
+    private var lastPanelClick: Date = .distantPast
+
     private func pageCalled(_ call: String) {
-        if call == "sidebar.cmd" || call.hasPrefix("tabs.") || call.hasPrefix("windows.") {
+        // Only right after the user clicked in THIS sidebar: the page re-renders (and queries tabs/windows)
+        // constantly in the background, and raising Chrome's window on those made windows of different
+        // profiles fight over focus.
+        guard Date().timeIntervalSince(lastPanelClick) < 0.8 else { return }
+        if call == "sidebar.cmd" || call == "tabs.update" || call == "windows.update" || call == "tabs.create" {
             reassertChrome()
         }
     }
@@ -1222,6 +1273,7 @@ final class OverlayController {
     private func reassertChrome() {
         let pid = AX.pid(window.element)
         if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
+            Log.write("focus: raising Chrome window after a sidebar click")
             AX.perform(window.element, AXName.actionRaise)
         }
     }

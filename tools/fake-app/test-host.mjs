@@ -473,6 +473,24 @@ check('SIGTERM: connection removed from host', await wait(() => !host.isConnecte
   H.closeStdin(); H2.closeStdin();
 }
 
+// ------------------------------------------------------------ 11b. duplicate profile guard
+{
+  const dupHost = new HostServer({ appDir: path.join(tmp, 'app-dup'), localState, chromeBin: fakeChrome, overlay: false });
+  await dupHost.listen();
+  const cs = [];
+  const res = [];
+  for (let i = 0; i < 6; i++) {
+    const c = spawnClient({ SIDEBAR_APP_DIR: dupHost.appDir });
+    cs.push(c);
+    res.push(await c.request({ type: 'identify', profileDir: 'Default' }));
+  }
+  check('duplicate: first claim and 3 replacements accepted', res.slice(0, 4).every((x) => x?.profileDir === 'Default' && !x.error), j(res.slice(0, 4)));
+  check('duplicate: 4th replacement attempt within 60 s refused', res[4]?.error === 'duplicate profile' && res[4].profileDir === null, j(res[4]));
+  check('duplicate: later attempts still refused, third connection keeps the profile', res[5]?.error === 'duplicate profile' && dupHost.isConnected('Default'));
+  for (const c of cs) c.closeStdin();
+  await dupHost.close();
+}
+
 // ------------------------------------------------------------ 12. connector behaviour
 {
   // starts before the host exists: waits, then connects

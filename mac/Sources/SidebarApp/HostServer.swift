@@ -217,6 +217,8 @@ final class HostServer {
     private(set) var socketPath: String = ""
     private(set) var listening = false
     private(set) var overlayRunning = false
+    /// Times an identify replaced another live connection, per profile dir (duplicate-identity guard).
+    private var replaceLog: [String: [Date]] = [:]
     private var handoffs: [String: (bounds: [String: Any]?, at: Date)] = [:]
     private var missingCache: (list: [(dir: String, name: String)], at: Date)?
     /// Global overlay on/off (state.json `overlayEnabled`, default true); the app is the source of truth.
@@ -392,10 +394,23 @@ final class HostServer {
             c.reply(m, ["type": "identified", "profileDir": m["profileDir"] ?? NSNull(), "error": "missing profileDir"])
             return
         }
-        // A newer connection for the same profile replaces the older one.
-        for old in bridges where old !== c && !old.closed && old.profileDir == dir {
-            Log.write("host: replacing older connection for '\(dir)'")
-            old.shutdown()
+        // A newer connection for the same profile replaces the older one (normally the extension's service worker
+        // restarted). If that keeps happening, two different Chrome profiles are claiming the same profile and
+        // would knock each other off forever: stop replacing and tell the newcomer to pick its profile.
+        let now = Date()
+        replaceLog[dir] = (replaceLog[dir] ?? []).filter { now.timeIntervalSince($0) < 60 }
+        let others = bridges.filter { $0 !== c && !$0.closed && $0.profileDir == dir }
+        if !others.isEmpty {
+            if (replaceLog[dir]?.count ?? 0) >= 3 {
+                Log.write("host: '\(dir)' claimed by two connections repeatedly; refusing the newer one")
+                c.reply(m, ["type": "identified", "profileDir": NSNull(), "error": "duplicate profile"])
+                return
+            }
+            replaceLog[dir, default: []].append(now)
+            for old in others {
+                Log.write("host: replacing older connection for '\(dir)'")
+                old.shutdown()
+            }
         }
         c.profileDir = dir
         Log.write("host: identified '\(dir)'")

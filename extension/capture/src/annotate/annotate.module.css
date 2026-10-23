@@ -1,0 +1,443 @@
+/*
+ * Image annotation editor. The card, overlay, header and phone sheet come from features/preview (preview.module.css),
+ * like the image viewer. Everything here is token colors (light + dark); text is never opacity-dimmed.
+ */
+.dialog {
+  /* the toolbar and hint stack on top of the stage: below 520px the whole sheet scrolls instead of squeezing the stage */
+  overflow: hidden;
+}
+@media (max-width: 520px) {
+  .dialog {
+    overflow-y: auto;
+  }
+}
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-6) 0;
+  background: var(--surface);
+}
+.tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.tool {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: var(--r-control);
+  border: 1px solid var(--border-control);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+@media (pointer: coarse) {
+  .tool {
+    width: 40px;
+    height: 40px;
+  }
+}
+@media (hover: hover) {
+  .tool:hover:not([aria-disabled='true']) {
+    background: var(--surface-3);
+  }
+}
+.tool[aria-pressed='true'] {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border-color: var(--accent-text);
+  box-shadow: inset 0 0 0 1px var(--accent-text);
+}
+.tool[aria-disabled='true'] {
+  color: var(--text-3);
+  background: var(--surface-2);
+  border-color: var(--border);
+  cursor: not-allowed;
+}
+.tool:focus-visible,
+.size:focus-visible,
+.action:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px var(--sp-3);
+  background: var(--border-strong);
+}
+
+.props {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-4) var(--sp-6);
+  /* the row keeps its height when controls come and go (no jump under the pointer) */
+  min-height: 36px;
+}
+.swatches,
+.sizes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.swatch {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.dot {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  /* a control boundary (3:1) even for the white swatch */
+  border: 2px solid var(--border-control);
+  box-sizing: border-box;
+}
+.swatch[aria-checked='true'] .dot {
+  border-color: var(--text);
+  box-shadow:
+    0 0 0 2px var(--surface),
+    0 0 0 4px var(--text);
+}
+.swatch:focus-visible {
+  outline: none;
+}
+.swatch:focus-visible .dot {
+  box-shadow:
+    0 0 0 2px var(--surface),
+    0 0 0 4px var(--accent-text);
+}
+.swatch[aria-checked='true']:focus-visible .dot {
+  box-shadow:
+    0 0 0 2px var(--surface),
+    0 0 0 4px var(--text),
+    0 0 0 6px var(--accent-text);
+}
+.size {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 28px;
+  padding: 0;
+  border-radius: var(--r-control);
+  border: 1px solid var(--border-control);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.size[aria-checked='true'] {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border-color: var(--accent-text);
+  box-shadow: inset 0 0 0 1px var(--accent-text);
+}
+.fontField {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-4);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-left: auto;
+}
+.action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 28px;
+  padding: 0 var(--sp-5);
+  border-radius: var(--r-control);
+  border: 1px solid var(--border-control);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  cursor: pointer;
+  white-space: nowrap;
+}
+@media (hover: hover) {
+  .action:hover {
+    background: var(--surface-3);
+  }
+}
+
+.hint {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-6) var(--sp-4);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-tight);
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 240px;
+  display: flex;
+  background: var(--surface-2);
+}
+.message {
+  margin: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-7);
+  color: var(--text);
+}
+.stageBox {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--sp-6);
+  overflow: hidden;
+}
+.stage {
+  position: relative;
+  /* pointer events (mouse, touch, pen) draw: nothing scrolls or zooms under the finger */
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  background: #ffffff;
+  box-shadow: var(--shadow-1);
+  outline: none;
+  cursor: crosshair;
+  flex: none;
+}
+.stage[data-tool='select'] {
+  cursor: default;
+}
+.stage[data-tool='text'] {
+  cursor: text;
+}
+.stage:focus-visible {
+  outline: 3px solid var(--accent-text);
+  outline-offset: 3px;
+}
+.svg {
+  display: block;
+  overflow: hidden;
+}
+.textEdit {
+  position: absolute;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0 2px;
+  border: 0;
+  border-radius: 2px;
+  outline: 2px dashed var(--accent-text);
+  outline-offset: 2px;
+  background: transparent;
+  font-weight: 600;
+  resize: none;
+  overflow: hidden;
+  white-space: pre;
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-6);
+  padding-bottom: max(var(--sp-4), var(--safe-bottom));
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+.footer [aria-disabled='true'] {
+  cursor: not-allowed;
+}
+.footer button[aria-disabled='true'] {
+  background: var(--surface-3);
+  color: var(--text-3);
+  border-color: var(--border);
+}
+
+.actionPrimary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+.stageBox {
+  position: relative;
+}
+
+/* ------------------------------------------------------------------------------------------------ phone */
+/*
+ * Phone composer (the `phone` flag): a full-screen sheet placed from the visual viewport (--vv-top / --vv-height, written
+ * by lib/useVisualViewport while the composer is open), so the keyboard of the text box shrinks the stage and never covers
+ * it. Cancel | title | Replace image on top (under the status bar / Dynamic Island), the stage in the middle, then one row
+ * of options and the tools as a bottom bar of 44px buttons that scrolls sideways, clear of the home indicator.
+ */
+.dialog[data-phone] {
+  position: fixed;
+  inset: auto;
+  top: var(--vv-top, 0px);
+  left: var(--safe-left);
+  right: var(--safe-right);
+  translate: none;
+  width: auto;
+  height: var(--vv-height, 100dvh);
+  border: 0;
+  border-radius: 0;
+  box-shadow: 0 100lvh 0 0 var(--surface);
+  padding-inline: 0;
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+.phoneHeader {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: calc(var(--sp-4) + var(--safe-top)) var(--sp-5) var(--sp-4);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.phoneHeader :global(button) {
+  min-height: 44px;
+  min-width: 44px;
+}
+.history {
+  display: flex;
+  justify-content: center;
+  gap: var(--sp-3);
+}
+.headTool {
+  width: 44px;
+  height: 44px;
+}
+.toolsWrap {
+  min-width: 0;
+}
+/* a sideways-scrolling row fades at an edge that has more to scroll to (useScrollEdges sets the attributes) */
+.dialog[data-phone] .props,
+.phoneTools {
+  --fade-l: 0px;
+  --fade-r: 0px;
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--fade-l),
+    #000 calc(100% - var(--fade-r)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--fade-l),
+    #000 calc(100% - var(--fade-r)),
+    transparent 100%
+  );
+}
+.dialog[data-phone] .props[data-more-start],
+.phoneTools[data-more-start] {
+  --fade-l: 28px;
+}
+.dialog[data-phone] .props[data-more-end],
+.phoneTools[data-more-end] {
+  --fade-r: 28px;
+}
+.dialog[data-phone] .body {
+  min-height: 0;
+  touch-action: none;
+}
+.dialog[data-phone] .stageBox {
+  padding: var(--sp-4);
+}
+.phoneControls {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  /* nothing under the home indicator */
+  padding-bottom: max(var(--sp-3), var(--safe-bottom));
+}
+.dialog[data-phone] .props {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-5);
+  min-height: 52px;
+  scrollbar-width: none;
+}
+.dialog[data-phone] .props > * {
+  flex: none;
+}
+.dialog[data-phone] .swatches,
+.dialog[data-phone] .sizes,
+.dialog[data-phone] .actions {
+  flex-wrap: nowrap;
+  gap: 0;
+}
+.dialog[data-phone] .actions {
+  margin-left: 0;
+  gap: var(--sp-3);
+}
+.dialog[data-phone] .swatch {
+  width: 44px;
+  height: 44px;
+}
+.dialog[data-phone] .dot {
+  width: 30px;
+  height: 30px;
+}
+.dialog[data-phone] .size {
+  width: 44px;
+  height: 44px;
+}
+.dialog[data-phone] .action {
+  min-height: 44px;
+  min-width: 44px;
+  justify-content: center;
+}
+.dialog[data-phone] .fontField select {
+  min-height: 44px;
+  /* 16px: a smaller font makes iOS zoom the page when a field takes focus */
+  font-size: 16px;
+}
+.phoneTools {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--sp-2);
+  overflow-x: auto;
+  padding: var(--sp-2) var(--sp-5);
+  border-top: 1px solid var(--border);
+  scrollbar-width: none;
+}
+.phoneTools > * {
+  flex: none;
+}
+.dialog[data-phone] .tool {
+  width: 44px;
+  height: 44px;
+}
+.dialog[data-phone] .textEdit {
+  font-size: 16px;
+}

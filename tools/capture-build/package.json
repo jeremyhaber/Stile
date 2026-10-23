@@ -1,0 +1,28 @@
+{
+  "name": "sidebar-capture-build",
+  "private": true,
+  "type": "module",
+  "description": "Build tooling for the Sidebar screenshot editor (extension/capture/dist). Run: npm install && npm run build",
+  "scripts": {
+    "build": "node ../build-capture.mjs",
+    "typecheck": "tsc -p ../../extension/capture/tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "lucide-react": "0.468.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/react": "^16.1.0",
+    "@types/chrome": "^0.0.280",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "aws4": "1.13.2",
+    "esbuild": "0.24.0",
+    "jsdom": "25.0.1",
+    "typescript": "5.6.3",
+    "vitest": "2.1.8"
+  }
+}

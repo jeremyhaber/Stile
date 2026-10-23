@@ -18,6 +18,8 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     var chromePid: (() -> pid_t)?
     /// A click inside the panel that did not land on an editable element (Chrome's window should become main again).
     var onNonEditingClick: (() -> Void)?
+    /// Called on every left mouse-down inside the panel (before the page sees it).
+    var onPanelMouseDown: (() -> Void)?
 
     /// True while an editable element inside the page has focus (host message `editing`).
     var isEditing = false
@@ -142,6 +144,7 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         switch event.type {
         case .leftMouseDown:
             pressedHere = true
+            onPanelMouseDown?()
             super.sendEvent(event)
             // The page reports `editing` asynchronously after focus moves; check once it settled.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in

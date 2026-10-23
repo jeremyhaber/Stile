@@ -1,0 +1,446 @@
+.app {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  background: var(--bg);
+  container-type: inline-size;
+}
+
+/* ---- top bar: exports | tools | zoom */
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 46px;
+  flex: none;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.exports,
+.zoom {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.centre {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+}
+.vsep {
+  width: 1px;
+  height: 18px;
+  margin: 0 6px;
+  background: var(--border-strong);
+  flex: none;
+}
+.ebtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ebtn svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: none;
+}
+.ebtn:hover:not([aria-disabled='true']) {
+  background: var(--surface-3);
+}
+.ebtn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.ebtn[aria-disabled='true'] {
+  color: var(--text-3);
+  cursor: default;
+}
+.ebtn kbd {
+  font: inherit;
+  font-weight: 500;
+  color: var(--text-2);
+  font-size: 11px;
+}
+.primaryBtn {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+.primaryBtn:hover:not([aria-disabled='true']) {
+  background: var(--accent);
+  filter: brightness(1.08);
+}
+.grip {
+  cursor: grab;
+}
+.zbtn {
+  min-width: 28px;
+  justify-content: center;
+  padding: 0 6px;
+}
+.pct {
+  min-width: 46px;
+  justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+@container (max-width: 1040px) {
+  .lbl,
+  .ebtn kbd {
+    display: none;
+  }
+  .ebtn {
+    padding: 0 7px;
+  }
+}
+
+/* the annotation tool buttons and swatches come from annotate.module.css; here they get the editor's lighter look */
+.bar :global([role='toolbar']) {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 1px;
+  align-items: center;
+}
+.bar :global([data-roving]),
+.floating :global([data-roving].tool) {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+}
+.bar :global([data-roving]):hover:not([aria-disabled='true']) {
+  background: var(--surface-3);
+}
+.bar :global([data-roving][aria-pressed='true']) {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border: 0;
+  box-shadow: none;
+}
+.bar :global([data-roving][aria-disabled='true']) {
+  background: transparent;
+  border: 0;
+  color: var(--text-3);
+  opacity: 0.55;
+}
+.bar :global([data-roving]:focus-visible) {
+  box-shadow: var(--focus-ring);
+}
+.bar :global([role='separator']) {
+  margin: 0 6px;
+  align-self: center;
+  height: 18px;
+  background: var(--border-strong);
+}
+
+/* ---- canvas */
+.canvas {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  background: var(--canvas);
+}
+.canvas :global([data-testid='annotate-stagebox']) {
+  padding: 24px;
+}
+.canvas :global([data-testid='annotate-stage']) {
+  background: repeating-conic-gradient(var(--check-a) 0 25%, var(--check-b) 0 50%) 0 0 / 14px 14px;
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.18),
+    0 6px 24px rgba(0, 0, 0, 0.22);
+}
+.canvas :global([data-testid='annotate-stage'][data-zoom]) {
+  /* a zoomed stage would scale its frame and shadow with it */
+  box-shadow: none;
+}
+.plain {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+.plain img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.18),
+    0 6px 24px rgba(0, 0, 0, 0.22);
+  background: repeating-conic-gradient(var(--check-a) 0 25%, var(--check-b) 0 50%) 0 0 / 14px 14px;
+}
+.message {
+  margin: auto;
+  color: var(--text-2);
+}
+
+/* floating properties bar: only while a tool or a shape is selected */
+.floating {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+  z-index: 5;
+  max-width: calc(100% - 28px);
+  padding: 6px 8px;
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow:
+    var(--shadow-1),
+    0 0 0 1px var(--border);
+  animation: pop 0.14s ease-out;
+}
+@keyframes pop {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+.floating :global([role='group'][aria-label='Properties']) {
+  min-height: 28px;
+  gap: 4px 12px;
+  flex-wrap: nowrap;
+}
+.floating :global([role='radiogroup']) {
+  gap: 2px;
+  flex-wrap: nowrap;
+}
+.floating :global([role='radio']) {
+  width: 24px;
+  height: 24px;
+}
+.floating :global([role='radio'][aria-checked]) :global(span) {
+  border-width: 1.5px;
+}
+.floating :global([data-testid^='annotate-size-']) {
+  width: 28px;
+  height: 24px;
+  border: 0;
+  background: transparent;
+  border-radius: 6px;
+}
+.floating :global([data-testid^='annotate-size-'][aria-checked='true']) {
+  background: var(--accent-soft);
+  box-shadow: none;
+}
+.floating :global([data-testid='annotate-add']),
+.floating :global([data-testid='annotate-delete']),
+.floating :global([data-testid='annotate-done']) {
+  min-height: 24px;
+  border-radius: 6px;
+}
+
+/* ---- status line */
+.status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 28px;
+  flex: none;
+  padding: 0 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.status .t {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status a {
+  color: var(--accent-text);
+  text-decoration: none;
+}
+.status a:hover {
+  text-decoration: underline;
+}
+.status .spacer {
+  flex: 1;
+}
+.dot {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 55%;
+}
+.link code {
+  font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mini {
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 6px;
+  border: 0;
+  background: var(--surface-3);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.mini:hover {
+  background: var(--border-strong);
+}
+
+/* ---- primitives (ui.tsx) */
+.select {
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid var(--border-control);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 0 4px;
+}
+.btn {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 7px;
+  border: 1px solid var(--border-control);
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn:hover {
+  background: var(--surface-3);
+}
+.btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+.primary:hover {
+  background: var(--accent);
+  filter: brightness(1.08);
+}
+.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+.danger:hover {
+  background: var(--danger);
+  filter: brightness(1.08);
+}
+.spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.35);
+}
+.dialog {
+  width: min(360px, calc(100% - 32px));
+  padding: 16px;
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
+}
+.dialog h2 {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+.dialog p {
+  margin: 0 0 14px;
+  color: var(--text-2);
+}
+.dialogFoot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.toasts {
+  position: absolute;
+  left: 50%;
+  bottom: 44px;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  background: var(--menu-bg);
+  color: var(--text);
+  box-shadow:
+    var(--shadow-1),
+    0 0 0 1px var(--border);
+  animation: pop 0.14s ease-out;
+}
+.toastBtn {
+  border: 0;
+  background: none;
+  color: var(--accent-text);
+  font-weight: 600;
+  cursor: pointer;
+}
+@media (prefers-reduced-motion: reduce) {
+  .floating,
+  .toast {
+    animation: none;
+  }
+}

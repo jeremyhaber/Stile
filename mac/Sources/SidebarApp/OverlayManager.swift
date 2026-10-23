@@ -7,6 +7,7 @@ final class OverlayManager {
     let tracker = ChromeTracker()
     let mapper = WindowMapper()
     let closer = CloseInterceptor()
+    let dragger = DragController()
     private(set) var controllers: [Int: OverlayController] = [:]
 
     private var followTimer: Timer?
@@ -44,6 +45,8 @@ final class OverlayManager {
         closer.chromePid = { [weak self] in self?.tracker.pid ?? 0 }
         closer.focusedWindowKey = { [weak self] in self?.tracker.focusedWindowKey() }
         closer.onRolesChanged = { [weak self] in self?.applyMapping() }
+        dragger.manager = self
+        closer.dragHandler = { [weak self] type, event in self?.dragger.handle(type, event) ?? false }
         closer.ensureTap()
 
         tracker.onUpdate = { [weak self] in self?.trackerUpdated() }

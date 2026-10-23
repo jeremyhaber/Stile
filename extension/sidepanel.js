@@ -4,6 +4,7 @@ import {
 } from './shared.js';
 import { icon } from './icons.js';
 import { renderBoostView, createBoostButton, renderBoostSettings } from './boost-view.js';
+import { createCaptureButton, renderCaptureRecent, renderCaptureSettings } from './capture/capture-view.js';
 
 // Overlay mode (Sidebar.app): chrome.* is provided by bridge-shim.js and must be ready before anything touches it.
 if (window.__sidebarReady) {
@@ -1351,7 +1352,12 @@ let boostCleanup = null;
 function leaveBoost() {
   if (boostCleanup) { try { boostCleanup(); } catch (e) { console.warn('[sidebar] boost cleanup', e); } boostCleanup = null; }
   $('view-boost').replaceChildren();
+  if (captureCleanup) { try { captureCleanup(); } catch (e) { console.warn('[sidebar] capture cleanup', e); } captureCleanup = null; }
+  $('view-captures').replaceChildren();
+  if (captureSettingsCleanup) { try { captureSettingsCleanup(); } catch { /* ignore */ } captureSettingsCleanup = null; }
 }
+let captureCleanup = null;
+let captureSettingsCleanup = null;
 
 function setView(v) {
   leaveBoost();
@@ -1360,14 +1366,21 @@ function setView(v) {
   $('view-archive').hidden = v !== 'archive';
   $('view-settings').hidden = v !== 'settings';
   $('view-boost').hidden = v !== 'boost';
+  $('view-captures').hidden = v !== 'captures';
+  if (v === 'captures') {
+    try {
+      const c = renderCaptureRecent($('view-captures'), makeCaptureCtx());
+      captureCleanup = typeof c === 'function' ? c : null;
+    } catch (e) { console.warn('[sidebar] captures view', e); }
+  }
   if (v === 'boost') {
     try {
       const c = renderBoostView($('view-boost'), makeBoostCtx());
       boostCleanup = typeof c === 'function' ? c : null;
     } catch (e) { console.warn('[sidebar] boost view', e); }
   }
-  if (v === 'settings') mountBoostSettings();
-  try { if (v !== 'boost') sessionStorage.setItem('view', v); } catch { /* ignore */ }
+  if (v === 'settings') { mountBoostSettings(); mountCaptureSettings(); }
+  try { if (v !== 'boost' && v !== 'captures') sessionStorage.setItem('view', v); } catch { /* ignore */ }
   if (loaded) draw();
 }
 
@@ -1386,6 +1399,32 @@ function mountBoostSettings() {
   const box = $('boost-settings-slot');
   box.replaceChildren();
   try { renderBoostSettings(box, makeBoostCtx()); } catch (e) { console.warn('[sidebar] boost settings', e); }
+}
+
+// ---- screenshots (v2.9): camera button, Recent captures view, Settings section
+function makeCaptureCtx() {
+  return {
+    get windowId() { return S.windowId; },
+    cmd,
+    toast,
+    showMenu,
+    goBack: () => setView('main'),
+    openRecent: () => setView('captures')
+  };
+}
+function mountCaptureSettings() {
+  const box = $('capture-settings-slot');
+  box.replaceChildren();
+  try { const c = renderCaptureSettings(box, makeCaptureCtx()); captureSettingsCleanup = typeof c === 'function' ? c : null; } catch (e) { console.warn('[sidebar] capture settings', e); }
+}
+function mountCaptureButton() {
+  try { $('capture-slot').replaceChildren(createCaptureButton(makeCaptureCtx())); } catch (e) { console.warn('[sidebar] capture button', e); }
+  // the service worker reports problems ("Screenshots aren't available on this page") through session storage
+  let lastToast = 0;
+  chrome.storage.onChanged.addListener((ch, area) => {
+    const t = ch.capToast && ch.capToast.newValue;
+    if (area === 'session' && t && t.n !== lastToast && (t.windowId == null || t.windowId === S.windowId)) { lastToast = t.n; toast(t.text); }
+  });
 }
 
 function mountBoostButton() {
@@ -2226,7 +2265,7 @@ function setupListeners() {
 
 // ------------------------------------------------------------------ overlay mode (host protocol)
 // Host state pushed by the app (`__sidebarHostState`): state is "collapsed" | "peek" | "pinned".
-const HOSTS = { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: null, railFound: null, railControllable: true, launchAtLogin: false, accessibility: null, appVersion: '', pinMode: 'push' };
+const HOSTS = { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: null, railFound: null, railControllable: true, launchAtLogin: false, lockstep: true, accessibility: null, appVersion: '', pinMode: 'push' };
 let vtHintDismissed = false;
 try { vtHintDismissed = localStorage.getItem('vtHintDismissed') === '1'; } catch { /* storage unavailable */ }
 const hostPost = (action, value) => { try { if (window.__sidebarHost) window.__sidebarHost.post(action, value); } catch { /* ignore */ } };
@@ -2271,6 +2310,7 @@ function applyHostState(st) {
   if ('railFound' in st) HOSTS.railFound = typeof st.railFound === 'boolean' ? st.railFound : null;
   if ('railControllable' in st) HOSTS.railControllable = st.railControllable !== false;
   if ('launchAtLogin' in st) HOSTS.launchAtLogin = !!st.launchAtLogin;
+  if ('lockstep' in st) HOSTS.lockstep = st.lockstep !== false;
   if ('accessibility' in st) HOSTS.accessibility = typeof st.accessibility === 'boolean' ? st.accessibility : null;
   if (typeof st.appVersion === 'string') HOSTS.appVersion = st.appVersion;
   const root = document.documentElement;
@@ -2326,6 +2366,7 @@ function drawAppSettings() {
   $('field-app').hidden = false;
   $('app-pinned').checked = isPinned();
   $('app-login').checked = HOSTS.launchAtLogin;
+  $('app-lockstep').checked = HOSTS.lockstep;
   const ax = HOSTS.accessibility;
   $('app-ax-status').textContent = ax === true ? 'Accessibility access granted' : ax === false ? 'Accessibility access needed' : 'Accessibility access unknown';
   $('app-ax-dot').className = 'status-dot' + (ax === true ? ' ok' : ax === false ? ' bad' : '');
@@ -2369,6 +2410,7 @@ function setupOverlay() {
   $('set-pin-mode').addEventListener('change', (e) => hostPost('setPinMode', e.target.value));
   $('app-pinned').addEventListener('change', (e) => hostPost('setPinned', e.target.checked));
   $('app-login').addEventListener('change', (e) => hostPost('setLaunchAtLogin', e.target.checked));
+  $('app-lockstep').addEventListener('change', (e) => hostPost('setLockstep', e.target.checked));
   $('app-ax-open').addEventListener('click', () => hostPost('openAccessibilitySettings', true));
   $('app-sc-on').addEventListener('click', () => hostPost('requestScreenCapture', true));
   $('app-rescan').addEventListener('click', () => hostPost('rescanRail', true));
@@ -2410,6 +2452,7 @@ function setupOverlay() {
   }
   setupListeners();
   mountBoostButton();
+  mountCaptureButton();
   try { const v = sessionStorage.getItem('view'); if (v === 'archive' || v === 'settings') S.view = v; } catch { /* ignore */ }
   await run();
   setView(S.view);

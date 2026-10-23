@@ -37,6 +37,8 @@ final class CloseInterceptor {
     var focusedWindowKey: (() -> Int?)?
     /// Called after a bridge's cached roles changed (the manager re-evaluates which windows are little).
     var onRolesChanged: (() -> Void)?
+    /// v2.9: lockstep window moves / resizes share this tap (see DragController).
+    var dragHandler: ((CGEventType, CGEvent) -> Bool)?
 
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -56,7 +58,7 @@ final class CloseInterceptor {
         if tap != nil { return }
         guard Permissions.isTrusted, Date().timeIntervalSince(lastTapAttempt) > 5 else { return }
         lastTapAttempt = Date()
-        let types: [CGEventType] = [.leftMouseDown, .leftMouseUp, .keyDown]
+        let types: [CGEventType] = [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .keyDown]
         var mask: CGEventMask = 0
         for t in types { mask |= (CGEventMask(1) << CGEventMask(t.rawValue)) }
         let refcon = Unmanaged.passUnretained(self).toOpaque()
@@ -170,34 +172,46 @@ final class CloseInterceptor {
         return NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
     }
 
+    /// The pop-out to merge when this mouse-down hits the close button of an interceptable window.
+    private func closeHit(_ event: CGEvent) -> (bridge: ProfileBridge, windowId: Int, target: Target)? {
+        if targets.isEmpty || !chromeIsFrontmost() { return nil }
+        let p = event.location
+        for t in targets.values where t.frame.insetBy(dx: -1, dy: -1).contains(p) {
+            // The cache may be stale (window moved without a refresh yet): confirm against the live frame.
+            guard let live = AX.frame(t.button), live.insetBy(dx: -1, dy: -1).contains(p) else { return nil }
+            guard let q = qualifying(t.key) else { return nil }
+            return (q.bridge, q.windowId, t)
+        }
+        return nil
+    }
+
     /// Returns true to swallow the event.
     func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
         switch type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
             Log.write("close-interceptor: tap was disabled, re-enabled")
+            _ = dragHandler?(type, event)
             return false
 
         case .leftMouseDown:
             swallowNextMouseUp = false
-            if targets.isEmpty || !chromeIsFrontmost() { return false }
-            let p = event.location
-            for t in targets.values where t.frame.insetBy(dx: -1, dy: -1).contains(p) {
-                // The cache may be stale (window moved without a refresh yet): confirm against the live frame.
-                guard let live = AX.frame(t.button), live.insetBy(dx: -1, dy: -1).contains(p) else { return false }
-                guard let q = qualifying(t.key) else { return false }
+            if let q = closeHit(event) {
                 swallowNextMouseUp = true
-                merge(bridge: q.bridge, windowId: q.windowId, target: t)
+                merge(bridge: q.bridge, windowId: q.windowId, target: q.target)
                 return true
             }
-            return false
+            return dragHandler?(type, event) ?? false
 
         case .leftMouseUp:
             if swallowNextMouseUp {
                 swallowNextMouseUp = false
                 return true
             }
-            return false
+            return dragHandler?(type, event) ?? false
+
+        case .leftMouseDragged:
+            return dragHandler?(type, event) ?? false
 
         case .keyDown:
             let code = event.getIntegerValueField(.keyboardEventKeycode)

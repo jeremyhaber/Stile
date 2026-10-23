@@ -2,6 +2,7 @@
 // Nothing here relies on in-memory state surviving a restart (the only module-level
 // state is the live native port and its pending-request table, which die with the worker).
 import { registerBoostListeners, handleBoostCommand } from './boosts-sw.js';
+import { registerCaptureListeners, handleCaptureCommand, createCaptureMenus, captureMenuIds } from './capture/capture-sw.js';
 import { registerBridgeListeners, handleBridgeMessage, emitBridgeEvent } from './bridge-sw.js';
 import { getRoots, isBlankUrl, DEFAULT_ARCHIVE_MINUTES, GROUP_COLORS, hashStr } from './shared.js';
 
@@ -169,6 +170,7 @@ async function syncMenu(connected) {
     if (!connected) {
       for (const k of Object.keys(menuItems)) delete menuItems[k];
       await chrome.contextMenus.removeAll();
+      createCaptureMenus();
       return;
     }
     if (menuItems[MENU_ID]) {
@@ -180,6 +182,7 @@ async function syncMenu(connected) {
     await chrome.contextMenus.removeAll();
     await new Promise((res) => chrome.contextMenus.create(item, () => { void chrome.runtime.lastError; res(); }));
     menuItems[MENU_ID] = item;
+    createCaptureMenus();
   } catch (e) { console.warn('[sidebar] context menu', e); }
 }
 
@@ -367,6 +370,14 @@ async function resolveProfileDir(profiles) {
   return null;
 }
 
+// The app refused our identify because other connections keep claiming the same profile dir: forget it and let the
+// user pick ("Which profile is this?"). No automatic retry.
+async function onDuplicateProfile(p, dir) {
+  console.warn(`profile '${dir}' is claimed by another connection (duplicate profile); asking which profile this is`);
+  try { await chrome.storage.local.remove('profileDir'); } catch { /* ignore */ }
+  if (port === p) await enqueue(() => setHelper({ currentProfileDir: null }));
+}
+
 async function handshake(p) {
   try {
     const r = await nreq({ type: 'hello', extVersion: chrome.runtime.getManifest().version });
@@ -379,7 +390,12 @@ async function handshake(p) {
     if (r.settings && typeof r.settings.defaultBrowser === 'boolean') await chrome.storage.local.set({ defaultBrowser: r.settings.defaultBrowser });
     const dir = await resolveProfileDir(profiles);
     await enqueue(() => setHelper({ status: 'connected', error: undefined, profiles, currentProfileDir: dir }));
-    if (dir) { try { await nreq({ type: 'identify', profileDir: dir }); } catch (e) { console.warn('identify failed', e); } }
+    if (dir) {
+      try {
+        const ir = await nreq({ type: 'identify', profileDir: dir });
+        if (ir && ir.error === 'duplicate profile') await onDuplicateProfile(p, dir);
+      } catch (e) { console.warn('identify failed', e); }
+    }
   } catch (e) {
     if (port === p) await enqueue(() => setHelper({ status: 'error', error: String(e && e.message || e) }));
   }
@@ -447,7 +463,8 @@ async function activateWindow(bounds) {
       await upd(o);
     }
   }
-  await upd({ focused: true });
+  const moved = bounds && typeof bounds === 'object';
+  if (moved || win.state === 'minimized' || !win.focused) await upd({ focused: true });
 }
 
 function helperConnected() {
@@ -1341,7 +1358,12 @@ const commands = {
     if (dir) await chrome.storage.local.set({ profileDir: dir });
     else await chrome.storage.local.remove('profileDir');
     await setHelper({ currentProfileDir: dir || null });
-    if (dir && helperConnected()) { try { await nreq({ type: 'identify', profileDir: dir }); } catch { /* ignore */ } }
+    if (dir && helperConnected()) {
+      try {
+        const ir = await nreq({ type: 'identify', profileDir: dir });
+        if (ir && ir.error === 'duplicate profile') await onDuplicateProfile(port, dir);
+      } catch { /* ignore */ }
+    }
     return { ok: true };
   },
 
@@ -1859,6 +1881,7 @@ const commands = {
         ...(await littleSettings())
       },
       contextMenus: Object.values(menuItems),
+      captureMenus: captureMenuIds.slice(),
       badge: { text: await chrome.action.getBadgeText({}).catch(() => null), title: await chrome.action.getTitle({}).catch(() => null) }
     };
   }
@@ -2043,7 +2066,10 @@ function dispatchCommand(msg, sender) {
   if (!msg || typeof msg.cmd !== 'string') return Promise.resolve({ ok: false, error: 'Unknown command' });
   if (!Object.prototype.hasOwnProperty.call(commands, msg.cmd)) {
     // BOOST HOOK 2: unknown commands are offered to the boost module (returns a response object, or undefined when it is not a boost command).
-    return Promise.resolve(handleBoostCommand(msg, sender)).then((r) => (r === undefined ? { ok: false, error: 'Unknown command' } : r));
+    // v2.9: screenshot commands (capture*) are handled first.
+    return Promise.resolve(handleCaptureCommand(msg, sender))
+      .then((r) => (r !== undefined ? r : handleBoostCommand(msg, sender)))
+      .then((r) => (r === undefined ? { ok: false, error: 'Unknown command' } : r));
   }
   const fn = () => commands[msg.cmd](msg);
   return unqueued.has(msg.cmd) ? fn() : enqueue(fn);
@@ -2064,6 +2090,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 registerBoostListeners();
+registerCaptureListeners();
 // v2.5: the app learns which window is the main one and whether merge-on-close is on (sidebar.windowRoles / sidebar.windowRolesChanged).
 async function windowRoles() {
   let main = null;
