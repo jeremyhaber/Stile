@@ -1103,7 +1103,7 @@ async function restoreBoundTabs(final) {
 }
 
 // ---------------------------------------------------------------- commands
-const unqueued = new Set(['openSettings', 'appSetting', 'appState', 'isLittleTab', 'switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle', 'setOverlayEnabled', 'setDefaultBrowser']);
+const unqueued = new Set(['openSettings', 'appSetting', 'appState', 'isLittleTab', 'switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle', 'setOverlayEnabled', 'setDefaultBrowser', 'setGreenButtonAction']);
 
 const APP_SETTINGS = new Set(['setPinned', 'setLockstep', 'setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'reviewPermissions', 'setShowMenuBarIcon', 'setOverlayEnabled', 'setDefaultBrowser']);
 

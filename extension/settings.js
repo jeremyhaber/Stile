@@ -187,7 +187,11 @@ sections.tabs = () => {
 sections.windows = () => {
   const root = h('section', { 'data-testid': 'settings-section-windows' });
   R.mergeOnClose = sw('settings-merge-on-close', (v) => { S.mergeOnClose = v; syncSet({ mergeOnClose: v }); });
-  root.append(group(setRow('Move tabs back when a pop-out closes', 'Closing a pop-out with a single tab archives that tab instead. The main window is the first window of the session; right-click a window in Today to change it.', R.mergeOnClose)));
+  const [gbWrap, gbSel] = sel('green-button-action', (v) => appSetting('setGreenButtonAction', v));
+  fillOptions(gbSel, [['full', 'Full screen'], ['fill', 'Fill screen']], 'full');
+  R.greenSel = gbSel;
+  R.greenRow = setRow('Green button', 'What the green window button does in Chrome. Fill screen enlarges the window to the screen without entering full screen.', gbWrap);
+  root.append(group(setRow('Move tabs back when a pop-out closes', 'Closing a pop-out with a single tab archives that tab instead. The main window is the first window of the session; right-click a window in Today to change it.', R.mergeOnClose), R.greenRow));
   return root;
 };
 
@@ -428,6 +432,8 @@ function drawApp() {
   R.scNote.hidden = sc === true;
   R.floatNote.hidden = !(on && a.railFound !== false && a.railControllable === false);
   R.version.textContent = a.appVersion ? `Sidebar ${a.appVersion}` : '';
+  // Windows: green button
+  if (R.greenSel) { R.greenSel.value = a.greenButtonAction === 'fill' ? 'fill' : 'full'; R.greenSel.disabled = !on; }
   // Appearance: pinned sidebar
   R.pinned.checked = a.state === 'pinned' || (a.state === undefined && a.pinned === true);
   R.pinned.disabled = !on;

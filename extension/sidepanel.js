@@ -2011,7 +2011,7 @@ function setupListeners() {
 
 // ------------------------------------------------------------------ overlay mode (host protocol)
 // Host state pushed by the app (`__sidebarHostState`): state is "collapsed" | "peek" | "pinned".
-const HOSTS = { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: null, railFound: null, railControllable: true, launchAtLogin: false, lockstep: true, accessibility: null, appVersion: '', pinMode: 'push' };
+const HOSTS = { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: null, railFound: null, railControllable: true, launchAtLogin: false, lockstep: true, accessibility: null, appVersion: '', pinMode: 'push', topBar: false };
 let vtHintDismissed = false;
 try { vtHintDismissed = localStorage.getItem('vtHintDismissed') === '1'; } catch { /* storage unavailable */ }
 const hostPost = (action, value) => { try { if (window.__sidebarHost) window.__sidebarHost.post(action, value); } catch { /* ignore */ } };
@@ -2026,7 +2026,15 @@ const darkMq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dar
 let themeColor = null;
 function postTheme(color) {
   if (color !== undefined) themeColor = color;
-  postOnce('theme', { color: themeColor, dark: OVERLAY ? resolvedDark : !!(darkMq && darkMq.matches) });
+  postOnce('theme', { color: themeColor, dark: OVERLAY ? resolvedDark : !!(darkMq && darkMq.matches), bg: computedBg() });
+}
+// Exact computed page background as #rrggbb (v3.1 top bar: the app paints its header with it).
+function computedBg() {
+  try {
+    const m = /rgba?\(\s*(\d+)[ ,]+(\d+)[ ,]+(\d+)/.exec(getComputedStyle(document.body).backgroundColor);
+    if (m) return '#' + [m[1], m[2], m[3]].map((n) => (+n).toString(16).padStart(2, '0')).join('');
+  } catch { /* ignore */ }
+  return null;
 }
 function postActiveTitle() {
   const t = activeTab();
@@ -2059,11 +2067,13 @@ function applyHostState(st) {
   if ('lockstep' in st) HOSTS.lockstep = st.lockstep !== false;
   if ('accessibility' in st) HOSTS.accessibility = typeof st.accessibility === 'boolean' ? st.accessibility : null;
   if (typeof st.appVersion === 'string') HOSTS.appVersion = st.appVersion;
+  if ('topBar' in st) HOSTS.topBar = st.topBar === true;
   const root = document.documentElement;
   root.style.setProperty('--icon-x', `${HOSTS.railWidth / 2}px`);
   root.classList.toggle('overlay-float', HOSTS.state === 'peek' || (isPinned() && !HOSTS.railControllable));
   if (wasCompact !== HOSTS.compact) setCompact(HOSTS.compact);
   const btn = $('pin-toggle');
+  btn.hidden = HOSTS.topBar;
   btn.setAttribute('aria-pressed', isPinned() ? 'true' : 'false');
   const lbl = isPinned() ? 'Unpin sidebar' : 'Pin sidebar';
   btn.title = lbl; btn.setAttribute('aria-label', lbl);

@@ -29,7 +29,7 @@ const MAX_FRAME = 64 * 1024 * 1024;
 const HANDOFF_SECONDS = 60;
 const DEFAULT_ARCHIVE_MINUTES = 720;
 // v3.0: app-only settings the extension relays from the settings window ({type:"appSetting", name, value}).
-const APP_SETTINGS = new Set(['setPinned', 'setLockstep', 'setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'reviewPermissions', 'setShowMenuBarIcon']);
+const APP_SETTINGS = new Set(['setPinned', 'setLockstep', 'setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'reviewPermissions', 'setShowMenuBarIcon', 'setGreenButtonAction']);
 const ICONS = new Set('picture initial home briefcase code star heart book music camera palette rocket leaf coffee game globe bolt moon'.split(' '));
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);

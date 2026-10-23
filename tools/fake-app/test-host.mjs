@@ -532,7 +532,7 @@ check('SIGTERM: connection removed from host', await wait(() => !host.isConnecte
   r = await T.request({ type: 'appSetting', name: 'setLockstep', value: false, requestId: 32 });
   check('appSetting: reply {type, name, ok, requestId}', r?.type === 'appSetting' && r.name === 'setLockstep' && r.ok === true && r.requestId === 32, j(r));
   check('appSetting: emitted to the app with profile, name and value', seen.length === 1 && seen[0].profileDir === 'Default' && seen[0].name === 'setLockstep' && seen[0].value === false, j(seen));
-  for (const name of ['setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'setPinned', 'reviewPermissions', 'setShowMenuBarIcon']) {
+  for (const name of ['setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'setPinned', 'reviewPermissions', 'setShowMenuBarIcon', 'setGreenButtonAction']) {
     r = await T.request({ type: 'appSetting', name, value: true, requestId: 'n-' + name });
     check(`appSetting: ${name} accepted`, r?.ok === true && seen.at(-1)?.name === name, j(r));
   }

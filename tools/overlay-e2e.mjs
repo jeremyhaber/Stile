@@ -109,6 +109,7 @@ refApp.on('appSetting', ({ name, value }) => {
   if (name === 'setPinned') setHost({ state: value ? 'pinned' : 'peek' });
   else if (name === 'setLockstep') setHost({ lockstep: !!value });
   else if (name === 'setLaunchAtLogin') setHost({ launchAtLogin: !!value });
+  else if (name === 'setGreenButtonAction') setHost({ greenButtonAction: value });
 });
 refApp.on('fromExt', ({ msg }) => {
   app.fromExt.push({ msg });
@@ -445,6 +446,9 @@ async function main() {
   check('chromeColor: light colour -> exact background and dark text', cc2.bg === hexToRgb('#f1f3f4') && cc2.theme === 'light' && cc2.fg === 'rgb(28, 28, 30)', JSON.stringify(cc2));
   const th2 = lastHost('theme');
   check('chromeColor: host theme post follows the sampled luminance', th2?.value.dark === false);
+  check('v3.1: theme post carries bg = exact computed background (#f1f3f4)', lastHost('theme')?.value.bg === '#f1f3f4', JSON.stringify(lastHost('theme')?.value));
+  setHost({ chromeColor: '#20242c' }); await sleep(500);
+  check('v3.1: theme bg is re-posted when the colour changes', lastHost('theme')?.value.bg === '#20242c', JSON.stringify(lastHost('theme')?.value));
   setHost({ chromeColor: null }); await sleep(500);
   check('chromeColor null -> falls back to the Chrome theme estimate', (await panel.evaluate(() => getComputedStyle(document.body).backgroundColor)) === bgBefore);
 
@@ -505,6 +509,17 @@ async function main() {
   check('App: pinned switch posts setPinned(true) and follows hostState', lastHost('setPinned')?.value === true && (await pin.getAttribute('aria-pressed')) === 'true' && app.host.state === 'pinned');
   await sp.locator('[data-testid="app-pinned"]').uncheck(); await sleep(300);
   check('App: pinned switch off posts setPinned(false)', lastHost('setPinned')?.value === false && app.host.state === 'peek');
+  setHost({ topBar: true }); await sleep(300);
+  check('v3.1: topBar hides the footer pin toggle (still in the DOM)', (await pin.count()) === 1 && !(await pin.isVisible()));
+  setHost({ topBar: false }); await sleep(300);
+  check('v3.1: topBar off shows the footer pin toggle again', await pin.isVisible());
+  await openSettings('windows');
+  const gb = sp.locator('[data-testid="green-button-action"]');
+  check('v3.1: Green button select defaults to Full screen', (await gb.inputValue()) === 'full' && /Full screen/.test(await gb.locator('option').first().innerText()));
+  await gb.selectOption('fill'); await sleep(400);
+  check('v3.1: Green button relays setGreenButtonAction("fill") and follows appState', lastHost('setGreenButtonAction')?.value === 'fill' && app.host.greenButtonAction === 'fill' && (await gb.inputValue()) === 'fill');
+  setHost({ greenButtonAction: 'full' }); await sleep(400);
+  check('v3.1: Green button reflects appState back to Full screen', (await gb.inputValue()) === 'full');
   await openSettings('app');
   check('App: accessibility granted, no "Open settings" button', /granted/i.test(await sp.locator('[data-testid="app-accessibility"]').innerText()) && !(await sp.locator('[data-testid="app-accessibility-open"]').isVisible()));
   await sp.locator('[data-testid="app-launch-login"]').check(); await sleep(300);
