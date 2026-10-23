@@ -3,8 +3,8 @@ import {
   looksLikeUrl, toUrl, resolveStyle, onColor, PROFILE_COLORS, PROFILE_GLYPHS, GROUP_COLORS, hashStr
 } from './shared.js';
 import { icon } from './icons.js';
-import { renderBoostView, createBoostButton, renderBoostSettings } from './boost-view.js';
-import { createCaptureButton, renderCaptureRecent, renderCaptureSettings } from './capture/capture-view.js';
+import { renderBoostView, createBoostButton } from './boost-view.js';
+import { createCaptureButton, renderCaptureRecent } from './capture/capture-view.js';
 
 // Overlay mode (Sidebar.app): chrome.* is provided by bridge-shim.js and must be ready before anything touches it.
 if (window.__sidebarReady) {
@@ -444,7 +444,6 @@ function draw() {
   drawFooter();
   if (OVERLAY) postActiveTitle();
   if (S.view === 'archive') drawArchive();
-  if (S.view === 'settings') drawSettings();
   if (focusKey) {
     const key = focusKey.replace('|child', '');
     const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
@@ -484,7 +483,6 @@ function drawTheme() {
     root.style.removeProperty('--on-profile');
     drawChromeTheme(cur);
     postTheme(cur ? cur.style.color : null);
-    drawSidebarColorUi();
     return;
   }
   const cc = customColor();
@@ -510,7 +508,6 @@ function drawTheme() {
     for (const k of CUSTOM_VARS) root.style.removeProperty(k);
     root.style.colorScheme = '';
   }
-  drawSidebarColorUi();
 }
 
 // Overlay mode: colours come from the Chrome profile's theme (`chromeTheme`, read from Preferences by the host).
@@ -526,23 +523,17 @@ function drawChromeTheme(cur) {
   resolvedDark = scheme === 'dark' ? true : scheme === 'light' ? false : !!(darkMq && darkMq.matches);
   // The host's sampled Chrome colour is the exact background; text colour follows its luminance and the
   // hover/active colours are mixed from it in CSS.
-  // Effective background: custom > exact host sample > theme colour estimate > profile colour (seeds are softened).
+  // Effective background (v3.0): custom > exact host sample > Chrome theme colour estimate > Chrome's default frame colour
+  // (#e9eef6 light / #1f1f1f dark, from the stylesheet). The profile colour is never an automatic seed.
   const custom = customColor();
   const sample = HOSTS.chromeColor;
-  const seed = color || (cur && cur.style && cur.style.color) || null;
-  let bg = null, src = 'none';
-  if (custom) { bg = custom; src = 'custom'; resolvedDark = hexLuminance(custom) < 0.5; }
-  else if (sample) { bg = sample; src = 'chrome'; resolvedDark = hexLuminance(sample) < 0.5; }
-  else if (seed) {
-    bg = resolvedDark ? `color-mix(in oklab, ${seed} 28%, #1f1f1f)` : `color-mix(in oklab, ${seed} 22%, white)`;
-    src = color ? 'theme' : 'profile';
-  }
-  sbColorSource = src;
+  let bg = null;
+  if (custom) { bg = custom; resolvedDark = hexLuminance(custom) < 0.5; }
+  else if (sample) { bg = sample; resolvedDark = hexLuminance(sample) < 0.5; }
   root.classList.toggle('has-chrome-bg', !!bg);
   if (bg) root.style.setProperty('--overlay-bg', bg); else root.style.removeProperty('--overlay-bg');
   root.dataset.theme = resolvedDark ? 'dark' : 'light';
 }
-let sbColorSource = 'none';
 function hexLuminance(hex) {
   const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
   return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
@@ -616,11 +607,7 @@ function showWindowMenu(ev, wid) {
   ]);
 }
 
-function editProfileStyle(dir) {
-  S.styleEditing = dir;
-  setView('settings');
-  requestAnimationFrame(() => { const f = $('field-styles'); if (f && f.scrollIntoView) f.scrollIntoView({ block: 'start' }); });
-}
+function editProfileStyle(dir) { cmd('openSettings', { section: 'profiles:' + encodeURIComponent(dir) }); }
 
 function drawHint() {
   $('left-hint').hidden = S.leftHintDismissed;
@@ -689,9 +676,9 @@ function pinnedRow(e, act) {
       oncontextmenu: (ev) => { ev.preventDefault(); showFolderMenu(ev, n); },
       ondragstart: (ev) => startDrag(ev, { type: 'bm', id: n.id, isFolder: true }, row)
     },
-    h('span', { class: 'chev' }, icon('chevron', 14)),
-    h('span', { class: 'fico' }, icon('folder', 16)),
-    renaming ? renameInput(n.title, (v) => chrome.bookmarks.update(n.id, { title: v })) : h('span', { class: 'title', text: n.title || 'Untitled folder' }));
+    h('span', { class: 'fico' }, icon(open ? 'folderOpen' : 'folder', 16)),
+    renaming ? renameInput(n.title, (v) => chrome.bookmarks.update(n.id, { title: v })) : h('span', { class: 'title', text: n.title || 'Untitled folder' }),
+    h('span', { class: 'chev' }, icon('chevron', 14)));
   } else {
     const tab = S.boundByBm.get(n.id);
     const open = !!tab;
@@ -715,7 +702,6 @@ function pinnedRow(e, act) {
       ondblclick: (ev) => { if (ev.target.closest('.title')) startRename(n.id); },
       ondragstart: (ev) => startDrag(ev, { type: 'bm', id: n.id, isFolder: false }, row)
     },
-    h('span', { class: 'chev' }),
     fav,
     renaming ? renameInput(n.title, (v) => chrome.bookmarks.update(n.id, { title: v })) : h('span', { class: 'title', text: n.title || n.url }),
     curHost && !renaming ? h('span', { class: 'sub cur-host', 'data-testid': 'pinned-host', title: tabUrl, text: '/ ' + curHost }) : null,
@@ -727,12 +713,10 @@ function pinnedRow(e, act) {
       type: 'button', class: 'icon-btn act close', title: 'Close tab', 'aria-label': 'Close tab', 'data-testid': 'pinned-close',
       onclick: (ev) => { ev.stopPropagation(); cmd('closeItem', { bookmarkId: n.id, windowId: S.windowId }); }
     }, icon('x', 14)) : null);
-    // the (empty) chevron slot keeps item icons aligned with folder icons
-    row.querySelector('.chev').style.visibility = 'hidden';
   }
   row.prepend(rbg());
   row.style.setProperty('--depth', String(e.depth));
-  if (e.depth > 0) row.append(h('span', { class: 'guide', 'aria-hidden': 'true' }));
+  row.dataset.depth = String(e.depth);
   return row;
 }
 
@@ -848,14 +832,16 @@ function renderUnits(units, other) {
     if (u.kind === 'tab') out.push(todayRow(u.tab, act, other));
     else if (u.kind === 'split') out.push(splitRow(u, act, other));
     else {
+      // v3.0: header + tabs live in one soft rounded container tinted with the group colour
       const g = u.group;
       const collapsed = !!g.collapsed;
-      out.push(groupRow(u, other));
+      const box = h('div', { class: 'group-box', 'data-gc': g.color || 'grey', 'data-testid': 'group-box', 'data-group-id': g.id, 'data-collapsed': collapsed ? 'true' : 'false' }, groupRow(u, other));
       if (!collapsed) {
         const body = h('div', { class: 'group-body', 'data-gc': g.color || 'grey', 'data-group-id': g.id });
         body.append(...renderUnits(u.units, other), h('span', { class: 'gout', 'data-testid': 'group-outline', 'aria-hidden': 'true' }));
-        out.push(body);
+        box.append(body);
       }
+      out.push(box);
     }
   }
   return out;
@@ -916,12 +902,12 @@ function groupRow(u, other) {
     }
   },
   rbg(),
-  h('span', { class: 'chev' }, icon('chevron', 14)),
   h('span', { class: 'gdot' }),
   renaming
     ? renameInput(g.title || '', (v) => chrome.tabGroups.update(g.id, { title: v }), true)
     : h('span', { class: 'title', text: g.title || 'Unnamed group' }),
-  collapsed && !renaming ? h('span', { class: 'gcount', 'data-testid': 'group-count', title: plural(count, 'tab'), text: String(count) }) : null,
+  !renaming ? h('span', { class: 'gcount', 'data-testid': 'group-count', title: plural(count, 'tab'), text: String(count) }) : null,
+  h('span', { class: 'chev' }, icon('chevron', 14)),
   collapsed && !renaming ? h('span', { class: 'gcbadge', 'aria-hidden': 'true', text: String(count) }) : null);
   return row;
 }
@@ -1028,8 +1014,16 @@ function splitRow(u, act, other) {
     ondragend: endDrag
   },
   rbg(),
-  h('span', { class: 'split-ic', title: 'Split view' }, icon('split', 14)),
-  half(a), h('span', { class: 'divider' }), half(b));
+  half(a), h('span', { class: 'divider' }), half(b),
+  other ? h('span', { class: 'split-ic', title: 'Split view' }, icon('split', 14)) : h('button', {
+    type: 'button', class: 'split-ic split-menu', title: 'Split view options', 'aria-label': 'Split view options', 'aria-haspopup': 'menu', 'data-testid': 'split-menu',
+    onclick: (ev) => {
+      ev.stopPropagation();
+      const r = ev.currentTarget.getBoundingClientRect();
+      showSplitMenu({ clientX: Math.round(r.right), clientY: Math.round(r.bottom + 2), preventDefault() {}, stopPropagation() {} }, u);
+    },
+    onkeydown: (ev) => ev.stopPropagation()
+  }, icon('split', 14)));
   return row;
 }
 
@@ -1084,7 +1078,6 @@ function drawFooter() {
   c.textContent = String(n);
   $('archive-btn').setAttribute('aria-pressed', S.view === 'archive' ? 'true' : 'false');
   $('archive-btn').setAttribute('aria-label', n ? `Archive, ${n} tabs` : 'Archive');
-  $('settings-btn').setAttribute('aria-pressed', S.view === 'settings' ? 'true' : 'false');
   $('clear').title = S.incognito ? 'Close all of Today\u2019s tabs (incognito tabs aren\u2019t archived)' : "Archive all of Today's tabs";
 }
 
@@ -1136,122 +1129,6 @@ function drawArchive() {
   box.replaceChildren(...out);
 }
 
-// ---- settings view
-function fillSelect(sel, values, withDefault, current) {
-  const opts = [];
-  if (withDefault) opts.push(['', `Default for all profiles (${fmtMinutes(S.globalMinutes)})`]);
-  for (const v of ARCHIVE_CHOICES) opts.push([String(v), fmtMinutes(v)]);
-  if (current !== '' && !ARCHIVE_CHOICES.includes(Number(current))) opts.push([String(current), fmtMinutes(Number(current))]);
-  const sig = JSON.stringify(opts);
-  if (sel.dataset.sig !== sig) {
-    sel.replaceChildren(...opts.map(([v, l]) => h('option', { value: v, text: l })));
-    sel.dataset.sig = sig;
-  }
-  sel.value = String(current);
-}
-
-function drawSidebarColorUi() {
-  const f = $('field-sidebar-color');
-  if (!f) return;
-  const custom = customColor();
-  for (const b of f.querySelectorAll('.seg-b')) b.setAttribute('aria-pressed', String((b.dataset.mode === 'custom') === !!custom));
-  $('sbc-custom').hidden = !custom;
-  const cur = currentProfile();
-  const hasSwatches = $('sbc-swatches').children.length > 0;
-  if (!hasSwatches) {
-    const tones = ['#e9eef6', '#f3e8ff', '#e6f4ea', '#fff4e5'];
-    $('sbc-swatches').replaceChildren(...[...PROFILE_COLORS.map((c) => ({ hex: c.hex, name: c.name })), ...tones.map((t) => ({ hex: t, name: t }))].map((c) =>
-      h('button', { type: 'button', class: 'sbc-sw', 'data-testid': 'sidebar-color-swatch', 'data-color': c.hex, title: c.name, 'aria-label': c.name,
-        onclick: () => setSidebarColor({ mode: 'custom', color: c.hex }, true) })));
-    for (const b of $('sbc-swatches').children) b.style.setProperty('--sw', b.dataset.color);
-  }
-  for (const b of $('sbc-swatches').children) b.setAttribute('aria-pressed', String(!!custom && b.dataset.color === custom));
-  if (custom && document.activeElement !== $('sbc-picker')) $('sbc-picker').value = custom;
-  const note = $('sbc-note');
-  let text = '';
-  if (!custom) {
-    if (OVERLAY) text = sbColorSource === 'chrome' ? 'Matching Chrome exactly' : sbColorSource === 'theme' ? 'From your Chrome theme colour' : sbColorSource === 'profile' ? 'From your profile colour' : 'Using the default colour';
-    else text = cur ? 'From your profile colour' : 'Using the default colour';
-  }
-  note.textContent = text;
-  note.hidden = !text;
-}
-let sbSaveTimer = 0;
-function setSidebarColor(v, save) {
-  S.sidebarColor = normSidebarColor(v);
-  drawTheme();
-  clearTimeout(sbSaveTimer);
-  const persist = () => chrome.storage.sync.set({ sidebarColor: S.sidebarColor }).catch(() => {});
-  if (save) persist(); else sbSaveTimer = setTimeout(persist, 300);
-}
-
-function drawSettings() {
-  drawSidebarColorUi();
-  const hs = S.helper;
-  const connected = !!(hs && hs.status === 'connected');
-  fillSelect($('set-profile-archive'), ARCHIVE_CHOICES, true, S.archiveMinutes === null ? '' : S.archiveMinutes);
-  const g = $('set-global-archive');
-  fillSelect(g, ARCHIVE_CHOICES, false, S.globalMinutes);
-  g.disabled = !connected;
-  $('global-hint').textContent = connected
-    ? 'Shared by every Chrome profile that has Sidebar installed.'
-    : 'Needs the profile helper. Until it is installed the default stays at 12 hours.';
-
-  $('set-archive-grouped').checked = S.archiveGrouped;
-  $('set-merge-on-close').checked = S.mergeOnClose;
-  $('set-pinned-reset').checked = S.pinnedReset;
-  drawLittleSettings(connected);
-  if (OVERLAY) drawAppSettings();
-  drawStyleList();
-  const profiles = (connected && hs.profiles) || [];
-  $('field-profile').hidden = !connected || !profiles.length;
-  const pick = $('set-profile-pick');
-  if (connected && profiles.length) {
-    const cur = hs.currentProfileDir || '';
-    const opts = [];
-    if (!cur || !profiles.some((p) => p.dir === cur)) opts.push(h('option', { value: '', text: 'Choose…' }));
-    for (const p of profiles) opts.push(h('option', { value: p.dir, text: p.name + (p.email ? ` (${p.email})` : '') }));
-    pick.replaceChildren(...opts);
-    pick.value = profiles.some((p) => p.dir === cur) ? cur : '';
-  }
-
-  const dot = $('helper-dot');
-  const status = $('helper-status');
-  dot.className = 'status-dot';
-  if (!hs || !hs.status) { status.textContent = 'Checking…'; }
-  else if (hs.status === 'connected') { status.textContent = 'Connected'; dot.classList.add('ok'); }
-  else if (hs.status === 'not_installed') { status.textContent = 'Sidebar app not running — open Sidebar.app, then Retry'; dot.classList.add('bad'); }
-  else { status.textContent = `Error: ${hs.error || 'unknown'}`; dot.classList.add('bad'); }
-  status.dataset.status = (hs && hs.status) || 'checking';
-  $('helper-retry').hidden = connected;
-  $('field-overlay-enabled').hidden = !connected;
-  $('set-overlay-enabled').checked = S.overlayEnabled;
-}
-
-// v2.8: Settings > Little windows
-const TEMP_EXPIRY_CHOICES = [60, 360, 720, 1440, 0];
-function drawLittleSettings(connected) {
-  const cb = $('set-little-default');
-  cb.checked = connected && S.defaultBrowser;
-  cb.disabled = !connected;
-  $('little-default-hint').textContent = connected
-    ? 'Sidebar.app asks macOS to make it your default browser; links it can\u2019t show go to Chrome as usual.'
-    : 'Needs Sidebar.app. Open it, then turn this on.';
-  for (const b of document.querySelectorAll('[data-testid="little-style"] .seg-b')) b.setAttribute('aria-pressed', String(b.dataset.style === S.littleStyle));
-  $('little-style-hint').textContent = S.littleStyle === 'minimal'
-    ? 'Just the page and a slim address bar. \u201cMake full tab\u201d reopens the page in your main window.'
-    : 'A regular Chrome window with toolbar and tabs. \u201cMake full tab\u201d moves the live tab, keeping its page state.';
-  const mx = $('set-little-max');
-  if (!mx.children.length) mx.replaceChildren(...[1, 2, 3, 4, 5].map((n) => h('option', { value: String(n), text: String(n) })));
-  mx.value = String(S.littleMaxOpen);
-  const ex = $('set-temp-expiry');
-  const opts = TEMP_EXPIRY_CHOICES.slice();
-  if (!opts.includes(S.temporaryMinutes)) opts.push(S.temporaryMinutes);
-  const sig = JSON.stringify(opts);
-  if (ex.dataset.sig !== sig) { ex.replaceChildren(...opts.map((v) => h('option', { value: String(v), text: fmtMinutes(v) }))); ex.dataset.sig = sig; }
-  ex.value = String(S.temporaryMinutes);
-}
-
 // v2.7: card shown when the Mac app isn't connected (only once it has connected before, so side-panel-only users aren't nagged).
 let offlineTryAt = 0;
 let offlineFailed = false;
@@ -1278,75 +1155,6 @@ async function offlineRetry(launch) {
   }, 5000);
 }
 
-// ---- profile icon + colour editor (Settings > Profiles)
-async function saveStyle(en, style) {
-  const hs = S.helper;
-  if (en.own) S.ownStyle = style;
-  else if (hs && hs.profiles) S.helper = { ...hs, profiles: hs.profiles.map((p) => (p.dir === en.dir ? { ...p, style } : p)) };
-  draw();
-  const r = await cmd('setProfileStyle', { dir: en.dir, style });
-  if (!r || !r.ok) { toast((r && r.error) || 'Could not save the profile style'); scheduleRender(); }
-}
-
-function styleEditor(en) {
-  const cur = en.style;
-  const names = [];
-  if (en.p.picture) names.push('picture');
-  names.push('initial', ...PROFILE_GLYPHS);
-  const iconBtns = names.map((name) => {
-    const inner = name === 'picture' ? h('img', { src: en.p.picture, alt: '', draggable: 'false' })
-      : name === 'initial' ? h('span', { class: 'letter', text: ((en.p.name || '?').trim()[0] || '?').toUpperCase() })
-        : icon(name, 18);
-    const b = h('button', {
-      type: 'button', class: 'style-icon', title: name, 'aria-label': `Icon: ${name}`, 'aria-pressed': cur.icon === name ? 'true' : 'false',
-      'data-testid': 'style-icon', 'data-icon': name,
-      onclick: () => saveStyle(en, { icon: name, color: cur.color })
-    }, inner);
-    b.style.setProperty('--sc', cur.color);
-    b.style.setProperty('--sf', onColor(cur.color));
-    return b;
-  });
-  const colorBtns = PROFILE_COLORS.map((c) => {
-    const b = h('button', {
-      type: 'button', class: 'style-color', title: c.name, 'aria-label': `Colour: ${c.name}`, 'aria-pressed': cur.color === c.hex ? 'true' : 'false',
-      'data-testid': 'style-color', 'data-color': c.hex,
-      onclick: () => saveStyle(en, { icon: cur.icon, color: c.hex })
-    }, cur.color === c.hex ? icon('check', 14) : null);
-    b.style.setProperty('--c', c.hex);
-    b.style.setProperty('--cf', onColor(c.hex));
-    return b;
-  });
-  return h('div', { class: 'style-editor', 'data-testid': 'style-editor', 'data-dir': en.dir },
-    h('div', {}, h('p', { class: 'cap', text: 'Icon' }), h('div', { class: 'icon-grid' }, ...iconBtns)),
-    h('div', {}, h('p', { class: 'cap', text: 'Colour' }), h('div', { class: 'color-grid' }, ...colorBtns)));
-}
-
-function drawStyleList() {
-  const box = $('profile-styles');
-  const hs = S.helper;
-  const connected = !!(hs && hs.status === 'connected' && hs.profiles && hs.profiles.length);
-  let entries;
-  if (connected) entries = hs.profiles.map((p) => ({ p, dir: p.dir, style: resolveStyle(p), current: p.dir === hs.currentProfileDir }));
-  else {
-    const pp = { dir: '__own', name: 'This profile', picture: null };
-    entries = [{ p: pp, dir: '__own', style: resolveStyle(pp, S.ownStyle), current: true, own: true }];
-  }
-  const kids = [];
-  for (const en of entries) {
-    const open = S.styleEditing === en.dir;
-    const sub = en.own ? 'Without the helper, only this profile can be styled' : (en.p.email || (en.current ? 'This profile' : ''));
-    kids.push(h('button', {
-      type: 'button', class: 'pstyle-row', 'aria-expanded': open ? 'true' : 'false', 'data-testid': 'profile-style-row', 'data-dir': en.dir,
-      onclick: () => { S.styleEditing = open ? null : en.dir; drawStyleList(); }
-    },
-    avatarEl('span', en.p, en.style, { 'aria-hidden': 'true' }, true),
-    h('span', { class: 'pname' }, en.p.name || en.dir, sub ? h('small', { text: en.current && en.p.email ? `${en.p.email} · this profile` : sub }) : null),
-    h('span', { class: 'chev' }, icon('chevron', 14))));
-    if (open) kids.push(styleEditor(en));
-  }
-  box.replaceChildren(...kids);
-}
-
 // ------------------------------------------------------------------ views
 let boostCleanup = null;
 function leaveBoost() {
@@ -1354,17 +1162,14 @@ function leaveBoost() {
   $('view-boost').replaceChildren();
   if (captureCleanup) { try { captureCleanup(); } catch (e) { console.warn('[sidebar] capture cleanup', e); } captureCleanup = null; }
   $('view-captures').replaceChildren();
-  if (captureSettingsCleanup) { try { captureSettingsCleanup(); } catch { /* ignore */ } captureSettingsCleanup = null; }
 }
 let captureCleanup = null;
-let captureSettingsCleanup = null;
 
 function setView(v) {
   leaveBoost();
   S.view = v;
   $('view-main').hidden = v !== 'main';
   $('view-archive').hidden = v !== 'archive';
-  $('view-settings').hidden = v !== 'settings';
   $('view-boost').hidden = v !== 'boost';
   $('view-captures').hidden = v !== 'captures';
   if (v === 'captures') {
@@ -1379,7 +1184,6 @@ function setView(v) {
       boostCleanup = typeof c === 'function' ? c : null;
     } catch (e) { console.warn('[sidebar] boost view', e); }
   }
-  if (v === 'settings') { mountBoostSettings(); mountCaptureSettings(); }
   try { if (v !== 'boost' && v !== 'captures') sessionStorage.setItem('view', v); } catch { /* ignore */ }
   if (loaded) draw();
 }
@@ -1395,12 +1199,6 @@ function makeBoostCtx() {
   };
 }
 
-function mountBoostSettings() {
-  const box = $('boost-settings-slot');
-  box.replaceChildren();
-  try { renderBoostSettings(box, makeBoostCtx()); } catch (e) { console.warn('[sidebar] boost settings', e); }
-}
-
 // ---- screenshots (v2.9): camera button, Recent captures view, Settings section
 function makeCaptureCtx() {
   return {
@@ -1411,11 +1209,6 @@ function makeCaptureCtx() {
     goBack: () => setView('main'),
     openRecent: () => setView('captures')
   };
-}
-function mountCaptureSettings() {
-  const box = $('capture-settings-slot');
-  box.replaceChildren();
-  try { const c = renderCaptureSettings(box, makeCaptureCtx()); captureSettingsCleanup = typeof c === 'function' ? c : null; } catch (e) { console.warn('[sidebar] capture settings', e); }
 }
 function mountCaptureButton() {
   try { $('capture-slot').replaceChildren(createCaptureButton(makeCaptureCtx())); } catch (e) { console.warn('[sidebar] capture button', e); }
@@ -1648,6 +1441,20 @@ async function swapSides(u) {
   if (!b) return;
   const r = await cmd('swapSplit', { splitViewId: u.splitId != null ? u.splitId : sidOf(a), tabIds: [a.id, b.id] });
   if (r && !r.ok) toast(r.error || 'Could not swap the split view');
+}
+
+// v3.0: the split icon at the right of a split row. Overlay mode serialises this through showMenu's native path (`contextMenu`).
+function showSplitMenu(ev, u) {
+  const [a, b] = u.tabs;
+  showMenu(ev, [
+    { label: 'Swap sides', action: 'swap-split', run: () => swapSides(u) },
+    typeof chrome.tabs.unsplit === 'function' ? { label: 'Separate', action: 'unsplit', run: () => unsplit(a) } : null,
+    '-',
+    { label: 'Close left tab', action: 'close-left', run: () => safe(chrome.tabs.remove(a.id)) },
+    { label: 'Close right tab', action: 'close-right', run: () => safe(chrome.tabs.remove(b.id)) },
+    '-',
+    { label: 'Move to new window', action: 'new-window', run: () => toNewWindow({ splitViewId: u.splitId != null ? u.splitId : sidOf(a) }) }
+  ]);
 }
 
 function showTabMenu(ev, tab, opts = {}) {
@@ -2107,10 +1914,8 @@ function setupStatic() {
   $('new-folder').append(icon('folderPlus', 15));
   $('archive-ic').append(icon('archive', 15));
   $('settings-btn').append(icon('gear', 16));
-  for (const id of ['archive-back', 'settings-back']) {
-    $(id).append(icon('arrowLeft', 16));
-    $(id).addEventListener('click', () => setView('main'));
-  }
+  $('archive-back').append(icon('arrowLeft', 16));
+  $('archive-back').addEventListener('click', () => setView('main'));
   $('new-folder').addEventListener('click', () => newFolder(null));
   // v2.5: Pinned is hidden while empty, so offer a new pinned folder from the Today section's own context menu
   $('today').closest('.sec').addEventListener('contextmenu', (ev) => {
@@ -2132,77 +1937,23 @@ function setupStatic() {
     else toast(`Tidied ${plural(r.tidied, 'tab')} into ${plural(r.groups, 'group')}`, { undo: () => doUndo(r.undoId), ms: 8000 });
   });
   $('archive-btn').addEventListener('click', () => setView(S.view === 'archive' ? 'main' : 'archive'));
-  $('settings-btn').addEventListener('click', () => setView(S.view === 'settings' ? 'main' : 'settings'));
+  // v3.0: settings live in their own window (settings.html); the service worker reuses it when it is already open
+  $('settings-btn').addEventListener('click', () => cmd('openSettings'));
   $('archive-search').addEventListener('input', () => drawArchive());
   $('archive-clear').addEventListener('click', async () => {
     if (!S.archive.length) return;
     const ok = await confirmDialog({ title: 'Clear archive?', message: `${S.archive.length} archived tab${S.archive.length === 1 ? '' : 's'} will be permanently removed.`, okLabel: 'Clear archive', danger: true });
     if (ok) await cmd('clearArchive');
   });
-  $('set-profile-archive').addEventListener('change', (e) => {
-    cmd('setProfileArchive', { minutes: e.target.value === '' ? null : Number(e.target.value) });
-  });
-  $('set-global-archive').addEventListener('change', async (e) => {
-    const r = await cmd('setGlobalArchive', { minutes: Number(e.target.value) });
-    if (!r || !r.ok) scheduleRender();
-  });
-  $('set-profile-pick').addEventListener('change', (e) => { if (e.target.value) cmd('setProfileDir', { dir: e.target.value }); });
-  $('helper-retry').addEventListener('click', () => cmd('retryHelper'));
   $('app-offline-open').addEventListener('click', () => offlineRetry(true));
   $('app-offline-retry').addEventListener('click', () => offlineRetry(false));
-  $('set-overlay-enabled').addEventListener('change', async (e) => {
-    const r = await cmd('setOverlayEnabled', { enabled: e.target.checked });
-    if (!r || !r.ok) scheduleRender();
-  });
-  $('shortcut-btn').addEventListener('click', () => safe(chrome.tabs.create({ url: 'chrome://extensions/shortcuts' })));
   const openLeft = () => safe(chrome.tabs.create({ url: 'chrome://settings/appearance' }));
-  $('left-btn').addEventListener('click', openLeft);
   $('left-hint-btn').addEventListener('click', openLeft);
   $('left-hint-close').append(icon('x', 14));
   $('left-hint-close').addEventListener('click', () => {
     S.leftHintDismissed = true;
     chrome.storage.local.set({ leftHintDismissed: true }).catch(() => {});
     drawHint();
-  });
-  for (const b of document.querySelectorAll('#field-sidebar-color .seg-b')) {
-    b.addEventListener('click', () => {
-      if (b.dataset.mode === 'auto') setSidebarColor({ mode: 'auto' }, true);
-      else setSidebarColor({ mode: 'custom', color: $('sbc-picker').value || '#e9eef6' }, true);
-    });
-  }
-  $('sbc-picker').addEventListener('input', (e) => setSidebarColor({ mode: 'custom', color: e.target.value }, false));
-  $('sbc-picker').addEventListener('change', (e) => setSidebarColor({ mode: 'custom', color: e.target.value }, true));
-  $('set-archive-grouped').addEventListener('change', (e) => {
-    S.archiveGrouped = e.target.checked;
-    chrome.storage.sync.set({ archiveGrouped: e.target.checked }).catch(() => {});
-  });
-  $('set-merge-on-close').addEventListener('change', (e) => {
-    S.mergeOnClose = e.target.checked;
-    chrome.storage.sync.set({ mergeOnClose: e.target.checked }).catch(() => {});
-  });
-  $('set-pinned-reset').addEventListener('change', (e) => {
-    S.pinnedReset = e.target.checked;
-    chrome.storage.sync.set({ pinnedResetOnRestart: e.target.checked }).catch(() => {});
-  });
-  $('set-little-default').addEventListener('change', async (e) => {
-    const r = await cmd('setDefaultBrowser', { enabled: e.target.checked });
-    if (!r || !r.ok) toast((r && r.error) || 'Could not change the default browser');
-    scheduleRender();
-  });
-  for (const b of document.querySelectorAll('[data-testid="little-style"] .seg-b')) {
-    b.addEventListener('click', () => {
-      S.littleStyle = b.dataset.style;
-      chrome.storage.sync.set({ littleStyle: S.littleStyle }).catch(() => {});
-      drawLittleSettings(!!(S.helper && S.helper.status === 'connected'));
-    });
-  }
-  $('set-little-max').addEventListener('change', (e) => {
-    S.littleMaxOpen = Number(e.target.value);
-    chrome.storage.sync.set({ littleMaxOpen: S.littleMaxOpen }).catch(() => {});
-  });
-  $('set-temp-expiry').addEventListener('change', (e) => {
-    S.temporaryMinutes = Number(e.target.value);
-    chrome.storage.sync.set({ temporaryMinutes: S.temporaryMinutes }).catch(() => {});
   });
   $('temp-clear').addEventListener('click', async () => {
     const n = S.temporary.length;
@@ -2216,12 +1967,7 @@ function setupStatic() {
     showMenu(ev, [{ label: 'Make this the main window', action: 'make-main', run: () => cmd('setMainWindow', { windowId: S.windowId }) }]);
   });
   $('merge-all').addEventListener('click', mergeAllCmd);
-  $('newwin-btn').append(icon('newWindow', 16));
   $('newwin-drop-ic').append(icon('newWindow', 18));
-  $('newwin-btn').addEventListener('click', async () => {
-    const w = await safe(chrome.windows.create({ focused: true }));
-    if (w) await openSidePanelFor(w.id);
-  });
 }
 
 function setupListeners() {
@@ -2321,7 +2067,6 @@ function applyHostState(st) {
   btn.setAttribute('aria-pressed', isPinned() ? 'true' : 'false');
   const lbl = isPinned() ? 'Unpin sidebar' : 'Pin sidebar';
   btn.title = lbl; btn.setAttribute('aria-label', lbl);
-  drawAppSettings();
   if (loaded) {
     if (oldColor !== HOSTS.chromeColor) { drawTheme(); }
     drawHint();
@@ -2360,25 +2105,6 @@ function setCompact(on) {
   setTimeout(() => { for (const el of moved) { el.style.transition = ''; el.style.transformOrigin = ''; } }, 220);
 }
 
-// Settings > App (overlay mode only): mirrors the host state; changes are posted to the app.
-function drawAppSettings() {
-  if (!OVERLAY) return;
-  $('field-app').hidden = false;
-  $('app-pinned').checked = isPinned();
-  $('app-login').checked = HOSTS.launchAtLogin;
-  $('app-lockstep').checked = HOSTS.lockstep;
-  const ax = HOSTS.accessibility;
-  $('app-ax-status').textContent = ax === true ? 'Accessibility access granted' : ax === false ? 'Accessibility access needed' : 'Accessibility access unknown';
-  $('app-ax-dot').className = 'status-dot' + (ax === true ? ' ok' : ax === false ? ' bad' : '');
-  $('app-ax-open').hidden = ax !== false;
-  const sc = HOSTS.screenCapture;
-  $('app-sc-status').textContent = sc === true ? 'On' : '';
-  $('app-sc-on').hidden = sc === true;
-  $('app-sc-note').hidden = sc === true;
-  $('app-float-note').hidden = !(HOSTS.railFound !== false && !HOSTS.railControllable);
-  $('app-version').textContent = HOSTS.appVersion ? `Sidebar ${HOSTS.appVersion}` : '';
-}
-
 // v2.5: tell the app whether an editable element has focus, so it can pass other keys through to Chrome.
 const NON_TEXT_INPUT = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'range', 'color', 'file', 'image']);
 function isEditableEl(el) {
@@ -2401,23 +2127,33 @@ function setupEditingReport() {
   window.addEventListener('blur', () => { clearTimeout(timer); postOnce('editing', false); });
 }
 
+// v3.0: dragging empty sidebar space moves Chrome's window (the app runs a lockstep move session). Only bare background counts:
+// anything interactive (buttons, fields, rows, tiles, menus, dialogs, scrollbars, the edge where the app resizes) keeps its own behaviour.
+const NOT_BACKGROUND = 'button, input, select, textarea, a, label, summary, [role="button"], [role="switch"], .row, .fav-tile, .pbtn, .menu, .scrim, .dialog, .toast, .hint-card, .popout-bar, .empty-drop, .fav-empty, .newwin-drop, .rename-input, .bx-card, .bx-code, .bx-zap, .cap-item, [draggable="true"], [contenteditable="true"]';
+function isBackgroundTarget(e) {
+  const t = e.target;
+  if (!t || t.nodeType !== 1 || t.closest(NOT_BACKGROUND)) return false;
+  if (e.clientX >= window.innerWidth - 4) return false;   // the app's resize edge
+  const sc = t.closest('.scroll, #view-boost');
+  if (sc && sc === t && e.clientX - sc.getBoundingClientRect().left >= sc.clientWidth) return false;   // scrollbar
+  return true;
+}
+function setupWindowDrag() {
+  document.addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.defaultPrevented) return;
+    if (!isBackgroundTarget(e)) return;
+    e.preventDefault();
+    hostPost('beginWindowDrag', { clientX: Math.round(e.clientX), clientY: Math.round(e.clientY), clickCount: e.detail || 1 });
+  });
+}
+
 function setupOverlay() {
+  setupWindowDrag();
   document.documentElement.classList.add('overlay');
   drawChromeTheme(null);
   $('pin-toggle').hidden = false;
   $('pin-toggle').append(icon('pin', 15));
   $('pin-toggle').addEventListener('click', () => hostPost('setPinned', !isPinned()));
-  $('set-pin-mode').addEventListener('change', (e) => hostPost('setPinMode', e.target.value));
-  $('app-pinned').addEventListener('change', (e) => hostPost('setPinned', e.target.checked));
-  $('app-login').addEventListener('change', (e) => hostPost('setLaunchAtLogin', e.target.checked));
-  $('app-lockstep').addEventListener('change', (e) => hostPost('setLockstep', e.target.checked));
-  $('app-ax-open').addEventListener('click', () => hostPost('openAccessibilitySettings', true));
-  $('app-sc-on').addEventListener('click', () => hostPost('requestScreenCapture', true));
-  $('app-rescan').addEventListener('click', () => hostPost('rescanRail', true));
-  $('app-quit').addEventListener('click', async () => {
-    const ok = await confirmDialog({ title: 'Quit Sidebar?', message: 'The sidebar will disappear until you open Sidebar again.', okLabel: 'Quit Sidebar', danger: true });
-    if (ok) hostPost('quitApp', true);
-  });
   $('vt-hint-close').append(icon('x', 14));
   $('vt-hint-close').addEventListener('click', () => {
     vtHintDismissed = true;
@@ -2426,7 +2162,6 @@ function setupOverlay() {
   });
   setupEditingReport();
   window.__sidebarHostState = applyHostState;
-  drawAppSettings();
   if (window.__sidebarHost && window.__sidebarHost.last) applyHostState(window.__sidebarHost.last);
   if (darkMq && darkMq.addEventListener) darkMq.addEventListener('change', () => { if (loaded) drawTheme(); });
   new MutationObserver(updateBusy).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['class'] });
@@ -2453,7 +2188,7 @@ function setupOverlay() {
   setupListeners();
   mountBoostButton();
   mountCaptureButton();
-  try { const v = sessionStorage.getItem('view'); if (v === 'archive' || v === 'settings') S.view = v; } catch { /* ignore */ }
+  try { const v = sessionStorage.getItem('view'); if (v === 'archive') S.view = v; } catch { /* ignore */ }
   await run();
   setView(S.view);
   if (OVERLAY) { postTheme(); postActiveTitle(); updateBusy(); hostPost('ready', true); }

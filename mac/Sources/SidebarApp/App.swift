@@ -4,6 +4,7 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let server = HostServer()
     private var manager: OverlayManager?
+    private var menuBar: MenuBarController?
     private let permissions = Permissions()
     private lazy var router = LinkRouter(server: server)
 
@@ -19,7 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
         }
-        Log.write("Sidebar \(AppInfo.version) launching (no menu bar icon, no Dock icon)")
+        Log.write("Sidebar \(AppInfo.version) launching (menu bar icon optional, no Dock icon)")
         installMainMenu()
 
         HostSetup.runAtLaunch()
@@ -27,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let mgr = OverlayManager(server: server)
         manager = mgr
         router.preferredBridge = { [weak mgr] in mgr?.preferredBridge() }
+        menuBar = MenuBarController(manager: mgr, server: server)
 
         HotKey.registerPin { [weak mgr] in
             Task { @MainActor in
@@ -43,6 +45,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in
                 self?.router.openNewLittle()
             }
+        }
+
+        permissions.server = server
+        NotificationCenter.default.addObserver(forName: .sidebarReviewPermissions, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.permissions.show() }
         }
 
         permissions.ensure { [weak self] in

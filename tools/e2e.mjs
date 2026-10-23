@@ -78,6 +78,19 @@ async function main() {
   let panel;
   const cmd = (msg) => panel.evaluate((m) => new Promise((res) => chrome.runtime.sendMessage(m, res)), msg).catch((e) => ({ error: String(e) }));
   const swEval = (fn, arg) => sw.evaluate(fn, arg);
+  // v3.0: settings live in their own window (settings.html), opened by the gear.
+  let sp = null;
+  const openSettings = async (sec) => {
+    if (!sp || sp.isClosed()) {
+      await panel.locator('[data-testid="settings-button"]').click();
+      for (let t = 0; t < 8000 && !(sp = ctx.pages().find((p) => !p.isClosed() && p.url().includes('settings.html'))); t += 100) await sleep(100);
+      await sp.waitForSelector('[data-testid="settings-nav"]');
+    }
+    if (sec) await sp.locator(`[data-testid="settings-nav-${sec}"]`).click();
+    await sleep(400);
+    return sp;
+  };
+  const closeSettings = async () => { if (sp && !sp.isClosed()) await sp.close(); sp = null; await sleep(600); };
 
   // Browsing window tabs
   const first = ctx.pages()[0] || await ctx.newPage();
@@ -234,19 +247,19 @@ async function main() {
   await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
 
   // Settings: global default via helper
-  await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
-  await panel.screenshot({ path: path.join(OUT, '04-settings.png') });
-  const g = panel.locator('[data-testid="settings-archive-global"]');
+  await openSettings('tabs');
+  await sp.screenshot({ path: path.join(OUT, '04-settings.png') });
+  const g = sp.locator('[data-testid="settings-archive-global"]');
   check('global default control enabled with helper', !(await g.isDisabled()));
   const opts = await g.locator('option').evaluateAll((os) => os.map((o) => [o.value, o.textContent]));
   const day = opts.find(([, t]) => /24 hours/.test(t));
   await g.selectOption(day[0]); await sleep(700);
   const stateJson = JSON.parse(fs.readFileSync(path.join(helperDir, 'state.json'), 'utf8'));
   check('global default saved to helper state', stateJson.archiveDefaultMinutes === 1440, JSON.stringify(stateJson));
-  await panel.locator('[data-testid="settings-archive-profile"]').selectOption({ index: 0 }); await sleep(400);
+  await sp.locator('[data-testid="settings-archive-profile"]').selectOption({ index: 0 }); await sleep(400);
   const st4 = await cmd({ cmd: 'debugState' });
   check('profile setting "use default" follows global', st4.settings.archiveMinutes == null && st4.settings.effectiveMinutes === 1440, JSON.stringify(st4.settings));
-  await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+  await closeSettings();
 
   // Profile switch → helper launches Chrome for the other profile
   await panel.locator('[data-testid="profile-pill"]').nth(1).click();
@@ -287,36 +300,37 @@ async function main() {
   const tint = await panel.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--profile').trim() || getComputedStyle(document.body).getPropertyValue('--profile').trim());
   check('panel themed with current profile colour', /^#|rgb|oklab|color/.test(tint) && !/^#8e8e93/i.test(tint), tint);
   // Style editor
-  await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
+  await openSettings('appearance');
   // Sidebar colour setting (side-panel mode)
   {
     const bg = () => panel.evaluate(() => getComputedStyle(document.body).backgroundColor);
     const rgb = (h) => `rgb(${parseInt(h.slice(1, 3), 16)}, ${parseInt(h.slice(3, 5), 16)}, ${parseInt(h.slice(5, 7), 16)})`;
     const profBg = await bg();
-    check('sidebar colour: default auto uses the profile tint (not the neutral grey)', profBg !== 'rgb(243, 243, 246)' && profBg !== 'rgb(31, 32, 35)', profBg);
-    check('sidebar colour: Automatic selected, note says "From your profile colour"',
-      (await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').getAttribute('aria-pressed')) === 'true' &&
-      /From your profile colour/.test(await panel.locator('[data-testid="sidebar-color-note"]').innerText()));
-    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="custom"]').click(); await sleep(400);
-    check('sidebar colour: Custom shows 14 swatches and the picker', (await panel.locator('[data-testid="sidebar-color-swatch"]:visible').count()) === 14 && await panel.locator('[data-testid="sidebar-color-picker"]').isVisible());
-    await panel.locator('[data-testid="sidebar-color-swatch"][data-color="#e6f4ea"]').click(); await sleep(400);
+    check('v3.0 default colour: with no theme/sample/custom, Automatic falls back to Chrome\'s default frame colour #e9eef6 (profile colour no longer seeds it)', (profBg === 'rgb(233, 238, 246)' || (/oklab\(0\.90[5-7]/.test(profBg))), profBg);
+    check('sidebar colour: Automatic selected, note says "Chrome\'s default colour"',
+      (await sp.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').getAttribute('aria-pressed')) === 'true' &&
+      /Chrome.s default colour/.test(await sp.locator('[data-testid="sidebar-color-note"]').innerText()));
+    await sp.locator('[data-testid="sidebar-color-mode"] [data-mode="custom"]').click(); await sleep(400);
+    check('sidebar colour: Custom shows 14 swatches and the picker', (await sp.locator('[data-testid="sidebar-color-swatch"]:visible').count()) === 14 && await sp.locator('[data-testid="sidebar-color-picker"]').isVisible());
+    await sp.locator('[data-testid="sidebar-color-swatch"][data-color="#e6f4ea"]').click(); await sleep(400);
     check('sidebar colour: custom swatch sets the exact background', (await bg()) === rgb('#e6f4ea'), await bg());
-    await panel.screenshot({ path: path.join(OUT, '05-sidebar-colour.png') });
-    await panel.locator('[data-testid="sidebar-color-picker"]').fill('#204060'); await sleep(500);
+    await sp.screenshot({ path: path.join(OUT, '05-sidebar-colour.png') });
+    await sp.locator('[data-testid="sidebar-color-picker"]').fill('#204060'); await sleep(500);
     check('sidebar colour: picker value applies exactly, with light text on dark', (await bg()) === rgb('#204060') && (await panel.evaluate(() => getComputedStyle(document.body).color)) === 'rgb(236, 236, 240)', await bg());
     const saved = await swEval(async () => (await chrome.storage.sync.get('sidebarColor')).sidebarColor);
     check('sidebar colour: stored in chrome.storage.sync', saved && saved.mode === 'custom' && saved.color === '#204060', JSON.stringify(saved));
-    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').click(); await sleep(500);
-    check('sidebar colour: back to Automatic restores the profile tint', (await bg()) === profBg, await bg());
+    await sp.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').click(); await sleep(500);
+    check('sidebar colour: back to Automatic restores the default colour', (await bg()) === profBg, await bg());
   }
-  const styleRow = panel.locator('[data-testid="profile-style-row"]').first();
+  await openSettings('profiles');
+  const styleRow = sp.locator('[data-testid="profile-style-row"]').first();
   await styleRow.click(); await sleep(300);
-  await panel.locator('[data-testid="style-icon"][data-icon="rocket"]').first().click(); await sleep(500);
-  await panel.locator('[data-testid="style-color"][data-color="#bf5af2"]').first().click(); await sleep(800);
+  await sp.locator('[data-testid="style-icon"][data-icon="rocket"]').first().click(); await sleep(500);
+  await sp.locator('[data-testid="style-color"][data-color="#bf5af2"]').first().click(); await sleep(800);
   const st5 = JSON.parse(fs.readFileSync(path.join(helperDir, 'state.json'), 'utf8'));
   check('icon and colour saved to helper', st5.profileStyles?.Default?.icon === 'rocket' && st5.profileStyles?.Default?.color?.toLowerCase() === '#bf5af2', JSON.stringify(st5.profileStyles));
-  await panel.screenshot({ path: path.join(OUT, '06-style-editor.png') });
-  await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(400);
+  await sp.screenshot({ path: path.join(OUT, '06-style-editor.png') });
+  await closeSettings();
   const pill0 = panel.locator('[data-testid="profile-pill"]').first();
   check('switcher shows the chosen icon', (await pill0.getAttribute('data-icon')) === 'rocket');
 
@@ -851,12 +865,12 @@ async function main() {
     // littlesearch.html
     const rs = await cmd({ cmd: 'openLittle', url: null });
     await sleep(900);
-    const sp = ctx.pages().find((p) => p.url().includes('littlesearch.html'));
-    check('v2.8 littlesearch: url null opens littlesearch.html titled "New little window" with a focused field', rs.ok && !!sp && (await sp.title()) === 'New little window' && (await sp.evaluate(() => document.activeElement && document.activeElement.id)) === 'q');
+    const lsp = ctx.pages().find((p) => p.url().includes('littlesearch.html'));
+    check('v2.8 littlesearch: url null opens littlesearch.html titled "New little window" with a focused field', rs.ok && !!lsp && (await lsp.title()) === 'New little window' && (await lsp.evaluate(() => document.activeElement && document.activeElement.id)) === 'q');
     check('v2.8 littlesearch: an unused search window is not listed in Temporary', (await tempRows()) === 0);
-    if (sp) {
-      await sp.fill('#q', `127.0.0.1:${PORT}/delta.html`);
-      await sp.press('#q', 'Enter');
+    if (lsp) {
+      await lsp.fill('#q', `127.0.0.1:${PORT}/delta.html`);
+      await lsp.press('#q', 'Enter');
       await until(async () => { const e = await entryOf(rs.entryId); return e?.url === U('delta') && /Delta/.test(e.title); });
       check('v2.8 littlesearch: Enter on a URL navigates this tab and the entry follows it', (await entryOf(rs.entryId))?.url === U('delta') && /Delta/.test((await entryOf(rs.entryId))?.title || ''), JSON.stringify(await entryOf(rs.entryId)));
       await sleep(400);
@@ -874,20 +888,20 @@ async function main() {
 
     // settings controls
     await setSync({ littleStyle: 'minimal', littleMaxOpen: 3, temporaryMinutes: 360 }); await sleep(300);
-    await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
-    const lt = panel.locator('[data-testid="settings-little"]');
-    check('v2.8 settings: Little windows section with all controls', (await lt.isVisible()) && (await panel.locator('[data-testid="little-default-browser"]').count()) === 1 && (await panel.locator('[data-testid="little-style"] .seg-b').count()) === 2 && (await panel.locator('[data-testid="little-max-open"]').count()) === 1 && (await panel.locator('[data-testid="temporary-expiry"]').count()) === 1 && /Control\+Option\+N/.test(await lt.innerText()));
-    check('v2.8 settings: defaults are Minimal, 3, 6 hours', (await panel.locator('[data-testid="little-style"] [data-style="minimal"]').getAttribute('aria-pressed')) === 'true' && (await panel.locator('[data-testid="little-max-open"]').inputValue()) === '3' && (await panel.locator('[data-testid="temporary-expiry"]').inputValue()) === '360');
-    check('v2.8 settings: expiry choices are 1 h / 6 h / 12 h / 24 h / Never', (await panel.locator('[data-testid="temporary-expiry"] option').allInnerTexts()).join() === '1 hour,6 hours,12 hours,24 hours,Never');
-    await panel.locator('[data-testid="little-style"] [data-style="regular"]').click();
-    await panel.locator('[data-testid="little-max-open"]').selectOption('4');
-    await panel.locator('[data-testid="temporary-expiry"]').selectOption('60');
+    await openSettings('little');
+    const lt = sp.locator('[data-testid="settings-little"]');
+    check('v2.8 settings: Little windows section with all controls', (await lt.isVisible()) && (await sp.locator('[data-testid="little-default-browser"]').count()) === 1 && (await sp.locator('[data-testid="little-style"] .seg-b').count()) === 2 && (await sp.locator('[data-testid="little-max-open"]').count()) === 1 && (await sp.locator('[data-testid="temporary-expiry"]').count()) === 1 && /Control\+Option\+N/.test(await lt.innerText()));
+    check('v2.8 settings: defaults are Minimal, 3, 6 hours', (await sp.locator('[data-testid="little-style"] [data-style="minimal"]').getAttribute('aria-pressed')) === 'true' && (await sp.locator('[data-testid="little-max-open"]').inputValue()) === '3' && (await sp.locator('[data-testid="temporary-expiry"]').inputValue()) === '360');
+    check('v2.8 settings: expiry choices are 1 h / 6 h / 12 h / 24 h / Never', (await sp.locator('[data-testid="temporary-expiry"] option').allInnerTexts()).join() === '1 hour,6 hours,12 hours,24 hours,Never');
+    await sp.locator('[data-testid="little-style"] [data-style="regular"]').click();
+    await sp.locator('[data-testid="little-max-open"]').selectOption('4');
+    await sp.locator('[data-testid="temporary-expiry"]').selectOption('60');
     await sleep(500);
     const sv = await swEval(async () => chrome.storage.sync.get(['littleStyle', 'littleMaxOpen', 'temporaryMinutes']));
     check('v2.8 settings: style, max open and expiry are stored in storage.sync', sv.littleStyle === 'regular' && sv.littleMaxOpen === 4 && sv.temporaryMinutes === 60, JSON.stringify(sv));
-    check('v2.8 settings: the style hint explains the trade-off', /moves the live tab/.test(await panel.locator('#little-style-hint').innerText()));
-    await panel.screenshot({ path: path.join(OUT, '12-little-settings.png') });
-    const sw2 = panel.locator('[data-testid="little-default-browser"]');
+    check('v2.8 settings: the style hint explains the trade-off', /moves the live tab/.test(await sp.locator('#little-style-hint').innerText()));
+    await sp.screenshot({ path: path.join(OUT, '12-little-settings.png') });
+    const sw2 = sp.locator('[data-testid="little-default-browser"]');
     check('v2.8 settings: the default-browser switch is enabled while the app is connected', (await sw2.isEnabled()) && !(await sw2.isChecked()));
     const stjL = () => JSON.parse(fs.readFileSync(path.join(helperDir, 'state.json'), 'utf8'));
     await sw2.check(); await sleep(700);
@@ -898,7 +912,39 @@ async function main() {
     check('v2.8 settings: unchecking sends enabled:false', stjL().littleLinksEnabled === false && !(await sw2.isChecked()));
     await setSync({ littleStyle: 'minimal', littleMaxOpen: 3, temporaryMinutes: 360 });
     await sleep(300);
-    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+    await closeSettings();
+
+    // ---- v3.0: ⌘O (content-script path) promotes a little window's page; in a normal tab it does nothing
+    {
+      const isL = async (tabId) => swEval(async (id) => { const t = await chrome.tabs.get(id); return (await chrome.windows.get(t.windowId)).type !== 'normal'; }, tabId);
+      const tabMain = async (id) => swEval(async ([t, w]) => (await chrome.tabs.get(t)).windowId === w, [id, mainWin]);
+      // normal tab: ⌘O is left alone
+      const nTabs0 = await swEval(async () => (await chrome.tabs.query({})).length);
+      const nt = await swEval(async ([w, u]) => (await chrome.tabs.create({ windowId: w, url: u, active: true })).id, [mainWin, U('golf') + '?cmdo=1']);
+      await sleep(1200);
+      const npg = ctx.pages().find((p) => p.url().includes('cmdo=1'));
+      await npg.bringToFront(); await npg.keyboard.press('Meta+o'); await sleep(900);
+      const nTabs1 = await swEval(async () => (await chrome.tabs.query({})).length);
+      check('v3.0 ⌘O: in a normal tab it does not promote or open anything', nTabs1 === nTabs0 + 1 && (await tabMain(nt)) && (await cmd({ cmd: 'debugState' })).temporary.length === 0, `${nTabs0} ${nTabs1}`);
+      await swEval(async (id) => chrome.tabs.remove(id), nt);
+      // little window: the page's content script asks the worker, intercepts ⌘O and promotes the tab into the main window
+      const rl = await cmd({ cmd: 'openLittle', url: U('golf') + '?cmdo=2' });
+      await sleep(1500);
+      const ask = await swEval(async (id) => { const t = await chrome.tabs.get(id); return { win: t.windowId }; }, rl.tabId);
+      check('v3.0 ⌘O: the little window is a popup (isLittleTab asked by its page)', await isL(rl.tabId));
+      const lpg = ctx.pages().find((p) => p.url().includes('cmdo=2'));
+      await lpg.bringToFront(); await lpg.keyboard.press('Meta+o');
+      const inMain = async () => swEval(async (w) => (await chrome.tabs.query({ windowId: w })).filter((t) => (t.url || '').includes('cmdo=2')).map((t) => t.id), mainWin);
+      let promoted = [];
+      for (let t = 0; t < 6000 && !promoted.length; t += 200) { await sleep(200); promoted = await inMain(); }
+      check('v3.0 ⌘O: in a little window the content script intercepts it and the page opens as a tab in the main window (entry gone)', promoted.length === 1 && (await cmd({ cmd: 'debugState' })).temporary.length === 0, JSON.stringify([ask, promoted]));
+      for (const id of promoted) await swEval(async (i) => chrome.tabs.remove(i).catch(() => {}), id);
+      const noTab = await cmd({ cmd: 'promoteLittle', tabId: 999999 });
+      check('v3.0 promoteLittle {tabId}: unknown tab is refused', noTab && noTab.ok === false);
+      const il = await cmd({ cmd: 'isLittleTab' });
+      check('v3.0 isLittleTab: without a sender tab answers "not little"', il && il.ok === true && il.little === false);
+      await sleep(500);
+    }
 
     // ---- pinned tabs come back after a restart
     const pt = await swEval(async (u) => (await chrome.tabs.create({ windowId: (await chrome.windows.getAll({ windowTypes: ['normal'] }))[0].id, url: u, active: true })).id, U('foxtrot'));
@@ -931,13 +977,13 @@ async function main() {
     await swEval(async ([t, u]) => chrome.tabs.update(t, { url: u }), [pt, U('other-foxtrot')]);
     await sleep(1800);
     check('v2.8 pinned: nothing is reset during a session', (await tabUrl(pt)) === U('other-foxtrot'));
-    await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
-    const prs = panel.locator('[data-testid="pinned-reset-on-restart"]');
+    await openSettings('tabs');
+    const prs = sp.locator('[data-testid="pinned-reset-on-restart"]');
     check('v2.8 settings: "Reset pinned tabs when Chrome restarts" is present, on by default', (await prs.isVisible()) && (await prs.isChecked()));
     await prs.uncheck(); await sleep(400);
     check('v2.8 settings: the switch is stored as storage.sync.pinnedResetOnRestart', (await swEval(async () => (await chrome.storage.sync.get('pinnedResetOnRestart')).pinnedResetOnRestart)) === false);
     await prs.check(); await sleep(300);
-    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+    await closeSettings();
     // an unmatched record is dropped by the final pass
     await swEval(async () => chrome.storage.local.set({ boundTabs: [{ bookmarkId: 'nope', url: 'http://gone.example/', windowIndex: 0, index: 0 }] }));
     await cmd({ cmd: 'debugRematch', mode: 'startup' });
@@ -984,8 +1030,8 @@ async function main() {
     check('v2.7: context menu item exists while connected (checkbox, action context, checked)', menu()?.type === 'checkbox' && menu().checked === true && menu().contexts?.[0] === 'action', JSON.stringify(d.contextMenus));
     check('v2.7: offline card hidden while connected', (await panel.locator('[data-testid="app-offline-card"]').isVisible()) === false);
 
-    await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
-    const sw = panel.locator('[data-testid="overlay-enabled"]');
+    await openSettings('app');
+    const sw = sp.locator('[data-testid="overlay-enabled"]');
     check('v2.7: settings switch present, checked by default', (await sw.isVisible()) && (await sw.isChecked()));
     await sw.uncheck(); await sleep(600);
     const stj = () => JSON.parse(fs.readFileSync(path.join(helperDir, 'state.json'), 'utf8'));
@@ -995,7 +1041,7 @@ async function main() {
     host.broadcast({ type: 'overlayEnabled', enabled: true }); await sleep(600);
     d = await dbg();
     check('v2.7: broadcast from the app updates switch and menu', (await sw.isChecked()) && menu()?.checked === true && d.settings?.overlayEnabled === true);
-    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+    await closeSettings();
 
     // drop the connection (the app "quit")
     for (const c of [...host.conns]) c.sock.destroy();
@@ -1006,9 +1052,9 @@ async function main() {
     check('v2.7: context menu removed while disconnected', !menu(), JSON.stringify(d.contextMenus));
     await sleep(500);
     const card = panel.locator('[data-testid="app-offline-card"]');
-    await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
-    check('v2.8 settings: the default-browser switch is disabled with a hint while the app is offline', (await panel.locator('[data-testid="little-default-browser"]').isDisabled()) && /Needs Sidebar\.app/.test(await panel.locator('[data-testid="little-default-hint"]').innerText()));
-    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+    await openSettings('little');
+    check('v2.8 settings: the default-browser switch is disabled with a hint while the app is offline', (await sp.locator('[data-testid="little-default-browser"]').isDisabled()) && /Needs Sidebar\.app/.test(await sp.locator('[data-testid="little-default-hint"]').innerText()));
+    await closeSettings();
     check('v2.7: offline card shown with both buttons', (await card.isVisible()) && /isn't running/.test(await card.innerText()) && (await panel.locator('[data-testid="app-offline-open"]').isVisible()) && (await panel.locator('[data-testid="app-offline-retry"]').isVisible()));
     // Retry reconnects (the reference host is still listening)
     await panel.locator('[data-testid="app-offline-retry"]').click();

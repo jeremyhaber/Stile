@@ -95,6 +95,31 @@
     };
     askName();
 
+
+    // ---------- v3.0: ⌘O in a little window promotes it to a full tab ----------
+    // The answer is cached (asked at load and whenever the page becomes visible) because preventDefault has to happen synchronously.
+    let little = false, ownTab = null;
+    const askLittle = () => {
+      try {
+        api.runtime.sendMessage({ cmd: 'isLittleTab' }, (res) => { void api.runtime.lastError; little = !!(res && res.little); ownTab = res && res.tabId != null ? res.tabId : null; });
+      } catch {}
+    };
+    askLittle();
+    // the worker registers a little window just after creating it, which can be after this page's first question
+    setTimeout(() => { if (!little) askLittle(); }, 500);
+    setTimeout(() => { if (!little) askLittle(); }, 2000);
+    window.addEventListener('focus', () => { if (!little) askLittle(); });
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) askLittle(); });
+    window.addEventListener('keydown', (e) => {
+      try {
+        if (!little || ownTab == null || !e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+        if ((e.key || '').toLowerCase() !== 'o') return;
+        e.preventDefault();
+        e.stopPropagation();
+        api.runtime.sendMessage({ cmd: 'promoteLittle', tabId: ownTab }, () => { void api.runtime.lastError; });
+      } catch {}
+    }, true);
+
     api.storage.onChanged.addListener((ch, area) => {
       try {
         if (area !== 'local') return;

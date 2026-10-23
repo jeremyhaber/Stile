@@ -223,6 +223,15 @@ final class HostServer {
     private var missingCache: (list: [(dir: String, name: String)], at: Date)?
     /// Global overlay on/off (state.json `overlayEnabled`, default true); the app is the source of truth.
     private(set) var overlayEnabled: Bool = HostStore.overlayEnabled(from: HostStore.readState())
+    /// v3.0: `appSetting` (app-wide settings relayed by the extension) and `getAppState`. Set by the OverlayManager
+    /// at creation; the closure must hop to the main actor itself. Arguments: message type, message, origin.
+    var onAppMessage: ((String, [String: Any], ProfileBridge) -> Void)?
+
+    /// Names accepted in `appSetting {name, value}` (also accepted as top-level message types).
+    static let appSettingNames: Set<String> = [
+        "setLockstep", "setLaunchAtLogin", "requestScreenCapture", "openAccessibilitySettings", "rescanRail",
+        "quitApp", "setOverlayEnabled", "setDefaultBrowser", "reviewPermissions", "setPinned", "setShowMenuBarIcon",
+    ]
 
     func start() {
         signal(SIGPIPE, SIG_IGN)
@@ -374,6 +383,16 @@ final class HostServer {
             doSetOverlayEnabled(m, c)
         case "setDefaultBrowser":
             doSetDefaultBrowser(m, c)
+        case "appSetting":
+            doAppSetting(m, c)
+        case "getAppState":
+            onAppMessage?("getAppState", m, c)
+        case _ where Self.appSettingNames.contains(type):
+            // Top-level form of an app setting: {type: "setLockstep", value|enabled: ...}.
+            var wrapped: [String: Any] = ["type": "appSetting", "name": type]
+            if let rid = m["requestId"] { wrapped["requestId"] = rid }
+            if let v = m["value"] ?? m["enabled"] { wrapped["value"] = v }
+            doAppSetting(wrapped, c)
         default:
             Log.write("host: unknown message type '\(type)'")
             c.reply(m, ["type": "error", "error": "unknown message type '\(type)'"])
@@ -472,20 +491,54 @@ final class HostServer {
 
     /// v2.8: make this app (or Chrome again) the default browser. Replies when macOS has answered.
     private func doSetDefaultBrowser(_ m: [String: Any], _ c: ProfileBridge) {
-        func effective() -> Bool { (HostStore.currentSettings()["defaultBrowser"] as? Bool) ?? false }
         guard HostStore.isBool(m["enabled"]), let on = m["enabled"] as? Bool else {
-            c.reply(m, ["type": "defaultBrowser", "enabled": effective(), "ok": false, "error": "invalid enabled"])
+            let now = (HostStore.currentSettings()["defaultBrowser"] as? Bool) ?? false
+            c.reply(m, ["type": "defaultBrowser", "enabled": now, "ok": false, "error": "invalid enabled"])
             return
         }
-        LittleLinks.setDefault(on) { [weak self, weak c] err in
-            // Turning it off always sticks (the feature is off even if Chrome could not be restored).
-            if err == nil || !on { _ = HostStore.updateState(["littleLinksEnabled": on]) }
-            let now = effective()
+        setDefaultBrowser(on, from: c) { now, err in
             var reply: [String: Any] = ["type": "defaultBrowser", "enabled": now, "ok": err == nil]
             if let e = err { reply["error"] = e }
-            if let c = c { c.reply(m, reply) }
-            self?.broadcast(except: c, ["type": "defaultBrowser", "enabled": now])
+            c.reply(m, reply)
+        }
+    }
+
+    /// Shared by the extension message and the permissions window. `done` runs on the main queue once macOS
+    /// has answered, before the other connections are told.
+    func setDefaultBrowser(_ on: Bool, from origin: ProfileBridge?, done: @escaping (_ now: Bool, _ error: String?) -> Void) {
+        LittleLinks.setDefault(on) { [weak self] err in
+            // Turning it off always sticks (the feature is off even if Chrome could not be restored).
+            if err == nil || !on { _ = HostStore.updateState(["littleLinksEnabled": on]) }
+            let now = (HostStore.currentSettings()["defaultBrowser"] as? Bool) ?? false
+            done(now, err)
+            self?.broadcast(except: origin, ["type": "defaultBrowser", "enabled": now])
             Settings.post()
+        }
+    }
+
+    /// v3.0: `{type:"appSetting", name, value}` relayed by the extension for the settings page. The two settings
+    /// the host already knew reuse their handlers (and reply with their own message types); the rest are run by
+    /// the OverlayManager and acknowledged with `{type:"appSetting", name, ok}`.
+    private func doAppSetting(_ m: [String: Any], _ c: ProfileBridge) {
+        let name = (m["name"] as? String) ?? ""
+        let value = m["value"]
+        guard Self.appSettingNames.contains(name) else {
+            c.reply(m, ["type": "appSetting", "name": name, "ok": false, "error": "unknown app setting '\(name)'"])
+            return
+        }
+        switch name {
+        case "setOverlayEnabled":
+            var mm = m
+            mm["enabled"] = value ?? NSNull()
+            doSetOverlayEnabled(mm, c)
+        case "setDefaultBrowser":
+            var mm = m
+            mm["enabled"] = value ?? NSNull()
+            doSetDefaultBrowser(mm, c)
+        default:
+            Log.write("host: appSetting \(name)")
+            onAppMessage?("appSetting", m, c)
+            c.reply(m, ["type": "appSetting", "name": name, "ok": true])
         }
     }
 

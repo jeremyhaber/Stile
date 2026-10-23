@@ -5,6 +5,8 @@ import ServiceManagement
 extension Notification.Name {
     static let sidebarSettingsChanged = Notification.Name("ca.simplistics.sidebar.settingsChanged")
     static let sidebarBridgesChanged = Notification.Name("ca.simplistics.sidebar.bridgesChanged")
+    /// v3.0: open the permissions window (page host message or `appSetting` `reviewPermissions`).
+    static let sidebarReviewPermissions = Notification.Name("ca.simplistics.sidebar.reviewPermissions")
 }
 
 // MARK: - Logging (~/Library/Logs/Sidebar.log, rotated at 1 MB)
@@ -80,6 +82,15 @@ enum Settings {
 }
 
 extension Settings {
+    /// v3.1: the menu bar (status item) icon. Default on.
+    static var showMenuBarIcon: Bool {
+        get { UserDefaults.standard.object(forKey: "showMenuBarIcon") as? Bool ?? true }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "showMenuBarIcon")
+            post()
+        }
+    }
+
     /// v2.9: Sidebar.app moves/resizes Chrome's window itself during a toolbar drag or edge resize (default on).
     static var lockstepDrag: Bool {
         get { UserDefaults.standard.bool(forKey: "lockstepDrag") }   // opt-in (default off) until proven on more setups

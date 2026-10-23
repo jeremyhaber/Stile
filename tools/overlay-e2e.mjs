@@ -101,7 +101,15 @@ const toSse = (obj) => {
 };
 const toHelper = (msg) => refApp.sendBridge('Default', msg);
 const hostState = () => toSse({ type: 'hostState', ...app.host });
-const setHost = (patch) => { if (patch.state && !('compact' in patch)) patch = { ...patch, compact: patch.state === 'collapsed' }; Object.assign(app.host, patch); hostState(); };
+const setHost = (patch) => { if (patch.state && !('compact' in patch)) patch = { ...patch, compact: patch.state === 'collapsed' }; Object.assign(app.host, patch); hostState(); refApp.setAppState({ ...app.host }); };
+// The settings window relays app-only settings through the extension (appSetting); this fake app applies them like Sidebar.app would
+// and logs them in hostLog exactly like the matching overlay host messages.
+refApp.on('appSetting', ({ name, value }) => {
+  app.hostLog.push({ action: name, value, t: Date.now(), viaRelay: true });
+  if (name === 'setPinned') setHost({ state: value ? 'pinned' : 'peek' });
+  else if (name === 'setLockstep') setHost({ lockstep: !!value });
+  else if (name === 'setLaunchAtLogin') setHost({ launchAtLogin: !!value });
+});
 refApp.on('fromExt', ({ msg }) => {
   app.fromExt.push({ msg });
   if (msg.type === 'bridgeResult') toSse(msg);
@@ -229,6 +237,7 @@ async function main() {
   panel.on('requestfailed', (r) => { if (process.env.E2E_DEBUG) console.log('requestfailed', r.url().slice(0, 120)); });
   await panel.setViewportSize({ width: 320, height: 860 });
 
+  refApp.setAppState({ ...app.host });
   const ready = await panel.evaluate(() => window.__sidebarReady ? window.__sidebarReady.then((h) => h, () => null) : null);
   check('shim ready resolves with the hello payload', ready && ready.extensionId === extId, JSON.stringify(ready));
   const shape = await panel.evaluate(() => ({
@@ -244,6 +253,20 @@ async function main() {
   const cbStyle = await panel.evaluate(() => new Promise((res) => chrome.tabs.query({}, (t) => res(Array.isArray(t)))));
   check('callback style works', cbStyle === true);
 
+  // v3.0: settings live in their own window (settings.html), opened by the gear through the worker.
+  let sp = null;
+  const openSettings = async (sec) => {
+    if (!sp || sp.isClosed()) {
+      await panel.locator('[data-testid="settings-button"]').click();
+      sp = await until(() => ctx.pages().find((p) => !p.isClosed() && p.url().includes('settings.html')), 8000, 100);
+      await sp.waitForSelector('[data-testid="settings-nav"]');
+    }
+    if (sec) await sp.locator(`[data-testid="settings-nav-${sec}"]`).click();
+    await sleep(400);
+    return sp;
+  };
+  const closeSettings = async () => { if (sp && !sp.isClosed()) await sp.close(); sp = null; await sleep(600); };
+
   // ---- overlay UI
   const todayRows = () => panel.locator('[data-testid="today-list"] > [data-testid="today-row"]').count();
   await until(async () => (await todayRows()) === 5, 8000);
@@ -257,10 +280,10 @@ async function main() {
     return a && b && a.x < b.x && Math.abs((a.y + a.height / 2) - (b.y + b.height / 2)) < 4;
   })());
   check('vertical-tabs hint is hidden while the rail is found', !(await panel.locator('[data-testid="vertical-tabs-hint"]').isVisible()));
-  await panel.locator('[data-testid="settings-button"]').click(); await sleep(300);
-  check('settings: legacy pin-mode select and tips are hidden', !(await panel.locator('[data-testid="settings-pin-mode"]').isVisible()) && !(await panel.locator('[data-testid="left-button"]').isVisible()) && !(await panel.locator('[data-testid="shortcut-button"]').isVisible()));
-  check('settings: App section is visible', await panel.locator('[data-testid="settings-app"]').isVisible());
-  await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(200);
+  await openSettings('app');
+  check('settings: legacy pin-mode select and tips are hidden', !(await sp.locator('[data-testid="settings-pin-mode"]').isVisible()) && !(await sp.locator('[data-testid="left-button"]').isVisible()) && !(await sp.locator('[data-testid="shortcut-button"]').isVisible()));
+  check('settings: App section is visible', await sp.locator('[data-testid="settings-app"]').isVisible());
+  await closeSettings();
 
   // ---- host messages
   check('host: ready was posted', hostCount('ready') >= 1);
@@ -293,9 +316,9 @@ async function main() {
   check('hostState pinned -> pressed, not compact, not float', (await pin.getAttribute('aria-pressed')) === 'true' && !(await cls('compact')) && !(await cls('overlay-float')));
   setHost({ railControllable: false }); await sleep(300);
   check('pinned but rail not controllable -> floats (fallback)', await cls('overlay-float'));
-  await panel.locator('[data-testid="settings-button"]').click(); await sleep(300);
-  check('settings: fallback note shown when the rail cannot be controlled', await panel.locator('[data-testid="app-float-note"]').isVisible());
-  await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(200);
+  await openSettings('app');
+  check('settings: fallback note shown when the rail cannot be controlled', await sp.locator('[data-testid="app-float-note"]').isVisible());
+  await closeSettings();
   setHost({ state: 'peek', railControllable: true }); await sleep(300);
 
   // ---- v2.2 stable layout: the same DOM compact and expanded, icons in a fixed column, nothing moves
@@ -323,9 +346,9 @@ async function main() {
   check('compact: placeholders keep their height (favourites / pinned empty)', sameCol(posExp, posCmp, 'pinnedEmpty', 99, 1) && sameCol(posExp, posCmp, 'favEmpty', 999, 1), JSON.stringify([posExp.pinnedEmpty, posCmp.pinnedEmpty, posExp.favEmpty, posCmp.favEmpty]));
   const fades = await panel.evaluate(() => {
     const cs = (sel) => { const el = document.querySelector(sel).closest('.sec-actions, .act') || document.querySelector(sel); const c = getComputedStyle(el); return { o: c.opacity, pe: c.pointerEvents }; };
-    return { h2: cs('.sec-h h2'), tidy: cs('#tidy'), clear: cs('#clear'), newFolder: cs('#new-folder'), pin: cs('#pin-toggle'), settings: cs('#settings-btn'), newwin: cs('#newwin-btn'), archiveLbl: getComputedStyle(document.querySelector('#archive-btn')).opacity, close: cs('[data-testid="today-close"]') };
+    return { h2: cs('.sec-h h2'), tidy: cs('#tidy'), clear: cs('#clear'), newFolder: cs('#new-folder'), pin: cs('#pin-toggle'), settings: cs('#settings-btn'), archiveLbl: getComputedStyle(document.querySelector('#archive-btn')).opacity, close: cs('[data-testid="today-close"]') };
   });
-  check('compact: section header text, Tidy/Clear, folder-new and footer right side fade out and ignore the pointer', ['h2', 'tidy', 'clear', 'newFolder', 'pin', 'settings', 'newwin', 'close'].every((k) => fades[k].o === '0' && fades[k].pe === 'none') && fades.archiveLbl === '1', JSON.stringify(fades));
+  check('compact: section header text, Tidy/Clear, folder-new and footer right side fade out and ignore the pointer', ['h2', 'tidy', 'clear', 'newFolder', 'pin', 'settings', 'close'].every((k) => fades[k].o === '0' && fades[k].pe === 'none') && fades.archiveLbl === '1', JSON.stringify(fades));
   check('compact: the address field is a 32px square at the same left position, search icon centred', Math.abs(posCmp.addrW - 32) <= 1 && Math.abs(posCmp.addrH - 32) <= 1 && Math.abs(posExp.addrLeft - posCmp.addrLeft) <= 1 && posExp.addrW > 200, JSON.stringify([posExp.addrW, posCmp.addrW, posCmp.addrH]));
   // the address field animates (sample mid-transition) instead of snapping
   const addrMid = await panel.evaluate(async () => {
@@ -374,7 +397,7 @@ async function main() {
   // ---- v2.9 screenshots: the camera button and its menu exist in overlay mode too (native menu through the host), hidden in compact
   {
     const cam = panel.locator('[data-testid="capture-button"]');
-    check('v2.9 overlay: camera button sits in the address row next to Boost and is visible when expanded', await cam.count() === 1 && await cam.isVisible() && await panel.locator('.addr-row [data-testid="boost-button"]').count() === 1);
+    check('v2.9 overlay: camera button sits in the footer next to Boost and is visible when expanded', await cam.count() === 1 && await cam.isVisible() && await panel.locator('#footer [data-testid="boost-button"]').count() === 1);
     const nMenu = hostCount('contextMenu');
     await cam.click();
     await until(() => hostCount('contextMenu') > nMenu, 3000);
@@ -432,92 +455,95 @@ async function main() {
     const NEUTRAL = ['rgb(233, 238, 246)', 'rgb(31, 31, 31)'];
     const themeBg = await bg();
     writePrefs({}); pushP();
-    const profBg = await until(async () => { const b = await bg(); return !NEUTRAL.includes(b) && b !== themeBg ? b : null; }, 20000, 200);
-    check('sidebar colour: auto with no chromeColor/theme seeds from the profile colour (not neutral grey)', !!profBg, String(profBg));
-    await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
-    check('sidebar colour: Automatic is selected and the note says "From your profile colour"',
-      (await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').getAttribute('aria-pressed')) === 'true' &&
-      /From your profile colour/.test(await panel.locator('[data-testid="sidebar-color-note"]').innerText()));
-    check('sidebar colour: no swatches while Automatic', (await panel.locator('[data-testid="sidebar-color-swatch"]:visible').count()) === 0);
-    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="custom"]').click(); await sleep(400);
-    check('sidebar colour: Custom shows 14 swatches and the picker', (await panel.locator('[data-testid="sidebar-color-swatch"]:visible').count()) === 14 && await panel.locator('[data-testid="sidebar-color-picker"]').isVisible());
-    await panel.locator('[data-testid="sidebar-color-swatch"][data-color="#f3e8ff"]').click(); await sleep(400);
+    const profBg = await until(async () => { const b = await bg(); return NEUTRAL.includes(b) && b !== themeBg ? b : null; }, 20000, 200);
+    check('v3.0 default colour: auto with no chromeColor/theme falls back to Chrome\'s default frame colour #e9eef6 (profile colour no longer seeds it)', profBg === 'rgb(233, 238, 246)', String(profBg));
+    await openSettings('appearance');
+    check('sidebar colour: Automatic is selected and the note says "Chrome’s default colour"',
+      (await sp.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').getAttribute('aria-pressed')) === 'true' &&
+      /Chrome.s default colour/.test(await sp.locator('[data-testid="sidebar-color-note"]').innerText()));
+    check('sidebar colour: no swatches while Automatic', (await sp.locator('[data-testid="sidebar-color-swatch"]:visible').count()) === 0);
+    await sp.locator('[data-testid="sidebar-color-mode"] [data-mode="custom"]').click(); await sleep(400);
+    check('sidebar colour: Custom shows 14 swatches and the picker', (await sp.locator('[data-testid="sidebar-color-swatch"]:visible').count()) === 14 && await sp.locator('[data-testid="sidebar-color-picker"]').isVisible());
+    await sp.locator('[data-testid="sidebar-color-swatch"][data-color="#f3e8ff"]').click(); await sleep(400);
     check('sidebar colour: custom swatch sets the exact background', (await bg()) === hexToRgb('#f3e8ff'), await bg());
     const storedSb = JSON.stringify(await swEval(async () => (await chrome.storage.sync.get('sidebarColor')).sidebarColor));
     check('sidebar colour: stored in chrome.storage.sync', (() => { try { const o = JSON.parse(storedSb); return o.mode === 'custom' && o.color === '#f3e8ff'; } catch { return false; } })(), storedSb);
     await panel.screenshot({ path: path.join(SHOTS, 'sidebar-colour-settings.png') });
-    await panel.locator('[data-testid="sidebar-color-picker"]').fill('#204060'); await sleep(500);
+    await sp.locator('[data-testid="sidebar-color-picker"]').fill('#204060'); await sleep(500);
     check('sidebar colour: picker value applies exactly (dark colour -> dark theme, light text)', (await bg()) === hexToRgb('#204060') && (await panel.evaluate(() => document.documentElement.dataset.theme)) === 'dark', await bg());
     await panel.screenshot({ path: path.join(SHOTS, 'sidebar-colour-settings-dark.png') });
-    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(400);
+    await sleep(300);
     await panel.screenshot({ path: path.join(SHOTS, 'sidebar-colour-custom-panel-dark.png') });
-    await panel.locator('[data-testid="settings-button"]').click(); await sleep(300);
+    await sleep(300);
     // another open panel of the profile follows live through storage.onChanged
     await swEval(async () => chrome.storage.sync.set({ sidebarColor: { mode: 'custom', color: '#e6f4ea' } })); await sleep(700);
     check('sidebar colour: storage change applies live', (await bg()) === hexToRgb('#e6f4ea'), await bg());
-    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(400);
+    await sleep(300);
     await panel.screenshot({ path: path.join(SHOTS, 'sidebar-colour-custom-panel.png') });
-    await panel.locator('[data-testid="settings-button"]').click(); await sleep(300);
-    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').click(); await sleep(500);
-    check('sidebar colour: back to Automatic restores the profile-derived colour', (await bg()) === profBg, await bg());
+    await sleep(300);
+    await sp.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').click(); await sleep(500);
+    check('sidebar colour: back to Automatic restores the default colour', (await bg()) === profBg, await bg());
     setHost({ chromeColor: '#3c4043' }); await sleep(500);
-    check('sidebar colour: auto + chromeColor still wins, note says "Matching Chrome exactly"', (await bg()) === hexToRgb('#3c4043') && /Matching Chrome exactly/.test(await panel.locator('[data-testid="sidebar-color-note"]').innerText()), await bg());
-    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="custom"]').click(); await sleep(300);
-    await panel.locator('[data-testid="sidebar-color-swatch"][data-color="#ff9f0a"]').click(); await sleep(400);
+    check('sidebar colour: auto + chromeColor still wins, note says "Matching Chrome exactly"', (await bg()) === hexToRgb('#3c4043') && /Matching Chrome exactly/.test(await sp.locator('[data-testid="sidebar-color-note"]').innerText()), await bg());
+    await sp.locator('[data-testid="sidebar-color-mode"] [data-mode="custom"]').click(); await sleep(300);
+    await sp.locator('[data-testid="sidebar-color-swatch"][data-color="#ff9f0a"]').click(); await sleep(400);
     check('sidebar colour: custom beats chromeColor', (await bg()) === hexToRgb('#ff9f0a'), await bg());
-    await panel.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').click(); await sleep(300);
+    await sp.locator('[data-testid="sidebar-color-mode"] [data-mode="auto"]').click(); await sleep(300);
     setHost({ chromeColor: null }); await sleep(300);
     writePrefs({ user_color: GREEN }); pushP();
     const thBg = await until(async () => { const b = await bg(); return b === themeBg ? b : null; }, 20000, 200);
-    check('sidebar colour: auto with a Chrome theme colour uses the theme estimate', !!thBg && /From your Chrome theme colour/.test(await panel.locator('[data-testid="sidebar-color-note"]').innerText()), String(thBg));
-    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+    check('sidebar colour: auto with a Chrome theme colour uses the theme estimate', !!thBg && /From your Chrome theme colour/.test(await sp.locator('[data-testid="sidebar-color-note"]').innerText()), String(thBg));
+    await closeSettings();
   }
 
   // ---- Settings > App
-  await panel.locator('[data-testid="settings-button"]').click(); await sleep(300);
-  check('App: pinned switch mirrors state (off), version shown', !(await panel.locator('[data-testid="app-pinned"]').isChecked()) && /2\.1\.0-test/.test(await panel.locator('[data-testid="app-version"]').innerText()));
-  check('App: accessibility granted, no "Open settings" button', /granted/i.test(await panel.locator('[data-testid="app-accessibility"]').innerText()) && !(await panel.locator('[data-testid="app-accessibility-open"]').isVisible()));
-  await panel.locator('[data-testid="app-pinned"]').check(); await sleep(300);
+  await openSettings('app');
+  check('App: version shown', /2\.1\.0-test/.test(await sp.locator('[data-testid="app-version"]').innerText()));
+  await openSettings('appearance');
+  check('Appearance: "Keep the sidebar open" switch mirrors state (off)', !(await sp.locator('[data-testid="app-pinned"]').isChecked()));
+  await sp.locator('[data-testid="app-pinned"]').check(); await sleep(300);
   check('App: pinned switch posts setPinned(true) and follows hostState', lastHost('setPinned')?.value === true && (await pin.getAttribute('aria-pressed')) === 'true' && app.host.state === 'pinned');
-  await panel.locator('[data-testid="app-pinned"]').uncheck(); await sleep(300);
+  await sp.locator('[data-testid="app-pinned"]').uncheck(); await sleep(300);
   check('App: pinned switch off posts setPinned(false)', lastHost('setPinned')?.value === false && app.host.state === 'peek');
-  await panel.locator('[data-testid="app-launch-login"]').check(); await sleep(300);
-  check('App: launch at login switch posts setLaunchAtLogin(true)', lastHost('setLaunchAtLogin')?.value === true && await panel.locator('[data-testid="app-launch-login"]').isChecked());
+  await openSettings('app');
+  check('App: accessibility granted, no "Open settings" button', /granted/i.test(await sp.locator('[data-testid="app-accessibility"]').innerText()) && !(await sp.locator('[data-testid="app-accessibility-open"]').isVisible()));
+  await sp.locator('[data-testid="app-launch-login"]').check(); await sleep(300);
+  check('App: launch at login switch posts setLaunchAtLogin(true)', lastHost('setLaunchAtLogin')?.value === true && await sp.locator('[data-testid="app-launch-login"]').isChecked());
   setHost({ launchAtLogin: false }); await sleep(300);
-  check('App: launch at login follows hostState', !(await panel.locator('[data-testid="app-launch-login"]').isChecked()));
-  const ls = panel.locator('[data-testid="app-lockstep"]');
+  check('App: launch at login follows hostState', !(await sp.locator('[data-testid="app-launch-login"]').isChecked()));
+  const ls = sp.locator('[data-testid="app-lockstep"]');
   check('App: lockstep switch mirrors hostState (on)', await ls.isChecked());
   await ls.uncheck(); await sleep(300);
   check('App: lockstep switch posts setLockstep(false) and follows hostState', lastHost('setLockstep')?.value === false && app.host.lockstep === false && !(await ls.isChecked()));
   setHost({ lockstep: true }); await sleep(300);
   check('App: lockstep follows hostState back on', await ls.isChecked());
-  const ovSw = panel.locator('[data-testid="overlay-enabled"]');
+  const ovSw = sp.locator('[data-testid="overlay-enabled"]');
   check('App: "Show sidebar over Chrome\'s tabs" switch present and on', (await ovSw.isVisible()) && (await ovSw.isChecked()));
   await ovSw.uncheck(); await sleep(600);
   check('App: overlay switch sends setOverlayEnabled to the app (state.json)', JSON.parse(fs.readFileSync(path.join(appDir, 'state.json'), 'utf8')).overlayEnabled === false);
   refApp.broadcast({ type: 'overlayEnabled', enabled: true }); await sleep(600);
   check('App: overlay switch follows the app broadcast', await ovSw.isChecked());
   setHost({ accessibility: false }); await sleep(300);
-  check('App: missing accessibility shows status and "Open settings"', /needed/i.test(await panel.locator('[data-testid="app-accessibility"]').innerText()) && await panel.locator('[data-testid="app-accessibility-open"]').isVisible());
-  await panel.locator('[data-testid="app-accessibility-open"]').click(); await sleep(200);
+  check('App: missing accessibility shows status and "Open settings"', /needed/i.test(await sp.locator('[data-testid="app-accessibility"]').innerText()) && await sp.locator('[data-testid="app-accessibility-open"]').isVisible());
+  await sp.locator('[data-testid="app-accessibility-open"]').click(); await sleep(200);
   check('App: "Open settings" posts openAccessibilitySettings', hostCount('openAccessibilitySettings') === 1);
   setHost({ accessibility: true });
-  check('App: Screen Recording row shows "Turn on" and the permission note', await panel.locator('[data-testid="app-screen-capture-on"]').isVisible() && /Match Chrome's colour exactly/.test(await panel.locator('[data-testid="settings-app"]').innerText()) && /Needs Screen Recording permission\. Sidebar only looks at Chrome's window\./.test(await panel.locator('[data-testid="app-screen-capture-note"]').innerText()));
-  await panel.locator('[data-testid="app-screen-capture-on"]').click(); await sleep(200);
+  check('App: Screen Recording row shows "Turn on" and the permission note', await sp.locator('[data-testid="app-screen-capture-on"]').isVisible() && /Match Chrome.s colour exactly/.test(await sp.locator('[data-testid="settings-app"]').innerText()) && /Needs Screen Recording permission\. Sidebar only looks at Chrome.s window\./.test(await sp.locator('[data-testid="app-screen-capture-note"]').innerText()));
+  await sp.locator('[data-testid="app-screen-capture-on"]').click(); await sleep(200);
   check('App: "Turn on" posts requestScreenCapture', hostCount('requestScreenCapture') === 1);
   setHost({ screenCapture: true }); await sleep(300);
-  check('App: screen capture granted shows "On" and no button', /^On$/.test((await panel.locator('[data-testid="app-screen-capture"]').innerText()).trim()) && !(await panel.locator('[data-testid="app-screen-capture-on"]').isVisible()));
+  check('App: screen capture granted shows "On" and no button', /^On$/.test((await sp.locator('[data-testid="app-screen-capture"]').innerText()).trim()) && !(await sp.locator('[data-testid="app-screen-capture-on"]').isVisible()));
   setHost({ screenCapture: false });
-  await panel.locator('[data-testid="app-rescan"]').click(); await sleep(200);
+  await sp.locator('[data-testid="app-rescan"]').click(); await sleep(200);
   check('App: "Find Chrome\'s tab rail again" posts rescanRail', hostCount('rescanRail') === 1);
-  await panel.locator('[data-testid="app-quit"]').click(); await sleep(300);
-  check('App: Quit asks for confirmation first (nothing posted yet)', (await panel.locator('[data-testid="confirm-dialog"]').count()) === 1 && hostCount('quitApp') === 0);
-  await panel.locator('[data-testid="confirm-cancel"]').click(); await sleep(200);
-  check('App: cancelling the confirmation does not quit', hostCount('quitApp') === 0);
-  await panel.locator('[data-testid="app-quit"]').click(); await sleep(300);
-  await panel.locator('[data-testid="confirm-ok"]').click(); await sleep(300);
+  await sp.locator('[data-testid="app-quit"]').click(); await sleep(300);
+  check('App: Quit asks for a second click first (nothing posted yet)', /again/i.test(await sp.locator('[data-testid="app-quit"]').innerText()) && hostCount('quitApp') === 0);
+  await sleep(3800);
+  check('App: the quit confirmation disarms by itself without quitting', /^Quit/.test(await sp.locator('[data-testid="app-quit"]').innerText()) && hostCount('quitApp') === 0);
+  await sp.locator('[data-testid="app-quit"]').click(); await sleep(200);
+  await sp.locator('[data-testid="app-quit"]').click(); await sleep(400);
   check('App: confirming posts quitApp', hostCount('quitApp') === 1);
-  await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(200);
+  await closeSettings();
 
   // ---- vertical-tabs hint (Chrome in horizontal-tabs mode: no rail found)
   setHost({ railFound: false }); await sleep(400);
@@ -918,9 +944,9 @@ async function main() {
   writePrefs({});
   pushProfiles();
   await until(async () => (await bgOf()) === DEF_LIGHT, 20000, 200);
-  check('theme: no user colour -> seeded from the profile colour, never the neutral default (light)', (await bgOf()) !== DEF_LIGHT, await bgOf());
+  check('theme: no user colour -> Chrome\'s default frame colour (the profile colour never seeds it) (light)', (await bgOf()) === DEF_LIGHT, await bgOf());
   await panel.emulateMedia({ colorScheme: 'dark' }); await sleep(400);
-  check('theme: no user colour -> seeded from the profile colour, never the neutral default (dark)', (await bgOf()) !== DEF_DARK, await bgOf());
+  check('theme: no user colour -> Chrome\'s default frame colour (the profile colour never seeds it) (dark)', (await bgOf()) === DEF_DARK, await bgOf());
   await panel.emulateMedia({ colorScheme: 'light' });
   writePrefs({ user_color: GREEN });
   pushProfiles();
@@ -1213,42 +1239,165 @@ async function main() {
     // littlesearch.html screenshot
     const rs = await cmdR({ cmd: 'openLittle', url: null, bounds: { left: 200, top: 120, width: 760, height: 620 } });
     await sleep(1000);
-    const sp = ctx.pages().find((p) => p.url().includes('littlesearch.html'));
-    if (sp) {
-      await sp.setViewportSize({ width: 760, height: 520 });
-      await sp.screenshot({ path: path.join(SHOTS, 'littlesearch.png') });
-      await sp.emulateMedia({ colorScheme: 'dark' });
-      await sp.screenshot({ path: path.join(SHOTS, 'littlesearch-dark.png') });
+    const lsp = ctx.pages().find((p) => p.url().includes('littlesearch.html'));
+    if (lsp) {
+      await lsp.setViewportSize({ width: 760, height: 520 });
+      await lsp.screenshot({ path: path.join(SHOTS, 'littlesearch.png') });
+      await lsp.emulateMedia({ colorScheme: 'dark' });
+      await lsp.screenshot({ path: path.join(SHOTS, 'littlesearch-dark.png') });
     }
-    check('v2.8 littlesearch: the page opened through the bridge, focused field, title "New little window"', !!sp && (await sp.title()) === 'New little window' && (await sp.evaluate(() => document.activeElement.id)) === 'q');
-    if (sp) { await sp.fill('#q', `127.0.0.1:${SITE}/kilo.html`); await sp.press('#q', 'Enter').catch(() => {}); }
+    check('v2.8 littlesearch: the page opened through the bridge, focused field, title "New little window"', !!lsp && (await lsp.title()) === 'New little window' && (await lsp.evaluate(() => document.activeElement.id)) === 'q');
+    if (lsp) { await lsp.fill('#q', `127.0.0.1:${SITE}/kilo.html`); await lsp.press('#q', 'Enter').catch(() => {}); }
     await until(async () => (await swEval(async (id) => (await chrome.tabs.get(id)).url, rs.tabId)) === U('kilo'), 6000);
     check('v2.8 littlesearch: Enter navigates this tab', (await swEval(async (id) => (await chrome.tabs.get(id)).url, rs.tabId)) === U('kilo'));
     await cmdR({ cmd: 'removeTemporary', entryId: rs.entryId }); await sleep(600);
 
     // settings in the overlay: the Little windows section and the default-browser switch against the reference host
-    await panel.locator('[data-testid="settings-button"]').click(); await sleep(500);
-    const sw = panel.locator('[data-testid="little-default-browser"]');
-    check('v2.8 settings (overlay): controls present; switch enabled while the app is connected', (await panel.locator('[data-testid="settings-little"]').isVisible()) && (await sw.isEnabled()) && (await panel.locator('[data-testid="little-style"]').isVisible()) && (await panel.locator('[data-testid="little-max-open"]').isVisible()) && (await panel.locator('[data-testid="temporary-expiry"]').isVisible()));
+    await openSettings('little');
+    const sw = sp.locator('[data-testid="little-default-browser"]');
+    check('v2.8 settings (overlay): controls present; switch enabled while the app is connected', (await sp.locator('[data-testid="settings-little"]').isVisible()) && (await sw.isEnabled()) && (await sp.locator('[data-testid="little-style"]').isVisible()) && (await sp.locator('[data-testid="little-max-open"]').isVisible()) && (await sp.locator('[data-testid="temporary-expiry"]').isVisible()));
     await sw.check(); await sleep(900);
     check('v2.8 settings (overlay): the switch sends setDefaultBrowser to the app', refApp.readState().littleLinksEnabled === true && (await sw.isChecked()), JSON.stringify(refApp.readState()));
     check('v2.8 hello: the app now reports defaultBrowser true', (await swEval(async () => (await chrome.storage.local.get('defaultBrowser')).defaultBrowser)) === true);
     refApp.broadcast({ type: 'defaultBrowser', enabled: false }); await sleep(700);
     check('v2.8 settings (overlay): a broadcast from the app unchecks it', !(await sw.isChecked()));
-    await panel.locator('#field-little').scrollIntoViewIfNeeded(); await sleep(200);
-    await panel.locator('[data-testid="little-style"] [data-style="regular"]').click(); await sleep(300);
-    await panel.evaluate(() => document.getElementById('field-little').scrollIntoView({ block: 'start' })); await sleep(200);
-    await panel.screenshot({ path: path.join(SHOTS, 'little-windows-settings.png') });
-    await panel.emulateMedia({ colorScheme: 'dark' }); await sleep(400);
-    await panel.screenshot({ path: path.join(SHOTS, 'little-windows-settings-dark.png') });
-    await panel.emulateMedia({ colorScheme: 'light' }); await sleep(300);
+    await sp.locator('[data-testid="little-style"] [data-style="regular"]').click(); await sleep(300);
+    await sp.screenshot({ path: path.join(SHOTS, 'little-windows-settings.png') });
+    await sp.emulateMedia({ colorScheme: 'dark' }); await sleep(400);
+    await sp.screenshot({ path: path.join(SHOTS, 'little-windows-settings-dark.png') });
+    await sp.emulateMedia({ colorScheme: 'light' }); await sleep(300);
     await setSync({ littleStyle: 'minimal', littleMaxOpen: 3, temporaryMinutes: 360 });
-    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+    await closeSettings();
 
     // Clear
     await panel.locator('[data-testid="temp-clear"]').click(); await sleep(800);
     check('v2.8 Clear archives every entry and hides the section', (await rows()) === 0 && (await dbgS()).temporary.length === 0 && (await panel.evaluate(() => document.getElementById('sec-temp').getBoundingClientRect().height)) === 0);
     setHost({ state: 'peek', compact: false, railWidth: 48 }); await sleep(400);
+  }
+
+
+  // ---- v3.0: settings window, split menu, group container, folder indentation, window drag
+  {
+    setHost({ state: 'peek', compact: false, railWidth: 48 }); await sleep(450);
+    // settings window: opens once, is reused, every section renders
+    await closeSettings();
+    const nSet = () => ctx.pages().filter((p) => !p.isClosed() && p.url().includes('settings.html')).length;
+    await panel.locator('[data-testid="settings-button"]').click(); await sleep(900);
+    await panel.locator('[data-testid="settings-button"]').click(); await sleep(900);
+    check('v3.0 settings: the gear opens one settings window and reuses it on the second click', nSet() === 1, String(nSet()));
+    sp = ctx.pages().find((p) => p.url().includes('settings.html'));
+    const secs = ['general', 'appearance', 'tabs', 'windows', 'little', 'screenshots', 'boosts', 'profiles', 'app'];
+    const seen = [];
+    for (const id of secs) {
+      await sp.locator(`[data-testid="settings-nav-${id}"]`).click(); await sleep(150);
+      seen.push(((await sp.locator(`[data-testid="settings-section-${id}"], [data-testid="settings-${id}"]`).first().isVisible())) && ((await sp.locator('[data-testid="settings-title"]').innerText()).trim().length > 0));
+    }
+    check('v3.0 settings: all nine sections render (General, Appearance, Tabs & Archive, Windows, Little windows, Screenshots, Boosts, Profiles, App)', seen.every(Boolean), seen.join());
+    const winType = await swEval(async () => { const t = (await chrome.tabs.query({ url: chrome.runtime.getURL('settings.html') + '*' }))[0]; return (await chrome.windows.get(t.windowId)).type; });
+    check('v3.0 settings: opens in a popup window', winType === 'popup', winType);
+    // app-only settings travel panel -> worker -> native port -> app and the app state comes back
+    check('v3.0 settings: app-only switches reached the app through the worker (appSetting relay)', app.hostLog.some((x) => x.viaRelay && x.action === 'setLockstep') && app.hostLog.some((x) => x.viaRelay && x.action === 'setLaunchAtLogin'));
+    const relayed = await sp.evaluate(() => new Promise((res) => chrome.runtime.sendMessage({ cmd: 'appSetting', name: 'rescanRail', value: true }, res)));
+    const bogus = await sp.evaluate(() => new Promise((res) => chrome.runtime.sendMessage({ cmd: 'appSetting', name: 'formatDisk', value: true }, res)));
+    const nRescan = hostCount('rescanRail');
+    check('v3.0 settings: appSetting accepts known names and refuses unknown ones', relayed?.ok === true && bogus?.ok === false && nRescan >= 1, JSON.stringify([relayed, bogus]));
+    setHost({ lockstep: false, appVersion: '9.9.9-test' }); await sleep(500);
+    const as = await sp.evaluate(() => new Promise((res) => chrome.runtime.sendMessage({ cmd: 'appState' }, res)));
+    check('v3.0 settings: appState returns the latest state pushed by the app', as?.ok && as.connected && as.state?.appVersion === '9.9.9-test' && as.state?.lockstep === false, JSON.stringify(as));
+    setHost({ lockstep: true, appVersion: '2.1.0-test' });
+    await closeSettings();
+
+    // split menu: the split icon is a button that posts a native menu; "Close right tab" closes that half
+    const pair = await swEval(async ([w, ua, ub]) => {
+      const a = await chrome.tabs.create({ windowId: w, url: ua, active: false });
+      const b = await chrome.tabs.create({ windowId: w, url: ub, active: false });
+      return [a.id, b.id];
+    }, [mainWin, U('india'), U('juliet')]);
+    app.splitMap = { ...app.splitMap, [pair[0]]: 91, [pair[1]]: 91 };
+    await swEval(async () => { const t = await chrome.tabs.create({ url: 'about:blank', active: false }); await chrome.tabs.remove(t.id); });
+    const rowOfPair = panel.locator('[data-testid="split-row"]').last();
+    await until(async () => (await rowOfPair.locator('[data-testid="split-menu"]').count()) === 1, 6000);
+    const smb = rowOfPair.locator('[data-testid="split-menu"]');
+    check('v3.0 split: the split icon at the right of a split row is a button (split-menu)', await smb.isVisible() && (await smb.evaluate((e) => e.tagName)) === 'BUTTON');
+    const nm0 = hostCount('contextMenu');
+    await smb.click();
+    await until(() => hostCount('contextMenu') > nm0, 3000);
+    const smItems = (lastHost('contextMenu')?.value.items || []).filter((i) => i.label);
+    const smLabels = smItems.map((i) => i.label);
+    check('v3.0 split: menu offers Swap sides, Close left tab, Close right tab, Move to new window (+ Separate when supported)', ['Swap sides', 'Close left tab', 'Close right tab', 'Move to new window'].every((l) => smLabels.includes(l)) && (smLabels.includes('Separate') === (await swEval(() => typeof chrome.tabs.unsplit === 'function'))), smLabels.join());
+    await panel.evaluate((id) => window.__sidebarMenuResult(id), smItems.find((i) => i.label === 'Close right tab').id); await sleep(800);
+    const alive = await swEval(async (ids) => { const out = []; for (const id of ids) out.push(await chrome.tabs.get(id).then(() => true, () => false)); return out; }, pair);
+    check('v3.0 split: "Close right tab" closes the right half only', alive[0] === true && alive[1] === false, JSON.stringify(alive));
+    await swEval(async (id) => chrome.tabs.remove(id).catch(() => {}), pair[0]);
+    app.splitMap = Object.fromEntries(Object.entries(app.splitMap).filter(([k]) => Number(k) !== pair[0] && Number(k) !== pair[1]));
+    await sleep(500);
+
+    // group container (expanded): header (dot, name, count, chevron) + tab rows inside one rounded tinted box, no guide line
+    const gbox = await panel.evaluate((id) => {
+      const head = document.querySelector(`[data-testid="group-row"][data-group-id="${id}"]`);
+      const box = head && head.closest('[data-testid="group-box"]');
+      if (!box) return null;
+      const r = box.getBoundingClientRect(), cs = getComputedStyle(box), hr = head.getBoundingClientRect();
+      const rows = [...box.querySelectorAll('[data-testid="today-row"]')].map((x) => x.getBoundingClientRect());
+      const plain = document.querySelector('[data-testid="today-list"] > [data-testid="today-row"] .fav-ic');
+      const inner = box.querySelector('[data-testid="today-row"] .fav-ic');
+      return { radius: parseFloat(cs.borderTopLeftRadius), bgA: cs.backgroundColor, left: r.left, right: r.right, vw: innerWidth, topOk: hr.top >= r.top - 1, bottomOk: rows.every((x) => x.bottom <= r.bottom + 1), n: rows.length,
+        guides: document.querySelectorAll('.guide').length, count: !!head.querySelector('.gcount'), chev: !!head.querySelector('.chev, .gchev, svg'), icX: inner ? inner.getBoundingClientRect().left + inner.getBoundingClientRect().width / 2 : null, plainX: plain ? plain.getBoundingClientRect().left + plain.getBoundingClientRect().width / 2 : null };
+    }, gid);
+    check('v3.0 group: the header and its tabs share one rounded container (radius >= 12) tinted with the group colour', !!gbox && gbox.radius >= 12 && !/rgba\(0, 0, 0, 0\)/.test(gbox.bgA) && gbox.topOk && gbox.bottomOk && gbox.n >= 1, JSON.stringify(gbox));
+    check('v3.0 group: container sits inset from the sidebar edges, count + chevron in the header, no guide line', !!gbox && gbox.left >= 3 && gbox.vw - gbox.right >= 3 && gbox.guides === 0 && gbox.count && gbox.chev, JSON.stringify(gbox));
+    check('v3.0 group: tabs inside keep the normal icon column (same x as other rows)', !!gbox && gbox.icX != null && gbox.plainX != null && Math.abs(gbox.icX - gbox.plainX) <= 1, JSON.stringify([gbox?.icX, gbox?.plainX]));
+
+    // folder: children indented by 16 in expanded mode, back in the icon column when compact; y stays put
+    const mk = await swEval(async () => {
+      const roots = (await chrome.storage.local.get('roots')).roots;
+      const parent = roots && roots.pinned;
+      if (!parent) return null;
+      const f = await chrome.bookmarks.create({ parentId: parent, title: 'Reading list' });
+      await chrome.bookmarks.create({ parentId: f.id, title: 'Kid one', url: 'http://127.0.0.1/kid1.html' });
+      await chrome.bookmarks.create({ parentId: f.id, title: 'Kid two', url: 'http://127.0.0.1/kid2.html' });
+      return f.id;
+    });
+    if (mk) {
+      await until(async () => (await panel.locator('[data-testid="pinned-folder"]').count()) >= 1, 6000);
+      const fold = panel.locator('[data-testid="pinned-folder"]').first();
+      if ((await fold.getAttribute('aria-expanded')) !== 'true') { await fold.click(); await sleep(500); }
+      const geo = () => panel.evaluate(() => {
+        const ic = (el) => { const b = el.querySelector('.fav-ic, .ic, svg').getBoundingClientRect(); return { x: b.left + b.width / 2, y: b.top + b.height / 2 }; };
+        const f = document.querySelector('[data-testid="pinned-folder"]');
+        const kids = [...document.querySelectorAll('[data-testid="pinned-row"]')].filter((r) => f.parentElement.contains(r) || r.closest('.fbody, .folder-body, .group-body') || true);
+        const k = kids.filter((r) => /Kid/.test(r.textContent));
+        return { f: ic(f), kids: k.map(ic), guides: document.querySelectorAll('.guide').length, chevOnFolder: !!f.querySelector('.chev, .fchev, .pchev') };
+      });
+      const gx = await geo();
+      check('v3.0 folder (expanded): children are indented 16px (icon and text), folder has no guide line', gx.kids.length === 2 && gx.kids.every((k) => Math.abs(k.x - gx.f.x - 16) <= 2) && gx.guides === 0, JSON.stringify(gx));
+      setHost({ compact: true, railWidth: 56 }); await sleep(600);
+      const gc = await geo();
+      check('v3.0 folder (compact): children icons return to the icon column; their y offsets from the folder are unchanged', gc.kids.every((k) => Math.abs(k.x - gc.f.x) <= 1) && gc.kids.every((k, i) => Math.abs((k.y - gc.f.y) - (gx.kids[i].y - gx.f.y)) <= 1), JSON.stringify([gx, gc]));
+      setHost({ compact: false, railWidth: 48 }); await sleep(500);
+      await swEval(async (id) => chrome.bookmarks.removeTree(id), mk);
+      await sleep(500);
+    } else check('v3.0 folder: pinned root available', false, 'no pinned root');
+
+    // dragging empty sidebar space posts beginWindowDrag; dragging a row does not
+    const n1 = hostCount('beginWindowDrag');
+    const bgPoint = await panel.evaluate(() => {
+      const foot = document.getElementById('footer').getBoundingClientRect();
+      return { x: 160, y: Math.round(foot.top - 30) };
+    });
+    await panel.mouse.move(bgPoint.x, bgPoint.y); await panel.mouse.down(); await panel.mouse.up(); await sleep(250);
+    const wd = lastHost('beginWindowDrag');
+    check('v3.0 window drag: mousedown on bare sidebar space posts beginWindowDrag with the point', hostCount('beginWindowDrag') === n1 + 1 && wd.value && Math.abs(wd.value.clientX - bgPoint.x) <= 1 && Math.abs(wd.value.clientY - bgPoint.y) <= 1 && wd.value.clickCount >= 1, JSON.stringify(wd?.value));
+    const rb = await panel.locator('[data-testid="today-row"]').first().boundingBox();
+    await panel.mouse.move(rb.x + 120, rb.y + rb.height / 2); await panel.mouse.down(); await panel.mouse.up(); await sleep(250);
+    const sbtn = await panel.locator('[data-testid="pin-toggle"]').boundingBox();
+    await panel.mouse.move(sbtn.x + sbtn.width / 2, sbtn.y + sbtn.height / 2); await panel.mouse.down(); await panel.mouse.up(); await sleep(250);
+    await panel.locator('[data-testid="address-field"]').click(); await sleep(150);
+    check('v3.0 window drag: rows, buttons and the address field do not start a window drag', hostCount('beginWindowDrag') === n1 + 1, String(hostCount('beginWindowDrag') - n1));
+    await panel.keyboard.press('Escape');
+    await panel.mouse.move(bgPoint.x, bgPoint.y); await panel.mouse.down({ button: 'right' }); await panel.mouse.up({ button: 'right' }); await sleep(200);
+    check('v3.0 window drag: only the left button starts it', hostCount('beginWindowDrag') === n1 + 1);
+    await panel.keyboard.press('Escape'); await sleep(2500);
   }
 
   // ---- connection drop: the extension stops forwarding; reconnecting resumes

@@ -74,7 +74,7 @@ class Client {
     return found;
   }
   async request(m, type) {
-    const rt = { getProfiles: 'profiles', identify: 'identified', switchProfile: 'switchResult', setGlobalSettings: 'settings', setProfileStyle: 'profiles', setOverlayEnabled: 'overlayEnabled', setDefaultBrowser: 'defaultBrowser' };
+    const rt = { getProfiles: 'profiles', identify: 'identified', switchProfile: 'switchResult', setGlobalSettings: 'settings', setProfileStyle: 'profiles', setOverlayEnabled: 'overlayEnabled', setDefaultBrowser: 'defaultBrowser', getAppState: 'appState', appSetting: 'appSetting' };
     this.send(m);
     return this.recv(type ?? rt[m.type] ?? m.type);
   }
@@ -519,6 +519,48 @@ check('SIGTERM: connection removed from host', await wait(() => !host.isConnecte
   const M = spawnClient({ SIDEBAR_APP_DIR: launchDir, SIDEBAR_APP_LAUNCH: `echo started > '${marker}'`, SIDEBAR_CONNECT_TIMEOUT_MS: '800' });
   check('connector: runs SIDEBAR_APP_LAUNCH when the socket is missing', await wait(() => fs.existsSync(marker), 3000));
   await wait(() => M.exited, 3000);
+}
+
+// ------------------------------------------------------------ 12b. v3.0: appSetting relay and appState push
+{
+  const T = spawnClient();
+  await T.request({ type: 'hello' });
+  await T.request({ type: 'identify', profileDir: 'Default', requestId: 31 });
+  await T.recv('overlayStatus');
+  const seen = [];
+  host.on('appSetting', (x) => seen.push(x));
+  r = await T.request({ type: 'appSetting', name: 'setLockstep', value: false, requestId: 32 });
+  check('appSetting: reply {type, name, ok, requestId}', r?.type === 'appSetting' && r.name === 'setLockstep' && r.ok === true && r.requestId === 32, j(r));
+  check('appSetting: emitted to the app with profile, name and value', seen.length === 1 && seen[0].profileDir === 'Default' && seen[0].name === 'setLockstep' && seen[0].value === false, j(seen));
+  for (const name of ['setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'setPinned', 'reviewPermissions', 'setShowMenuBarIcon']) {
+    r = await T.request({ type: 'appSetting', name, value: true, requestId: 'n-' + name });
+    check(`appSetting: ${name} accepted`, r?.ok === true && seen.at(-1)?.name === name, j(r));
+  }
+  const n = seen.length;
+  r = await T.request({ type: 'appSetting', name: 'formatDisk', value: 1, requestId: 33 });
+  check('appSetting: unknown name refused and not emitted', r?.ok === false && !!r.error && seen.length === n, j(r));
+  T.send({ type: 'appSetting', name: 'setLockstep', value: true });
+  await wait(() => seen.length === n + 1);
+  check('appSetting: works without a requestId (fire and forget), no reply', seen.length === n + 1 && await T.quiet(200));
+  r = await T.request({ type: 'getAppState', requestId: 34 });
+  check('getAppState: null before the app reported anything', r?.type === 'appState' && r.state === null && r.requestId === 34, j(r));
+  host.setAppState({ state: 'pinned', lockstep: false, launchAtLogin: true, accessibility: true });
+  r = await T.recv('appState');
+  check('setAppState: pushed to identified extensions as {type:"appState", state} without requestId', r?.state?.lockstep === false && r.state.state === 'pinned' && !('requestId' in r), j(r));
+  r = await T.request({ type: 'getAppState', requestId: 35 });
+  check('getAppState: returns the latest state', r?.state?.launchAtLogin === true && r.requestId === 35, j(r));
+  const T2 = spawnClient();
+  await T2.request({ type: 'hello' });
+  const unidentified = await T2.quiet(200);
+  await T2.request({ type: 'identify', profileDir: 'Profile 1', requestId: 36 });
+  const replay = await T2.recv('appState');
+  check('appState: replayed to an extension that identifies later (not before)', unidentified && replay?.state?.accessibility === true, j(replay));
+  host.appState = null;
+  T2.closeStdin();
+  await wait(() => T2.exited, 3000);
+  T.closeStdin();
+  await wait(() => T.exited, 3000);
+  host.removeAllListeners('appSetting');
 }
 
 // ------------------------------------------------------------ 13. state import

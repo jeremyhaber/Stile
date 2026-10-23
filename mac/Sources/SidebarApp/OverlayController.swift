@@ -29,8 +29,11 @@ final class OverlayController {
     /// Small "Sidebar isn't set up for this profile" pill shown instead of a panel over the rail.
     private let notice = SetupNoticePanel()
     private var noticeCandidates: [(dir: String, name: String)] = []
-    /// v2.8: "Open as tab  \u{2318}O" pill at the top-right of a little window.
+    /// v2.8/v3.0: "Open in Chrome" button in the title bar (right side) of a little window.
     private let littlePill = LittlePillPanel()
+    /// Title-bar height of this little window relative to its top, from AX (nil = not measured yet).
+    private var littleTitleBarRel: CGFloat?
+    private var littleTitleBarFallbackAt = Date.distantPast
     /// This window is a little window (per the extension's windowRoles): no sidebar, no setup pill.
     private(set) var isLittle = false
     /// Global on/off (set by the manager). While off, nothing of ours is on screen.
@@ -106,6 +109,13 @@ final class OverlayController {
 
     /// Tell the manager that a geometry change was made locally (so it runs the follow timer).
     var onLocalGeometryChange: (() -> Void)?
+    /// v3.0: `beginWindowDrag` from the page: (window key, doubleClick). The manager forwards to the DragController.
+    var onWindowDrag: ((Int, Bool) -> Void)?
+    /// v3.0: this controller pushed host state to its page (the manager then pushes `appState` to the extension).
+    var onHostStatePushed: (() -> Void)?
+
+    /// The live extension connection this window is mapped to.
+    var mappedBridge: ProfileBridge? { liveMapped ? bridge : nil }
 
     init(window: ChromeWindow) {
         self.key = window.key
@@ -212,6 +222,8 @@ final class OverlayController {
         if isLittle == on { return }
         isLittle = on
         Log.write("window \(key): \(on ? "little window" : "regular window")")
+        littleTitleBarRel = nil
+        littleTitleBarFallbackAt = .distantPast
         if on {
             visible = false
             hideAll()
@@ -230,10 +242,43 @@ final class OverlayController {
         LittleLinks.promote(bridge: b, windowId: id)
     }
 
-    /// Top-right pill: 8 pt from the window's right edge, below Chrome's title bar.
+    /// Height of the little window's title bar: top of the first AX toolbar / web area minus the window top
+    /// (28 pt when that cannot be read). Cached; a fallback is retried every few seconds.
+    private func littleTitleBarHeight() -> CGFloat {
+        if let h = littleTitleBarRel { return h }
+        if Date().timeIntervalSince(littleTitleBarFallbackAt) < 3 { return 28 }
+        let top = window.frame.minY
+        var best: CGFloat?
+        var queue: [(AXUIElement, Int)] = [(window.element, 0)]
+        var seen = 0
+        while !queue.isEmpty, seen < 80 {
+            let (el, depth) = queue.removeFirst()
+            seen += 1
+            if depth > 0 {
+                let role = AX.string(el, AXName.role) ?? ""
+                if role == "AXToolbar" || role == "AXWebArea", let f = AX.frame(el) {
+                    let rel = f.minY - top
+                    if rel >= 18 && rel <= 70 { best = min(best ?? rel, rel) }
+                }
+            }
+            if depth < 3, let kids = AX.children(el) {
+                for k in kids { queue.append((k, depth + 1)) }
+            }
+        }
+        if let b = best {
+            littleTitleBarRel = b
+            return b
+        }
+        littleTitleBarFallbackAt = Date()
+        return 28
+    }
+
+    /// Right side of the title bar, vertically centred, 8 pt from the window's right edge.
     private func layoutLittlePill(in frame: CGRect) {
         let size = littlePill.pillSize
-        let ax = CGRect(x: frame.maxX - 8 - size.width, y: frame.minY + 40, width: size.width, height: size.height)
+        let barH = littleTitleBarHeight()
+        let ax = CGRect(x: frame.maxX - 8 - size.width, y: frame.minY + (barH - size.height) / 2,
+                        width: size.width, height: size.height)
         let ns = Geometry.flip(ax)
         if littlePill.frame != ns { littlePill.setFrame(ns, display: true) }
     }
@@ -891,7 +936,7 @@ final class OverlayController {
     }
 
     /// `requestScreenCapture` from the page: ask, then re-check every second for 30 s.
-    private func startCaptureRequest() {
+    func startCaptureRequest() {
         Permissions.requestScreenCapture()
         captureDeadline = Date().addingTimeInterval(30)
         captureTimer?.invalidate()
@@ -1141,6 +1186,15 @@ final class OverlayController {
             pushHostState(force: true)
         case "setPinned":
             setPinned(boolValue(value))
+        case "beginWindowDrag":
+            // v3.0: mousedown on empty sidebar space. {clientX, clientY, clickCount|detail} (all optional).
+            let d = value as? [String: Any]
+            let clicks = JSONUtil.int(d?["clickCount"]) ?? JSONUtil.int(d?["detail"]) ?? 1
+            onWindowDrag?(key, clicks >= 2 || boolValue(d?["doubleClick"]))
+        case "windowDoubleClick":
+            onWindowDrag?(key, true)
+        case "reviewPermissions":
+            NotificationCenter.default.post(name: .sidebarReviewPermissions, object: nil)
         case "setLockstep":
             Settings.lockstepDrag = boolValue(value)   // posts; the manager calls settingsChanged
         case "setPeekWidth":
@@ -1233,6 +1287,13 @@ final class OverlayController {
     }
 
     func pushHostState(force: Bool = false) {
+        sidebar.sendHostState(hostStateObject(), force: force)
+        onHostStatePushed?()
+    }
+
+    /// The host state object sent to the page (`__sidebarHostState`) and, plus app-wide fields, to the extension
+    /// as `appState` (see OverlayManager).
+    func hostStateObject() -> [String: Any] {
         let s = state
         noteRailWidths()
         var obj: [String: Any] = [
@@ -1249,9 +1310,10 @@ final class OverlayController {
             "railWidth": Int(lastCollapsedRailWidth.rounded()),
             "overlayEnabled": overlayEnabled,
             "lockstep": Settings.lockstepDrag,
+            "showMenuBarIcon": Settings.showMenuBarIcon,
         ]
         if let c = chromeColor { obj["chromeColor"] = c } else { obj["chromeColor"] = NSNull() }
-        sidebar.sendHostState(obj, force: force)
+        return obj
     }
 
     // MARK: Page calls

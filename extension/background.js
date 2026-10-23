@@ -412,7 +412,7 @@ function connectHelper() {
   p.onMessage.addListener((m) => { try { onHelperMessage(m); } catch (e) { console.warn(e); } });
   p.onDisconnect.addListener(() => {
     const msg = (chrome.runtime.lastError && chrome.runtime.lastError.message) || '';
-    if (port === p) port = null;
+    if (port === p) { port = null; chrome.storage.session.remove('appState').catch(() => {}); }
     // No app on the other end any more: stop forwarding bridge events.
     handleBridgeMessage({ type: 'overlayStatus', connected: false }).catch(() => {});
     failAllWaiting(new Error(msg || 'helper disconnected'));
@@ -434,10 +434,12 @@ function onHelperMessage(m) {
   }
   if (m.type === 'bridge' || m.type === 'overlayStatus') handleBridgeMessage(m).catch(() => {});
   else if (m.type === 'activate') activateWindow(m.bounds).catch(() => {});
+  else if (m.type === 'openSettings') commands.openSettings({}).catch(() => {});   // menu bar "Settings…"
   else if (m.type === 'profiles' && Array.isArray(m.profiles)) {
     enqueue(() => setHelper({ profiles: m.profiles })).catch(() => {});
   }
   else if (m.type === 'overlayEnabled' && !m.requestId) storeOverlayEnabled(m.enabled).catch(() => {});
+  else if (m.type === 'appState' && m.state && typeof m.state === 'object') chrome.storage.session.set({ appState: m.state }).catch(() => {});
   else if (m.type === 'defaultBrowser' && typeof m.enabled === 'boolean') chrome.storage.local.set({ defaultBrowser: m.enabled }).catch(() => {});
   else if (m.type === 'settings' && m.settings && typeof m.settings.archiveDefaultMinutes === 'number') {
     chrome.storage.local.set({ globalDefaultMinutes: m.settings.archiveDefaultMinutes }).catch(() => {});
@@ -1101,7 +1103,9 @@ async function restoreBoundTabs(final) {
 }
 
 // ---------------------------------------------------------------- commands
-const unqueued = new Set(['switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle', 'setOverlayEnabled', 'setDefaultBrowser']);
+const unqueued = new Set(['openSettings', 'appSetting', 'appState', 'isLittleTab', 'switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle', 'setOverlayEnabled', 'setDefaultBrowser']);
+
+const APP_SETTINGS = new Set(['setPinned', 'setLockstep', 'setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'reviewPermissions', 'setShowMenuBarIcon', 'setOverlayEnabled', 'setDefaultBrowser']);
 
 const commands = {
   async ensureRoots() {
@@ -1680,12 +1684,13 @@ const commands = {
 
   // Make a Temporary link an ordinary Today tab in the main window. Regular little windows move the live tab; popups can't move, so the
   // URL is reopened in the main window (scroll position carried over).
-  async promoteLittle({ entryId, windowId }) {
+  async promoteLittle({ entryId, windowId, tabId }) {
     const temp = await getTemp();
-    // Sidebar.app only knows Chrome window ids (pill / ⌘O), so accept either.
-    const e = temp.find((x) => (entryId != null && x.id === entryId) || (entryId == null && windowId != null && x.windowId === windowId));
+    // Sidebar.app only knows Chrome window ids (pill / ⌘O), and the page's own ⌘O handler only its tab id, so accept any of them.
+    const e = temp.find((x) => (entryId != null && x.id === entryId) || (entryId == null && windowId != null && x.windowId === windowId) || (entryId == null && windowId == null && tabId != null && x.tabId === tabId));
     if (e) entryId = e.id;
     if (!e) return { ok: false, error: 'No such temporary link' };
+    if (isSearchUrl(e.url)) return { ok: false, error: 'Open a page first' };
     let target = null;
     try { target = (await resolveMain()).main; } catch { /* ignore */ }
     if (target == null) { const w = await pickNormalWindow(); target = w ? w.id : null; }
@@ -1774,6 +1779,56 @@ const commands = {
     } catch (e) { console.warn('[sidebar] new tab', e && e.message); }
     await removeTabs([tabId]);
     return { ok: true, entryId: temp[0].id };
+  },
+
+  // ---- v3.0: the settings window and the app-only settings it relays
+  // One settings window per profile: reuse and focus it when it is open (optionally jumping to a section: "profiles" or "profiles:<dir>").
+  async openSettings({ section } = {}) {
+    const base = chrome.runtime.getURL('settings.html');
+    const url = base + (section ? '#' + section : '');
+    let tabs = [];
+    try { tabs = await chrome.tabs.query({ url: base + '*' }); } catch { /* ignore */ }
+    const t = tabs.find((x) => x.windowId != null);
+    if (t) {
+      try { if (section) await chrome.tabs.update(t.id, { url }); } catch { /* ignore */ }
+      try { await chrome.windows.update(t.windowId, { focused: true, drawAttention: true }); } catch { /* ignore */ }
+      try { await chrome.tabs.update(t.id, { active: true }); } catch { /* ignore */ }
+      return { ok: true, windowId: t.windowId, reused: true };
+    }
+    const o = { url, type: 'popup', width: 860, height: 640, focused: true };
+    try {
+      const lf = await chrome.windows.getLastFocused();
+      if (lf && Number.isFinite(lf.left) && Number.isFinite(lf.width) && lf.state === 'normal') {
+        o.left = Math.max(0, Math.round(lf.left + (lf.width - o.width) / 2));
+        o.top = Math.max(0, Math.round((lf.top || 0) + 40));
+      }
+    } catch { /* ignore */ }
+    const w = await chrome.windows.create(o);
+    return { ok: true, windowId: w.id, reused: false };
+  },
+
+  // Relay an app-only setting to Sidebar.app over the native connection. The app applies it and pushes a new `appState`.
+  async appSetting({ name, value }) {
+    if (!APP_SETTINGS.has(name)) return { ok: false, error: 'Unknown setting' };
+    if (name === 'setOverlayEnabled') return await commands.setOverlayEnabled({ enabled: !!value });
+    if (name === 'setDefaultBrowser') return await commands.setDefaultBrowser({ enabled: !!value });
+    if (!port) return { ok: false, error: 'Sidebar.app isn’t running' };
+    try { port.postMessage({ type: 'appSetting', name, value }); } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+    return { ok: true };
+  },
+
+  // The app's latest host state (pushed as {type:"appState", state}); null when the app isn't connected.
+  async appState() {
+    const connected = helperConnected();
+    const st = connected ? (await sget('session', 'appState', null)) : null;
+    return { ok: true, connected, state: st };
+  },
+
+  // ⌘O from a page's content script: is the asking tab in a little window?
+  async isLittleTab(_msg, sender) {
+    const tab = sender && sender.tab;
+    if (!tab || tab.id == null) return { ok: true, little: false };
+    return { ok: true, little: (await littleIds()).has(tab.windowId), tabId: tab.id };
   },
 
   async setDefaultBrowser({ enabled }) {
@@ -2071,7 +2126,7 @@ function dispatchCommand(msg, sender) {
       .then((r) => (r !== undefined ? r : handleBoostCommand(msg, sender)))
       .then((r) => (r === undefined ? { ok: false, error: 'Unknown command' } : r));
   }
-  const fn = () => commands[msg.cmd](msg);
+  const fn = () => commands[msg.cmd](msg, sender);
   return unqueued.has(msg.cmd) ? fn() : enqueue(fn);
 }
 

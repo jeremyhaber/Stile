@@ -74,18 +74,49 @@ export async function presign({ method = 'GET', url, region, service = 's3', acc
 
 // ------------------------------------------------------------------ configuration
 
-export const PRESETS = {
-  aws: { label: 'AWS S3', endpoint: 'https://s3.{region}.amazonaws.com', region: 'us-east-1', style: 'virtual', hint: 'Endpoint uses the region below.' },
-  r2: { label: 'Cloudflare R2', endpoint: 'https://<account-id>.r2.cloudflarestorage.com', region: 'auto', style: 'path', hint: 'Replace <account-id> with your Cloudflare account ID.' },
-  b2: { label: 'Backblaze B2', endpoint: 'https://s3.{region}.backblazeb2.com', region: 'us-west-004', style: 'path', hint: 'Use the region shown in your bucket’s endpoint.' },
-  spaces: { label: 'DigitalOcean Spaces', endpoint: 'https://{region}.digitaloceanspaces.com', region: 'nyc3', style: 'virtual', hint: 'Region is the datacenter, for example nyc3.' },
-  custom: { label: 'MinIO / custom', endpoint: 'http://localhost:9000', region: 'us-east-1', style: 'path', hint: 'Any S3-compatible server.' },
+// v3.0: no provider presets. One S3-compatible form; region and addressing are worked out from the endpoint unless overridden.
+export const DEFAULT_S3 = {
+  endpoint: '', region: '', regionAuto: true, bucket: '', accessKeyId: '', secretAccessKey: '',
+  prefix: 'screenshots/{yyyy}/{mm}/', style: 'auto', naming: 'random', linkType: 'public', publicBase: '', expiry: 86400,
 };
 
-export const DEFAULT_S3 = {
-  preset: 'aws', endpoint: PRESETS.aws.endpoint, region: 'us-east-1', bucket: '', accessKeyId: '', secretAccessKey: '',
-  prefix: 'screenshots/{yyyy}/{mm}/', style: 'virtual', naming: 'random', linkType: 'public', publicBase: '', expiry: 86400,
-};
+const hostOfEndpoint = (endpoint) => { try { return new URL(String(endpoint || '').trim()).hostname.toLowerCase(); } catch { return ''; } };
+
+/** The region an endpoint implies (R2 -> auto, s3.<region>.amazonaws.com, <region>.digitaloceanspaces.com, ...), or null. */
+export function regionFromEndpoint(endpoint) {
+  const h = hostOfEndpoint(endpoint);
+  if (!h) return null;
+  if (/(^|\.)r2\.cloudflarestorage\.com$/.test(h)) return 'auto';
+  let m;
+  if ((m = /(?:^|\.)s3[.-](?:dualstack\.)?([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?$/.exec(h))) return m[1];
+  if (/(?:^|\.)s3\.amazonaws\.com$/.test(h)) return 'us-east-1';
+  if ((m = /(?:^|\.)([a-z0-9-]+)\.digitaloceanspaces\.com$/.exec(h))) return m[1];
+  if ((m = /(?:^|\.)s3\.([a-z0-9-]+)\.backblazeb2\.com$/.exec(h))) return m[1];
+  if ((m = /(?:^|\.)s3\.([a-z0-9-]+)\.wasabisys\.com$/.exec(h))) return m[1];
+  if ((m = /(?:^|\.)s3\.([a-z0-9-]+)\.idrivee2-[a-z0-9-]+\.com$/.exec(h))) return m[1];
+  return null;
+}
+/** Region to sign with: what the user entered, else what the endpoint implies, else us-east-1. */
+export const effectiveRegion = (cfg) => String((cfg && cfg.region) || '').trim() || regionFromEndpoint(cfg && cfg.endpoint) || 'us-east-1';
+/** Automatic addressing: virtual-hosted for amazonaws.com, path-style for everything else. */
+export function autoStyle(endpoint) { return /(^|\.)amazonaws\.com(\.cn)?$/.test(hostOfEndpoint(endpoint)) ? 'virtual' : 'path'; }
+export const effectiveStyle = (cfg) => (cfg && (cfg.style === 'path' || cfg.style === 'virtual') ? cfg.style : autoStyle(cfg && cfg.endpoint));
+
+/** Stored settings from before v3.0 had provider presets: drop `preset`/`provider`, resolve `{region}`, and map an addressing style that equals the automatic one to "auto". */
+export function migrateS3(raw) {
+  const r = raw && typeof raw === 'object' ? { ...raw } : {};
+  const had = 'preset' in r || 'provider' in r;
+  delete r.preset; delete r.provider;
+  const cfg = { ...DEFAULT_S3, ...r };
+  if (/\{region\}/.test(String(cfg.endpoint))) cfg.endpoint = String(cfg.endpoint).replace(/\{region\}/g, cfg.region || 'us-east-1');
+  if (/^https:\/\/<account-id>/.test(String(cfg.endpoint))) cfg.endpoint = '';
+  if (had) {
+    cfg.regionAuto = !cfg.region || cfg.region === regionFromEndpoint(cfg.endpoint);
+    if (cfg.style === autoStyle(cfg.endpoint)) cfg.style = 'auto';
+  }
+  if (cfg.style !== 'path' && cfg.style !== 'virtual') cfg.style = 'auto';
+  return { cfg, changed: had };
+}
 
 export const s3Configured = (c) => !!(c && c.endpoint && c.bucket && c.accessKeyId && c.secretAccessKey);
 
@@ -109,9 +140,9 @@ export function objectKey(cfg, d = new Date(), id) {
 
 /** The URL of an object on the endpoint, with the configured addressing style. */
 export function objectUrl(cfg, key) {
-  const ep = new URL(String(cfg.endpoint).replace(/\{region\}/g, cfg.region || 'us-east-1'));
+  const ep = new URL(String(cfg.endpoint).trim());
   const keyPath = encodePath(key);
-  if (cfg.style === 'virtual') return `${ep.protocol}//${cfg.bucket}.${ep.host}/${keyPath}`;
+  if (effectiveStyle(cfg) === 'virtual') return `${ep.protocol}//${cfg.bucket}.${ep.host}/${keyPath}`;
   return `${ep.protocol}//${ep.host}${ep.pathname.replace(/\/$/, '')}/${encodePath(cfg.bucket)}/${keyPath}`;
 }
 
@@ -132,7 +163,7 @@ async function xmlError(res) {
 async function put(cfg, key, body, contentType, extra = {}) {
   const url = objectUrl(cfg, key);
   const payloadHash = await sha256Hex(body);
-  const signed = await signHeaders({ method: 'PUT', url, headers: { 'content-type': contentType, ...extra }, payloadHash, region: cfg.region || 'us-east-1', accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey });
+  const signed = await signHeaders({ method: 'PUT', url, headers: { 'content-type': contentType, ...extra }, payloadHash, region: effectiveRegion(cfg), accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey });
   const { host, ...send } = signed.headers; // the browser sets Host itself
   let res;
   try { res = await fetch(url, { method: 'PUT', headers: send, body }); } catch (e) { throw new Error(`Couldn’t reach ${new URL(url).host}: ${e.message || e}`); }
@@ -141,7 +172,7 @@ async function put(cfg, key, body, contentType, extra = {}) {
 }
 async function del(cfg, key) {
   const url = objectUrl(cfg, key);
-  const signed = await signHeaders({ method: 'DELETE', url, payloadHash: await sha256Hex(''), region: cfg.region || 'us-east-1', accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey });
+  const signed = await signHeaders({ method: 'DELETE', url, payloadHash: await sha256Hex(''), region: effectiveRegion(cfg), accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey });
   const { host, ...send } = signed.headers;
   let res;
   try { res = await fetch(url, { method: 'DELETE', headers: send }); } catch (e) { throw new Error(`Couldn’t reach ${new URL(url).host}: ${e.message || e}`); }
@@ -158,7 +189,7 @@ export async function uploadPng(cfg, blob, { date = new Date() } = {}) {
   let url;
   if (cfg.linkType === 'presigned') {
     const expires = Math.min(604800, Math.max(1, Number(cfg.expiry) || 86400));
-    url = (await presign({ url: objectUrl(cfg, key), region: cfg.region || 'us-east-1', accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey, expires })).url;
+    url = (await presign({ url: objectUrl(cfg, key), region: effectiveRegion(cfg), accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey, expires })).url;
   } else url = publicLink(cfg, key);
   return { key, url };
 }

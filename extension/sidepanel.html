@@ -24,9 +24,6 @@
             <span class="addr-ic" id="addr-ic"></span>
             <input id="addr" data-testid="address-field" type="text" placeholder="Search or enter address" aria-label="Search or enter address" spellcheck="false" autocomplete="off" autocapitalize="off">
           </form>
-          <span id="capture-slot" class="capture-slot"></span>
-          <!-- BOOST HOOK 3 slot: the button from createBoostButton(ctx) is placed here -->
-          <span id="boost-slot" class="boost-slot"></span>
         </div>
       </div>
       <div class="scroll" id="scroll-main">
@@ -105,124 +102,6 @@
       </div>
     </section>
 
-    <section id="view-settings" class="view" data-testid="settings-view" hidden>
-      <div class="viewbar">
-        <button type="button" class="icon-btn back" id="settings-back" aria-label="Back" title="Back" data-testid="back-button"></button>
-        <h1>Settings</h1>
-      </div>
-      <div class="scroll" id="scroll-settings">
-        <div class="field" id="field-sidebar-color" data-testid="settings-sidebar-color">
-          <label id="sbc-label">Sidebar colour</label>
-          <div class="seg" role="group" aria-labelledby="sbc-label" data-testid="sidebar-color-mode">
-            <button type="button" class="seg-b" data-mode="auto" aria-pressed="true">Automatic</button>
-            <button type="button" class="seg-b" data-mode="custom" aria-pressed="false">Custom</button>
-          </div>
-          <div class="sbc-custom" id="sbc-custom" hidden>
-            <div class="sbc-swatches" id="sbc-swatches" role="group" aria-label="Sidebar colour swatches"></div>
-            <label class="sbc-pick"><span>Pick any colour</span><input type="color" id="sbc-picker" data-testid="sidebar-color-picker" value="#e9eef6"></label>
-          </div>
-          <p class="hint" id="sbc-note" data-testid="sidebar-color-note"></p>
-        </div>
-        <div class="field">
-          <label for="set-profile-archive">Archive tabs after</label>
-          <select id="set-profile-archive" data-testid="settings-archive-profile"></select>
-          <p class="hint">Unused tabs in this profile move to the archive. Tabs pinned to Favourites or Pinned are never archived.</p>
-        </div>
-        <div class="field">
-          <label for="set-global-archive">Default for all profiles</label>
-          <select id="set-global-archive" data-testid="settings-archive-global"></select>
-          <p class="hint" id="global-hint"></p>
-        </div>
-        <div class="field">
-          <label class="check"><input type="checkbox" id="set-archive-grouped" data-testid="settings-archive-grouped"><span>Also archive tabs in groups</span></label>
-          <p class="hint">Tabs inside tab groups are kept by default, including when you press Clear.</p>
-        </div>
-        <div class="field">
-          <label>Windows</label>
-          <label class="check sub"><input type="checkbox" id="set-merge-on-close" data-testid="settings-merge-on-close"><span>When you close a pop-out window, move its tabs back to the main window</span></label>
-          <p class="hint">Closing a pop-out that has a single tab archives that tab instead. The main window is the first window of the session; right-click a window in Today to change it.</p>
-        </div>
-        <div class="field" id="field-pinned">
-          <label>Pinned</label>
-          <label class="check sub"><input type="checkbox" id="set-pinned-reset" data-testid="pinned-reset-on-restart"><span>Reset pinned tabs when Chrome restarts</span></label>
-          <p class="hint">After a restart, Favourites and Pinned tabs that had wandered off go back to their original page. The back button (↶) still resets one by hand.</p>
-        </div>
-        <div class="field" id="field-little" data-testid="settings-little">
-          <label id="little-label">Little windows</label>
-          <label class="check sub"><input type="checkbox" id="set-little-default" data-testid="little-default-browser"><span>Open links from other apps in little windows</span></label>
-          <p class="hint" id="little-default-hint" data-testid="little-default-hint"></p>
-          <p class="cap" id="little-style-cap">Window style</p>
-          <div class="seg" role="group" aria-labelledby="little-style-cap" data-testid="little-style">
-            <button type="button" class="seg-b" data-style="minimal" aria-pressed="true">Minimal</button>
-            <button type="button" class="seg-b" data-style="regular" aria-pressed="false">Regular</button>
-          </div>
-          <p class="hint" id="little-style-hint"></p>
-          <label for="set-little-max" class="sublabel">Keep open at most</label>
-          <select id="set-little-max" data-testid="little-max-open"></select>
-          <label for="set-temp-expiry" class="sublabel">Move temporary links to Archive after</label>
-          <select id="set-temp-expiry" data-testid="temporary-expiry"></select>
-          <p class="hint">Control+Option+N opens a little window from anywhere.</p>
-        </div>
-        <div class="field" id="field-pin-mode" hidden><!-- legacy; kept for the testid, never shown -->
-          <label for="set-pin-mode">When pinned</label>
-          <select id="set-pin-mode" data-testid="settings-pin-mode">
-            <option value="push">Move the page over</option>
-            <option value="float">Float over the page</option>
-          </select>
-        </div>
-        <!-- BOOST HOOK 3 slot: renderBoostSettings(containerEl, ctx) fills this -->
-        <div class="field" id="boost-settings-slot"></div>
-        <div class="field" id="capture-settings-slot"></div>
-        <div class="field" id="field-profile" hidden>
-          <label for="set-profile-pick">This profile</label>
-          <select id="set-profile-pick" data-testid="settings-profile-picker"></select>
-        </div>
-        <div class="field" id="field-styles">
-          <label>Profiles</label>
-          <div id="profile-styles" class="pstyles" data-testid="settings-profiles"></div>
-        </div>
-        <div class="field">
-          <label>Sidebar app</label>
-          <div class="status-line">
-            <span class="status-dot" id="helper-dot"></span>
-            <span id="helper-status" data-testid="helper-status"></span>
-            <button type="button" class="btn small" id="helper-retry" data-testid="helper-retry">Retry</button>
-          </div>
-        </div>
-        <div class="field" id="field-overlay-enabled" hidden>
-          <label class="check"><input type="checkbox" id="set-overlay-enabled" data-testid="overlay-enabled"><span>Show sidebar over Chrome's tabs</span></label>
-        </div>
-        <div class="field app" id="field-app" data-testid="settings-app" hidden>
-          <label>App</label>
-          <label class="check sub"><input type="checkbox" id="app-pinned" data-testid="app-pinned"><span>Pinned sidebar</span></label>
-          <label class="check sub"><input type="checkbox" id="app-login" data-testid="app-launch-login"><span>Launch at login</span></label>
-          <label class="check sub"><input type="checkbox" id="app-lockstep" data-testid="app-lockstep"><span>Move Chrome and the sidebar together</span></label>
-          <p class="hint" id="app-lockstep-note">Sidebar.app moves Chrome's window itself while you drag it, so the two stay together. Turn off if window snapping or other window tools misbehave.</p>
-          <div class="status-line">
-            <span class="status-dot" id="app-ax-dot"></span>
-            <span id="app-ax-status" data-testid="app-accessibility"></span>
-            <button type="button" class="btn small" id="app-ax-open" data-testid="app-accessibility-open">Open settings</button>
-          </div>
-          <div class="status-line">
-            <span id="app-sc-label">Match Chrome's colour exactly</span>
-            <span id="app-sc-status" data-testid="app-screen-capture"></span>
-            <button type="button" class="btn small" id="app-sc-on" data-testid="app-screen-capture-on">Turn on</button>
-          </div>
-          <p class="hint" id="app-sc-note" data-testid="app-screen-capture-note">Needs Screen Recording permission. Sidebar only looks at Chrome's window.</p>
-          <p class="hint" id="app-float-note" data-testid="app-float-note" hidden>Couldn't control Chrome's tab rail; pinned sidebar will float over the page.</p>
-          <button type="button" class="btn" id="app-rescan" data-testid="app-rescan">Find Chrome's tab rail again</button>
-          <p class="hint" id="app-version" data-testid="app-version"></p>
-          <button type="button" class="btn danger" id="app-quit" data-testid="app-quit">Quit Sidebar</button>
-        </div>
-        <div class="field tips">
-          <label>Tips</label>
-          <button type="button" class="btn" id="left-btn" data-testid="left-button">Show panel on the left</button>
-          <p class="hint">Set Side panel to Left.</p>
-          <button type="button" class="btn" id="shortcut-btn" data-testid="shortcut-button">Change keyboard shortcut</button>
-        </div>
-      </div>
-    </section>
-
     <!-- BOOST HOOK 3 slot: setView('boost') empties this element and calls renderBoostView(rootEl, ctx) on it -->
     <section id="view-boost" class="view" hidden></section>
     <section id="view-captures" class="view" data-testid="captures-view" hidden></section>
@@ -230,7 +109,9 @@
     <footer id="footer" class="footer">
       <button type="button" id="archive-btn" class="foot-btn" aria-label="Archive" title="Archive" data-testid="archive-button"><span class="foot-ic" id="archive-ic"></span><span>Archive</span><span class="badge" id="archive-count" data-testid="archive-count" hidden></span></button>
       <span class="spacer"></span>
-      <button type="button" id="newwin-btn" class="icon-btn" aria-label="New window" title="New window" data-testid="new-window-button"></button>
+      <span id="capture-slot" class="capture-slot"></span>
+      <!-- BOOST HOOK 3 slot: the button from createBoostButton(ctx) is placed here -->
+      <span id="boost-slot" class="boost-slot"></span>
       <button type="button" id="pin-toggle" class="icon-btn" data-testid="pin-toggle" aria-pressed="false" aria-label="Pin sidebar" title="Pin sidebar" hidden></button>
       <button type="button" id="settings-btn" class="icon-btn" aria-label="Settings" title="Settings" data-testid="settings-button"></button>
     </footer>

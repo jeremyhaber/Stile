@@ -1,6 +1,8 @@
 // Overlay mode: the bridge shim must be ready before any chrome.* use.
 if (window.__sidebarReady) { try { await window.__sidebarReady; } catch { /* sidepanel.js reports it */ } }
 
+import { faviconUrl } from './shared.js';
+
 // Boost UI for the side panel: toolbar button, Boost view, Settings section.
 const svg = (body, extra = '') => `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" ${extra} aria-hidden="true">${body}</svg>`;
 export const BOOST_ICONS = {
@@ -10,6 +12,7 @@ export const BOOST_ICONS = {
   trash: svg('<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>'),
   reload: svg('<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>'),
   close: svg('<path d="M6 6l12 12M18 6 6 18"/>'),
+  chevron: svg('<path d="M9 6l6 6-6 6"/>'),
 };
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -112,8 +115,13 @@ export async function renderBoostView(rootEl, ctx) {
     const p = st.p;
     const head = document.createElement('div'); head.className = 'bx-head';
     head.innerHTML = `<button class="icon-btn" data-testid="back-button" aria-label="Back" title="Back"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
-      <span class="bx-host" data-testid="boost-hostname">${p?.ok ? esc(p.hostname) : 'Boost'}</span>`;
+      ${p?.ok ? '<span class="bx-fav"><img alt="" draggable="false"></span>' : ''}<span class="bx-host" data-testid="boost-hostname">${p?.ok ? esc(p.hostname) : 'Boost'}</span>`;
     head.querySelector('[data-testid=back-button]').onclick = () => ctx.goBack();
+    if (p?.ok) {
+      const im = head.querySelector('.bx-fav img');
+      im.onerror = () => { head.querySelector('.bx-fav')?.remove(); };
+      try { im.src = faviconUrl(p.url || ('https://' + p.hostname + '/'), 32); } catch { head.querySelector('.bx-fav')?.remove(); }
+    }
     if (p?.ok && st.boost) {
       const sw = document.createElement('button');
       sw.className = 'bx-switch'; sw.setAttribute('role', 'switch'); sw.dataset.testid = 'boost-enabled'; sw.setAttribute('data-testid', 'boost-enabled');
@@ -131,9 +139,10 @@ export async function renderBoostView(rootEl, ctx) {
     v.append(sub);
 
     // Zap card
+    const zapN = (st.boost?.zaps || []).length;
     const zap = document.createElement('button');
-    zap.className = 'bx-card' + (st.zapping ? ' bx-armed' : ''); zap.setAttribute('data-testid', 'zap-button');
-    zap.innerHTML = `<span>${st.zapping ? 'Zapping… (Esc to finish)' : 'Zap'}</span><span class="bx-ico">${BOOST_ICONS.bolt}</span>`;
+    zap.className = 'bx-card' + (st.zapping ? ' bx-armed' : ''); zap.setAttribute('data-testid', 'zap-button'); zap.type = 'button';
+    zap.innerHTML = `<span class="bx-tile bx-t-zap">${BOOST_ICONS.bolt}</span><span class="bx-ct"><b>${st.zapping ? 'Zapping…' : 'Zap'}</b><small>${st.zapping ? 'Click what to hide. Esc to finish' : 'Hide parts of this page'}</small></span><span class="bx-status">${st.zapping ? 'Esc' : zapN ? `${zapN} hidden` : BOOST_ICONS.chevron}</span>`;
     zap.onclick = async () => {
       if (st.zapping) { await ctx.cmd('stopZap', { tabId: p.tabId }); st.zapping = false; draw(); return; }
       const r = await ctx.cmd('startZap', { tabId: p.tabId });
@@ -143,7 +152,7 @@ export async function renderBoostView(rootEl, ctx) {
     const zaps = st.boost?.zaps || [];
     if (zaps.length) {
       const h = document.createElement('div'); h.className = 'bx-zap-h';
-      h.innerHTML = `<span>Zapped (${zaps.length})</span>`;
+      h.innerHTML = `<span>Hidden on this site (${zaps.length})</span>`;
       if (zaps.length >= 2) {
         const c = document.createElement('button'); c.className = 'text-btn'; c.textContent = 'Unhide all'; c.setAttribute('data-testid', 'zap-clear');
         c.onclick = () => ctx.cmd('clearZaps', { hostname: p.hostname });
@@ -163,9 +172,10 @@ export async function renderBoostView(rootEl, ctx) {
     }
 
     // Code card
+    const kinds = [st.boost?.css?.trim() ? 'CSS' : '', st.boost?.js?.trim() ? 'JS' : ''].filter(Boolean).join(' · ');
     const code = document.createElement('button');
-    code.className = 'bx-card'; code.setAttribute('data-testid', 'code-button'); code.setAttribute('aria-expanded', String(st.codeOpen));
-    code.innerHTML = `<span>Code</span><span class="bx-ico">${BOOST_ICONS.braces}</span>`;
+    code.className = 'bx-card'; code.type = 'button'; code.setAttribute('data-testid', 'code-button'); code.setAttribute('aria-expanded', String(st.codeOpen));
+    code.innerHTML = `<span class="bx-tile bx-t-code">${BOOST_ICONS.braces}</span><span class="bx-ct"><b>Code</b><small>Add your own CSS or JavaScript</small></span><span class="bx-status${st.codeOpen ? ' open' : ''}">${kinds ? esc(kinds) + '<i class="bx-chev">' + BOOST_ICONS.chevron + '</i>' : '<i class="bx-chev">' + BOOST_ICONS.chevron + '</i>'}</span>`;
     code.onclick = async () => { st.codeOpen = !st.codeOpen; if (st.codeOpen) { const s = await ctx.cmd('userScriptsStatus', {}); st.us = !!(s && s.available); } draw(); };
     v.append(code);
     if (st.codeOpen) v.append(codePanel());
@@ -256,21 +266,21 @@ export async function renderBoostView(rootEl, ctx) {
 // ---------------- Settings section ----------------
 export function renderBoostSettings(containerEl, ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'sec'; wrap.setAttribute('data-testid', 'boost-settings');
-  wrap.innerHTML = '<div class="sec-h"><h2>Boosts</h2></div>';
-  const list = document.createElement('div'); list.className = 'bx-sites';
-  wrap.append(list); containerEl.append(wrap);
+  wrap.className = 'bx-settings'; wrap.setAttribute('data-testid', 'boost-settings');
+  const list = document.createElement('div'); list.className = 'bx-sites group';
+  const note = document.createElement('p'); note.className = 'note hint'; note.textContent = 'A boost applies to one exact hostname. Zap hides parts of a page; Code adds your own CSS or JavaScript. Open Boost from the sparkle button in the sidebar\u2019s footer.';
+  wrap.append(list, note); containerEl.append(wrap);
   const draw = async () => {
     const r = await ctx.cmd('listBoosts', {});
     const boosts = (r && r.boosts) || {};
     list.textContent = '';
     const hosts = Object.keys(boosts).sort();
-    if (!hosts.length) { const h = document.createElement('div'); h.className = 'hint'; h.textContent = 'No boosts yet. Use the sparkle button next to the address field.'; list.append(h); return; }
+    if (!hosts.length) { const h = document.createElement('div'); h.className = 'empty'; h.textContent = 'No boosts yet. Use the sparkle button in the sidebar\u2019s footer.'; list.append(h); return; }
     for (const h of hosts) {
       const b = boosts[h];
       const row = document.createElement('div'); row.className = 'bx-site'; row.setAttribute('data-testid', 'boost-site-row'); row.dataset.hostname = h;
-      const meta = [b.zaps.length ? `${b.zaps.length} zapped` : '', b.css.trim() ? 'CSS' : '', b.js.trim() ? 'JS' : ''].filter(Boolean).join(' · ');
-      row.innerHTML = `<span class="bx-sn">${esc(h)} <span class="bx-sm">${esc(meta)}</span></span>`;
+      const meta = [b.zaps.length ? `${b.zaps.length} hidden` : '', b.css.trim() ? 'CSS' : '', b.js.trim() ? 'JS' : ''].filter(Boolean).join(' · ');
+      row.innerHTML = `<span class="bx-sn">${esc(h)}<span class="bx-sm">${esc(meta || 'No changes yet')}</span></span>`;
       const sw = document.createElement('button'); sw.className = 'bx-switch'; sw.setAttribute('role', 'switch'); sw.setAttribute('data-testid', 'boost-site-toggle');
       sw.setAttribute('aria-checked', String(b.enabled !== false)); sw.setAttribute('aria-label', `Enable boost for ${h}`);
       sw.onclick = () => ctx.cmd('saveBoost', { hostname: h, patch: { enabled: b.enabled === false } });

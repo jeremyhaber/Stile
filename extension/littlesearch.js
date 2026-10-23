@@ -21,3 +21,11 @@ document.addEventListener('keydown', async (e) => {
   e.preventDefault();
   try { const w = await chrome.windows.getCurrent(); await chrome.windows.remove(w.id); } catch { window.close(); }
 });
+
+// v3.0: ⌘O promotes this little window to a full tab, like on any page in it (nothing to open yet while it is still the search page).
+document.addEventListener('keydown', async (e) => {
+  if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || (e.key || '').toLowerCase() !== 'o') return;
+  e.preventDefault();
+  e.stopPropagation();
+  try { const tab = await chrome.tabs.getCurrent(); await chrome.runtime.sendMessage({ cmd: 'promoteLittle', tabId: tab && tab.id }); } catch { /* ignore */ }
+}, true);

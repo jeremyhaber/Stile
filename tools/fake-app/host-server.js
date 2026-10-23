@@ -28,6 +28,8 @@ const MAX_REPLY = 900 * 1000; // hello/profiles replies stay under 900 KB (Chrom
 const MAX_FRAME = 64 * 1024 * 1024;
 const HANDOFF_SECONDS = 60;
 const DEFAULT_ARCHIVE_MINUTES = 720;
+// v3.0: app-only settings the extension relays from the settings window ({type:"appSetting", name, value}).
+const APP_SETTINGS = new Set(['setPinned', 'setLockstep', 'setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'reviewPermissions', 'setShowMenuBarIcon']);
 const ICONS = new Set('picture initial home briefcase code star heart book music camera palette rocket leaf coffee game globe bolt moon'.split(' '));
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -128,6 +130,8 @@ class HostServer extends EventEmitter {
     /** profileDir -> timestamps (ms) of recent replacement attempts (duplicate-profile guard) */
     this.replacements = new Map();
     this.server = null;
+    /** the app's latest host state (what the sidebar page receives as `hostState`), pushed to every extension as {type:"appState", state} */
+    this.appState = null;
   }
 
   // ---- lifecycle
@@ -210,6 +214,7 @@ class HostServer extends EventEmitter {
     const handlers = {
       hello: this.doHello, identify: this.doIdentify, getProfiles: this.doGetProfiles,
       setProfileStyle: this.doSetStyle, switchProfile: this.doSwitch, setGlobalSettings: this.doSetSettings, setOverlayEnabled: this.doSetOverlayEnabled, setDefaultBrowser: this.doSetDefaultBrowser,
+      appSetting: this.doAppSetting, getAppState: this.doGetAppState,
     };
     const h = Object.hasOwn(handlers, m.type) ? handlers[m.type] : null;
     if (!h) { this.log(`unknown message type '${m.type}'`); return this.reply(conn, m, { type: 'error', error: `unknown message type '${m.type}'` }); }
@@ -221,6 +226,16 @@ class HostServer extends EventEmitter {
 
   broadcast(msg, except) {
     for (const c of this.conns) if (c !== except) this.send(c, msg);
+  }
+
+  /**
+   * v3.0: the app reports its host state (pinned, lockstep, launchAtLogin, accessibility, ...). Remembered, pushed to every identified
+   * extension now, and replayed to each extension that identifies later.
+   */
+  setAppState(state) {
+    this.appState = isObject(state) ? { ...state } : null;
+    if (!this.appState) return;
+    for (const c of this.conns) if (c.profileDir) this.send(c, { type: 'appState', state: this.appState });
   }
 
   // ---- state.json
@@ -353,6 +368,7 @@ class HostServer extends EventEmitter {
       else this.log(`ignoring stale pending handoff for '${dir}'`);
     }
     if (this.overlay) this.send(conn, { type: 'overlayStatus', connected: true });
+    if (this.appState) this.send(conn, { type: 'appState', state: this.appState });
     this.emit('identify', { profileDir: dir });
   }
 
@@ -420,6 +436,21 @@ class HostServer extends EventEmitter {
     this.emit('defaultBrowser', { enabled: m.enabled });
   }
 
+  // v3.0: Settings window -> app. Unknown names are refused; the app applies the setting and then calls setAppState with the result.
+  doAppSetting(conn, m) {
+    if (typeof m.name !== 'string' || !APP_SETTINGS.has(m.name)) {
+      // fire-and-forget senders (the extension) get no reply; callers that pass a requestId do
+      if ('requestId' in m) this.reply(conn, m, { type: 'appSetting', name: m.name, ok: false, error: 'unknown setting' });
+      return;
+    }
+    this.emit('appSetting', { profileDir: conn.profileDir, name: m.name, value: m.value });
+    if ('requestId' in m) this.reply(conn, m, { type: 'appSetting', name: m.name, ok: true });
+  }
+
+  doGetAppState(conn, m) {
+    this.reply(conn, m, { type: 'appState', state: this.appState });
+  }
+
   doSetStyle(conn, m) {
     const { dir, style } = m;
     let err = null;
@@ -454,7 +485,7 @@ function writeHostManifest(nmhDir, executable) {
   return file;
 }
 
-module.exports = { HostServer, writeHostManifest, colorHex, readChromeTheme, HOST_VERSION, EXTENSION_ORIGIN };
+module.exports = { APP_SETTINGS, HostServer, writeHostManifest, colorHex, readChromeTheme, HOST_VERSION, EXTENSION_ORIGIN };
 
 // `node host-server.js` runs a standalone host using the SIDEBAR_* environment variables.
 if (require.main === module) {

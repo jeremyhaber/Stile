@@ -3,7 +3,10 @@
 A background app that puts the Sidebar extension's UI exactly over Chrome's **vertical tab rail**, so it
 looks and behaves like Chrome's own sidebar. Chrome's toolbar, address bar and window buttons stay
 untouched. The app also *is* the extension's native messaging host: there is no separate helper to
-install, no menu bar icon and no Dock icon.
+install and no Dock icon. A small menu bar icon (SF Symbol `sidebar.left`) gives quick access to
+the sidebar on/off switch (Control+Option+Shift+S), keeping it open (Control+Option+S), moving Chrome and the
+sidebar together, Settings, the permissions window and Quit. Turn it off with "Show menu bar icon" in the
+extension's settings (App section).
 
 ## Setup
 

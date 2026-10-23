@@ -25,8 +25,24 @@ final class OverlayManager {
     /// Global on/off (state.json `overlayEnabled`, owned by the host server).
     private(set) var overlayEnabled = true
 
+    // v3.0: app state pushed to every connected extension (`{type:"appState", state}`)
+    private let appStateTimer = OneShot()
+    private var lastAppState: [UUID: String] = [:]
+    private var defaultBrowserCache: (value: Bool, at: Date)?
+    private var appStatePoll: Timer?
+
     init(server: HostServer) {
         self.server = server
+        // Works before `start()` (which waits for Accessibility): the settings page must be able to open the
+        // permission panes and the permissions window exactly then.
+        server.onAppMessage = { [weak self] type, msg, bridge in
+            runOnMain { self?.handleAppMessage(type, msg, from: bridge) }
+        }
+        let t = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.scheduleAppState() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        appStatePoll = t
     }
 
     func start() {
@@ -130,6 +146,7 @@ final class OverlayManager {
             c.pushHostState()
         }
         if supportChanged { closer.refreshTargets(supportedWindows()) }
+        scheduleAppState()
     }
 
     // MARK: Events
@@ -156,6 +173,7 @@ final class OverlayManager {
         closer.bridgesChanged(live)
         mapper.schedule()
         applyMapping()
+        scheduleAppState()
     }
 
     private func settingsChanged() {
@@ -168,6 +186,7 @@ final class OverlayManager {
         }
         for c in controllers.values { c.settingsChanged() }
         dragger.syncTap()
+        scheduleAppState()
     }
 
     private func trackerUpdated() {
@@ -188,6 +207,10 @@ final class OverlayManager {
                     self.followLastActivity = Date()
                     self.startFollowing()
                 }
+                c.onWindowDrag = { [weak self] key, doubleClick in
+                    self?.dragger.beginFromPanel(windowKey: key, doubleClick: doubleClick)
+                }
+                c.onHostStatePushed = { [weak self] in self?.scheduleAppState() }
                 c.overlayEnabled = overlayEnabled
                 controllers[w.key] = c
                 c.setLittle(closer.isLittle(mapper.map[w.key]))
@@ -318,6 +341,110 @@ final class OverlayManager {
         for c in controllers.values { c.endFollowing() }
     }
 
+    // MARK: App state and app settings (v3.0)
+
+    private func scheduleAppState() {
+        if appStateTimer.isScheduled { return }
+        appStateTimer.schedule(after: 0.05) { [weak self] in
+            self?.appStateTimer.clear()
+            self?.broadcastAppState()
+        }
+    }
+
+    /// `defaultBrowser` as the host reports it (little links on AND this app is the default handler); the
+    /// NSWorkspace probe behind it is cached for a few seconds.
+    private func defaultBrowserNow() -> Bool {
+        if let c = defaultBrowserCache, Date().timeIntervalSince(c.at) < 4 { return c.value }
+        let v = (HostStore.currentSettings()["defaultBrowser"] as? Bool) ?? false
+        defaultBrowserCache = (v, Date())
+        return v
+    }
+
+    /// The state for one profile's extension: the host state object of that profile's windows (the focused one,
+    /// else the first visible one) plus app-wide fields.
+    private func appStateObject(for b: ProfileBridge) -> [String: Any] {
+        let mine = controllers.values.filter { $0.mappedBridge === b && !$0.isLittle }.sorted { $0.key < $1.key }
+        let c = mine.first(where: { $0.isFocusedChromeWindow && $0.window.visible })
+            ?? mine.first(where: { $0.window.visible }) ?? mine.first
+        var obj: [String: Any] = c?.hostStateObject() ?? [
+            "state": "collapsed", "pinned": false, "railFound": false, "railControllable": false,
+            "launchAtLogin": LoginItem.enabled, "accessibility": Permissions.isTrusted,
+            "appVersion": AppInfo.version, "peekWidth": Int(Settings.peekWidth),
+            "screenCapture": Permissions.screenCaptureGranted, "compact": true, "railWidth": 48,
+            "overlayEnabled": overlayEnabled, "lockstep": Settings.lockstepDrag, "showMenuBarIcon": Settings.showMenuBarIcon, "chromeColor": NSNull(),
+        ]
+        // App-wide fields (the same for every profile).
+        obj["defaultBrowser"] = defaultBrowserNow()
+        obj["overlayRunning"] = server.overlayRunning
+        obj["profileDir"] = b.profileDir
+        obj["windowCount"] = mine.count
+        obj["mapped"] = c != nil
+        obj["connectedProfiles"] = server.identified.map { $0.profileDir }.sorted()
+        return obj
+    }
+
+    private func broadcastAppState() {
+        let live = server.identified
+        for b in live {
+            let obj = appStateObject(for: b)
+            guard let json = JSONUtil.string(obj) else { continue }
+            if lastAppState[b.id] == json { continue }
+            lastAppState[b.id] = json
+            b.sendToExt(["type": "appState", "state": obj])
+        }
+        let liveIds = Set(live.map { $0.id })
+        for id in Array(lastAppState.keys) where !liveIds.contains(id) { lastAppState.removeValue(forKey: id) }
+    }
+
+    /// Messages relayed by the HostServer: `getAppState` and `appSetting {name, value}` (the two settings the
+    /// server handles itself, setOverlayEnabled and setDefaultBrowser, never get here).
+    private func handleAppMessage(_ type: String, _ m: [String: Any], from b: ProfileBridge) {
+        if type == "getAppState" {
+            let obj = appStateObject(for: b)
+            if let json = JSONUtil.string(obj) { lastAppState[b.id] = json }
+            b.reply(m, ["type": "appState", "state": obj])
+            return
+        }
+        guard type == "appSetting", let name = m["name"] as? String else { return }
+        let value = m["value"]
+        let on = (value as? Bool) ?? ((value as? NSNumber)?.boolValue ?? false)
+        let mine = controllers.values.filter { $0.mappedBridge === b }.sorted { $0.key < $1.key }
+        switch name {
+        case "setLockstep":
+            Settings.lockstepDrag = on   // posts; settingsChanged installs/removes the tap
+        case "setShowMenuBarIcon":
+            Settings.showMenuBarIcon = on   // posts; the menu bar controller adds or removes the status item
+        case "setPinned":
+            // Same effect as the page's `setPinned` host message: the focused window of this profile, else its
+            // first visible one.
+            let candidates = mine.filter { !$0.isLittle }
+            if let c = candidates.first(where: { $0.isFocusedChromeWindow && $0.window.visible })
+                ?? candidates.first(where: { $0.window.visible }) {
+                c.setPinned(on)
+            }
+        case "setLaunchAtLogin":
+            LoginItem.set(on)
+            Settings.post()
+        case "requestScreenCapture":
+            if let c = mine.first(where: { $0.isFocusedChromeWindow }) ?? mine.first {
+                c.startCaptureRequest()   // asks, then re-checks every second for 30 s
+            } else {
+                Permissions.requestScreenCapture()
+            }
+        case "openAccessibilitySettings":
+            Permissions.openSettings()
+        case "rescanRail":
+            for c in mine where c.window.visible { c.forceRescan() }
+        case "quitApp":
+            quitApp()
+        case "reviewPermissions":
+            NotificationCenter.default.post(name: .sidebarReviewPermissions, object: nil)
+        default:
+            Log.write("host: appSetting '\(name)' not handled by the overlay manager")
+        }
+        scheduleAppState()
+    }
+
     // MARK: Commands
 
     /// The controller for Chrome's focused window (or the first visible one).
@@ -337,6 +464,26 @@ final class OverlayManager {
         if requireChromeFrontmost && !tracker.chromeFrontmost { return }
         guard let c = focusedController() else { return }
         c.setPinned(c.state != .pinned)
+    }
+
+    /// Menu bar "Settings…": asks the extension of the focused window's profile (else the first connected one) to
+    /// open its settings window; with no extension connected, opens the permissions window instead.
+    func openExtensionSettings() {
+        let bridge: ProfileBridge? = {
+            if let b = focusedController()?.mappedBridge, !b.closed { return b }
+            return server.identified.first
+        }()
+        if let b = bridge {
+            b.sendToExt(["type": "openSettings"])
+        } else {
+            NotificationCenter.default.post(name: .sidebarReviewPermissions, object: nil)
+        }
+    }
+
+    /// Writes the quit flag (so the connector doesn't relaunch the app) and terminates.
+    func quitApp() {
+        FileManager.default.createFile(atPath: HostPaths.quitFlagPath, contents: nil)
+        NSApp.terminate(nil)
     }
 
     var isFocusedPinned: Bool {

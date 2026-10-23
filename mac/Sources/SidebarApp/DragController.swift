@@ -5,8 +5,8 @@ import ApplicationServices
 /// CGEventTap (CloseInterceptor forwards mouse events here). Chrome's window is moved with synchronous AX
 /// sets and our panel is moved right after each set, so both come from the same code path.
 /// Everything runs on the main thread (the tap is attached to the main run loop).
-/// Own event tap, installed only while lockstep is on: drag events in a tap wait for our main thread, so they
-/// must not be intercepted at all when the feature is off.
+/// Own event tap, installed only while lockstep is on (or, briefly, for a drag started from our own panel):
+/// drag events in a tap wait for our main thread, so they must not be intercepted at all otherwise.
 private let dragTapCallback: CGEventTapCallBack = { _, type, event, refcon in
     guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
     let me = Unmanaged<DragController>.fromOpaque(refcon).takeUnretainedValue()
@@ -22,34 +22,47 @@ final class DragController {
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
 
-    /// Installs or removes the tap to match the setting. Cheap to call often.
+    /// Installs or removes the tap to match the setting. Cheap to call often. A panel-initiated session (v3.0)
+    /// keeps the tap alive until it ends even when the setting is off; it is removed right after.
     func syncTap() {
         let want = Settings.lockstepDrag && !Self.disabledThisRun && Permissions.isTrusted
-        if want, tap == nil {
-            let types: [CGEventType] = [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
-            var mask: CGEventMask = 0
-            for t in types { mask |= (CGEventMask(1) << CGEventMask(t.rawValue)) }
-            let refcon = Unmanaged.passUnretained(self).toOpaque()
-            guard let port = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                               options: .defaultTap, eventsOfInterest: mask,
-                                               callback: dragTapCallback, userInfo: refcon) else {
-                Log.write("lockstep: could not create event tap")
-                return
-            }
-            let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
-            CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
-            CGEvent.tapEnable(tap: port, enable: true)
-            tap = port
-            tapSource = src
-            Log.write("lockstep: event tap installed")
-        } else if !want, let t = tap {
-            if session != nil { finish(at: nil, replay: false) }
-            CGEvent.tapEnable(tap: t, enable: false)
-            if let src = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
-            tap = nil
-            tapSource = nil
-            Log.write("lockstep: event tap removed")
+        if want {
+            _ = installTap()
+        } else if tap != nil, session?.fromPanel != true {
+            removeTap()
         }
+    }
+
+    @discardableResult
+    private func installTap() -> Bool {
+        if tap != nil { return true }
+        let types: [CGEventType] = [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
+        var mask: CGEventMask = 0
+        for t in types { mask |= (CGEventMask(1) << CGEventMask(t.rawValue)) }
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        guard let port = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                                           options: .defaultTap, eventsOfInterest: mask,
+                                           callback: dragTapCallback, userInfo: refcon) else {
+            Log.write("lockstep: could not create event tap")
+            return false
+        }
+        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+        CGEvent.tapEnable(tap: port, enable: true)
+        tap = port
+        tapSource = src
+        Log.write("lockstep: event tap installed")
+        return true
+    }
+
+    private func removeTap() {
+        guard let t = tap else { return }
+        if session != nil { finish(at: nil, replay: false) }
+        CGEvent.tapEnable(tap: t, enable: false)
+        if let src = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
+        tap = nil
+        tapSource = nil
+        Log.write("lockstep: event tap removed")
     }
 
     /// Value of `.eventSourceUserData` on the click we replay to Chrome, so the tap ignores it.
@@ -75,6 +88,8 @@ final class DragController {
         let startFrame: CGRect
         let minSize: CGSize
         let flags: CGEventFlags
+        /// Started by `beginWindowDrag` from our own panel (the mouse-down went to the panel, not to Chrome).
+        var fromPanel = false
         var latest: CGPoint
         var moved = false
         var resized = false
@@ -130,7 +145,12 @@ final class DragController {
                 swallowUp = false
                 return true
             }
-            guard session != nil else { return false }
+            guard let s = session else { return false }
+            if s.fromPanel {
+                // The panel saw the mouse-down, so it must see the mouse-up too; nothing to replay.
+                finish(at: event.location, replay: false)
+                return false
+            }
             finish(at: event.location, replay: true)
             return true
         default:
@@ -181,6 +201,12 @@ final class DragController {
     }
 
     private func begin(_ w: ChromeWindow, gesture: Gesture, event: CGEvent, focused: Int?) -> Bool {
+        startSession(w, gesture: gesture, at: event.location, flags: event.flags, focused: focused, fromPanel: false)
+    }
+
+    @discardableResult
+    private func startSession(_ w: ChromeWindow, gesture: Gesture, at p: CGPoint, flags: CGEventFlags,
+                              focused: Int?, fromPanel: Bool) -> Bool {
         guard let m = manager else { return false }
         let live = AX.frame(w.element) ?? w.frame
         if w.key != focused { AX.perform(w.element, AXName.actionRaise) }
@@ -188,15 +214,48 @@ final class DragController {
         if let ms = AX.size(w.element, "AXMinimumSize") {
             minSize = CGSize(width: max(minSize.width, ms.width), height: max(minSize.height, ms.height))
         }
-        let p = event.location
         session = Session(key: w.key, window: w.element, pid: m.tracker.pid, gesture: gesture, startMouse: p,
-                          startFrame: live, minSize: minSize, flags: event.flags, latest: p, lastFrame: live)
+                          startFrame: live, minSize: minSize, flags: flags, fromPanel: fromPanel, latest: p, lastFrame: live)
         m.tracker.paused = true
+        let origin = fromPanel ? " (from sidebar)" : ""
         switch gesture {
-        case .move: Log.write("lockstep: move started")
-        case .resize: Log.write("lockstep: resize started")
+        case .move: Log.write("lockstep: move started\(origin)")
+        case .resize: Log.write("lockstep: resize started\(origin)")
         }
         return true
+    }
+
+    // MARK: Panel-initiated drags (v3.0)
+
+    /// `beginWindowDrag` from the sidebar page: the mouse-down landed on empty sidebar space. Starts a lockstep
+    /// move of this window from the current mouse location, whatever the lockstep setting says. With the setting
+    /// off, the drag tap exists only for this session. `doubleClick` runs the title-bar double-click action instead.
+    @discardableResult
+    func beginFromPanel(windowKey key: Int, doubleClick: Bool = false) -> Bool {
+        guard let m = manager, m.overlayEnabled, Permissions.isTrusted, m.tracker.pid != 0 else {
+            Log.write("lockstep: sidebar drag ignored (overlay off, no Accessibility or Chrome not running)")
+            return false
+        }
+        guard let w = m.tracker.windows.first(where: { $0.key == key && $0.visible }) else {
+            Log.write("lockstep: sidebar drag ignored (window \(key) not visible)")
+            return false
+        }
+        if doubleClick {
+            if session?.fromPanel == true { finish(at: nil, replay: false) }
+            performTitleBarDoubleClick(w.element)
+            Log.write("lockstep: double-click action (from sidebar)")
+            return true
+        }
+        // The mouse-down is already behind us: only start while the button is still physically down.
+        guard CGEventSource.buttonState(.hidSystemState, button: .left) else {
+            Log.write("lockstep: sidebar drag ignored (button already released)")
+            return false
+        }
+        if session != nil { finish(at: nil, replay: false) }
+        guard installTap() else { return false }
+        let ns = NSEvent.mouseLocation
+        let p = CGEvent(source: nil)?.location ?? CGPoint(x: ns.x, y: Geometry.primaryHeight - ns.y)
+        return startSession(w, gesture: .move, at: p, flags: [], focused: m.tracker.focusedWindowKey(), fromPanel: true)
     }
 
     // MARK: Hit testing
@@ -353,6 +412,10 @@ final class DragController {
         switch s.gesture {
         case .move: Log.write("lockstep: move ended")
         case .resize: Log.write("lockstep: resize ended")
+        }
+        if s.fromPanel {
+            // Remove the temporary tap (outside the tap callback) unless the setting wants it.
+            DispatchQueue.main.async { [weak self] in self?.syncTap() }
         }
         if replay && !s.moved {
             let start = s.startMouse, flags = s.flags, pid = s.pid

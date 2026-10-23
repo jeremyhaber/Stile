@@ -1,5 +1,5 @@
 // Shared by the service worker, the editor page and the side panel: settings, filenames, the capture store.
-import { DEFAULT_S3 } from './s3.js';
+import { DEFAULT_S3, migrateS3 } from './s3.js';
 
 export const MAX_RECENT = 30;
 export const SETTING_DEFAULTS = { captureAfter: 'editor', captureAnnotate: true, captureAskWhere: false };
@@ -11,7 +11,12 @@ export async function getCaptureSettings() {
   return { captureAfter: after, captureAnnotate: s.captureAnnotate !== false, captureAskWhere: !!s.captureAskWhere };
 }
 export async function getS3Config() {
-  try { return { ...DEFAULT_S3, ...((await chrome.storage.local.get('captureS3')).captureS3 || {}) }; } catch { return { ...DEFAULT_S3 }; }
+  try {
+    const raw = (await chrome.storage.local.get('captureS3')).captureS3 || {};
+    const { cfg, changed } = migrateS3(raw);   // v3.0: provider presets are gone; old stored settings migrate on first read
+    if (changed) { try { await chrome.storage.local.set({ captureS3: cfg }); } catch { /* ignore */ } }
+    return cfg;
+  } catch { return { ...DEFAULT_S3 }; }
 }
 export async function setS3Config(patch) {
   const cur = await getS3Config();

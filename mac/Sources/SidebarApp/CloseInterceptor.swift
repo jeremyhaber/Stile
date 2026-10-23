@@ -213,9 +213,24 @@ final class CloseInterceptor {
             let relevant: CGEventFlags = [.maskCommand, .maskShift, .maskControl, .maskAlternate]
             if code == 31 {
                 // Command+O in a little window: "Open as tab" (swallowed; key repeat promotes only once).
-                guard event.flags.intersection(relevant) == [.maskCommand], chromeIsFrontmost(),
-                      let key = focusedWindowKey?(), let l = littleWindow(key) else { return false }
-                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                // Only a bare Command+O is considered (and logged); plain 'o' presses are never logged, and
+                // nothing is logged for other apps.
+                guard event.flags.intersection(relevant) == [.maskCommand], chromeIsFrontmost() else { return false }
+                let repeated = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+                guard let key = focusedWindowKey?() else {
+                    if !repeated { Log.write("cmd-o: skipped (no focused Chrome window)") }
+                    return false
+                }
+                guard let mapping = mappingProvider?(key) else {
+                    if !repeated { Log.write("cmd-o: skipped (window \(key) is not mapped to an extension window)") }
+                    return false
+                }
+                guard isLittle(mapping), let l = littleWindow(key) else {
+                    if !repeated { Log.write("cmd-o: skipped (window \(key) is not a little window)") }
+                    return false
+                }
+                if !repeated {
+                    Log.write("cmd-o: intercepted in little window \(l.windowId); promoting to a tab")
                     LittleLinks.promote(bridge: l.bridge, windowId: l.windowId)
                 }
                 return true

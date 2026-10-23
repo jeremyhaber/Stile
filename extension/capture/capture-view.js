@@ -1,6 +1,6 @@
 // Side panel / overlay UI for screenshots: camera button, Recent captures view, Settings section.
 // Plain DOM like boost-view.js; talks to the service worker through ctx.cmd.
-import { PRESETS, DEFAULT_S3, s3Configured } from './s3.js';
+import { DEFAULT_S3, s3Configured, migrateS3, regionFromEndpoint, effectiveRegion, autoStyle } from './s3.js';
 
 const svg = (body) => `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
 const ICONS = {
@@ -87,52 +87,46 @@ export function renderCaptureRecent(rootEl, ctx) {
 }
 
 // ------------------------------------------------------------------ settings
+// Rendered by settings.html (Screenshots section) with the window's own row styles (.group / .row / .lbl / .ctl).
 const AFTER = [['editor', 'Open the editor'], ['thumbnail', 'Show a thumbnail'], ['copy', 'Copy to the clipboard only']];
 const EXPIRY = [[3600, '1 hour'], [86400, '24 hours'], [604800, '7 days']];
 
 export function renderCaptureSettings(containerEl, ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'sec cap-settings'; wrap.setAttribute('data-testid', 'capture-settings');
-  wrap.innerHTML = `<div class="sec-h"><h2>Screenshots</h2></div>
-<div class="field">
-  <label for="cap-after">After taking a screenshot</label>
-  <select id="cap-after" data-testid="capture-after">${AFTER.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>
-  <p class="hint" id="cap-after-hint"></p>
-  <label class="check sub"><input type="checkbox" id="cap-annotate" data-testid="capture-annotate"><span>Annotation tools in the editor</span></label>
-  <label class="check sub"><input type="checkbox" id="cap-ask" data-testid="capture-ask-where"><span>Ask where to save each time</span></label>
-  <p class="hint">Saved screenshots go to Downloads / Screenshots. Alt+Shift+3 selects a region; set shortcuts for Visible area and Full page at <b>chrome://extensions/shortcuts</b>.</p>
+  wrap.className = 'cap-settings'; wrap.setAttribute('data-testid', 'capture-settings');
+  const row = (id, label, desc, ctl, cls = '') => `<div class="row ${cls}" data-row="${id}"><div class="lbl"><label class="t" for="${id}">${label}</label>${desc ? `<div class="d">${desc}</div>` : ''}</div><div class="ctl">${ctl}</div></div>`;
+  const selBox = (inner) => `<span class="sel">${inner}</span>`;
+  wrap.innerHTML = `
+<div class="group">
+  ${row('cap-after', 'After taking a screenshot', '', selBox(`<select id="cap-after" data-testid="capture-after">${AFTER.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>`))}
+  ${row('cap-annotate', 'Annotation tools in the editor', 'Draw, add text and blur parts of a screenshot before sharing it.', '<input type="checkbox" id="cap-annotate" data-testid="capture-annotate">')}
+  ${row('cap-ask', 'Ask where to save each time', 'Off saves to Downloads / Screenshots.', '<input type="checkbox" id="cap-ask" data-testid="capture-ask-where">')}
 </div>
-<div class="field cap-upload" data-testid="capture-upload-settings">
-  <label>Upload to your own storage</label>
-  <p class="hint">Any S3-compatible bucket. Your keys stay in this browser (never synced) and are only sent to the endpoint you enter here.</p>
-  <label for="cap-preset" class="sublabel">Provider</label>
-  <select id="cap-preset" data-testid="capture-s3-preset">${Object.entries(PRESETS).map(([k, p]) => `<option value="${k}">${esc(p.label)}</option>`).join('')}</select>
-  <p class="hint" id="cap-preset-hint"></p>
-  <label for="cap-endpoint" class="sublabel">Endpoint URL</label>
-  <input id="cap-endpoint" class="cap-in" data-testid="capture-s3-endpoint" type="url" spellcheck="false" autocomplete="off" placeholder="https://s3.us-east-1.amazonaws.com">
-  <div class="cap-two">
-    <div><label for="cap-region" class="sublabel">Region</label><input id="cap-region" class="cap-in" data-testid="capture-s3-region" spellcheck="false" autocomplete="off"></div>
-    <div><label for="cap-bucket" class="sublabel">Bucket</label><input id="cap-bucket" class="cap-in" data-testid="capture-s3-bucket" spellcheck="false" autocomplete="off"></div>
-  </div>
-  <label for="cap-akid" class="sublabel">Access key ID</label>
-  <input id="cap-akid" class="cap-in" data-testid="capture-s3-key" spellcheck="false" autocomplete="off">
-  <label for="cap-secret" class="sublabel">Secret access key</label>
-  <input id="cap-secret" class="cap-in" data-testid="capture-s3-secret" type="password" spellcheck="false" autocomplete="new-password">
-  <label for="cap-prefix" class="sublabel">Path prefix</label>
-  <input id="cap-prefix" class="cap-in" data-testid="capture-s3-prefix" spellcheck="false" autocomplete="off" placeholder="screenshots/{yyyy}/{mm}/">
-  <div class="cap-two">
-    <div><label for="cap-style" class="sublabel">Addressing</label><select id="cap-style" data-testid="capture-s3-style"><option value="path">Path style</option><option value="virtual">Virtual-hosted</option></select></div>
-    <div><label for="cap-naming" class="sublabel">File names</label><select id="cap-naming" data-testid="capture-s3-naming"><option value="random">Random id</option><option value="timestamp">Timestamp</option></select></div>
-  </div>
-  <label for="cap-link" class="sublabel">Link type</label>
-  <select id="cap-link" data-testid="capture-s3-linktype"><option value="public">Public base URL</option><option value="presigned">Presigned link</option></select>
-  <div id="cap-public"><label for="cap-base" class="sublabel">Public base URL</label><input id="cap-base" class="cap-in" data-testid="capture-s3-base" type="url" spellcheck="false" autocomplete="off" placeholder="https://shots.example.com/"></div>
-  <div id="cap-expiry"><label for="cap-exp" class="sublabel">Link expires after</label><select id="cap-exp" data-testid="capture-s3-expiry">${EXPIRY.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></div>
-  <div class="cap-actions">
+<p class="note" id="cap-after-hint"></p>
+<p class="note">Alt+Shift+3 selects a region. Set shortcuts for Visible area and Full page at <b>chrome://extensions/shortcuts</b>.</p>
+
+<h2 class="group-h">Upload to your own storage</h2>
+<div data-testid="capture-upload-settings">
+<div class="group cap-upload">
+  ${row('cap-endpoint', 'Endpoint URL', '', '<input id="cap-endpoint" data-testid="capture-s3-endpoint" type="url" spellcheck="false" autocomplete="off" placeholder="https://s3.us-east-1.amazonaws.com">', 'form')}
+  ${row('cap-bucket', 'Bucket', '', '<input id="cap-bucket" type="text" data-testid="capture-s3-bucket" spellcheck="false" autocomplete="off">', 'form')}
+  ${row('cap-akid', 'Access key ID', '', '<input id="cap-akid" type="text" data-testid="capture-s3-key" spellcheck="false" autocomplete="off">', 'form')}
+  ${row('cap-secret', 'Secret access key', '', '<input id="cap-secret" type="password" data-testid="capture-s3-secret" spellcheck="false" autocomplete="new-password">', 'form')}
+  ${row('cap-region', 'Region', 'Optional. Filled in from the endpoint when it can.', '<input id="cap-region" type="text" data-testid="capture-s3-region" spellcheck="false" autocomplete="off" placeholder="us-east-1">', 'form')}
+  ${row('cap-prefix', 'Path prefix', '', '<input id="cap-prefix" type="text" data-testid="capture-s3-prefix" spellcheck="false" autocomplete="off" placeholder="screenshots/{yyyy}/{mm}/">', 'form')}
+  ${row('cap-naming', 'File names', '', selBox('<select id="cap-naming" data-testid="capture-s3-naming"><option value="random">Random id</option><option value="timestamp">Timestamp</option></select>'))}
+  ${row('cap-link', 'Link type', '', selBox('<select id="cap-link" data-testid="capture-s3-linktype"><option value="public">Public base URL</option><option value="presigned">Presigned link</option></select>'))}
+  <div id="cap-public">${row('cap-base', 'Public base URL', 'Links are this address plus the file name.', '<input id="cap-base" type="url" data-testid="capture-s3-base" spellcheck="false" autocomplete="off" placeholder="https://shots.example.com/">', 'form')}</div>
+  <div id="cap-expiry">${row('cap-exp', 'Link expires after', '', selBox(`<select id="cap-exp" data-testid="capture-s3-expiry">${EXPIRY.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>`))}</div>
+  <div class="row"><div class="lbl"><div class="t">Advanced</div></div><div class="ctl"><button type="button" class="btn small" id="cap-adv" data-testid="capture-s3-advanced" aria-expanded="false">Show</button></div></div>
+  <div id="cap-advanced" hidden>${row('cap-style', 'Addressing', '', selBox('<select id="cap-style" data-testid="capture-s3-style"><option value="auto">Automatic</option><option value="path">Path style</option><option value="virtual">Virtual-hosted</option></select>'))}<div class="row"><div class="lbl"><div class="d" id="cap-style-hint"></div></div></div></div>
+  <div class="row actions">
     <button type="button" class="btn" data-testid="capture-s3-test">Test connection</button>
     <button type="button" class="btn danger" data-testid="capture-s3-clear">Clear credentials</button>
   </div>
-  <p class="hint cap-result" id="cap-result" data-testid="capture-s3-result" role="status"></p>
+</div>
+<p class="note cap-result" id="cap-result" data-testid="capture-s3-result" role="status"></p>
+<p class="note">Works with any S3-compatible service (AWS, Cloudflare R2, Backblaze B2, iDrive e2, Wasabi, MinIO, …). Your keys stay in this browser (never synced) and are only sent to the endpoint you enter here.</p>
 </div>`;
   containerEl.append(wrap);
   const $ = (id) => wrap.querySelector('#' + id);
@@ -158,29 +152,49 @@ export function renderCaptureSettings(containerEl, ctx) {
   // ---- upload (storage.local only)
   let cfg = { ...DEFAULT_S3 };
   const fields = { endpoint: 'cap-endpoint', region: 'cap-region', bucket: 'cap-bucket', accessKeyId: 'cap-akid', secretAccessKey: 'cap-secret', prefix: 'cap-prefix', style: 'cap-style', naming: 'cap-naming', linkType: 'cap-link', publicBase: 'cap-base' };
-  const paint = () => {
-    for (const [k, id] of Object.entries(fields)) $(id).value = cfg[k] ?? '';
-    $('cap-preset').value = cfg.preset in PRESETS ? cfg.preset : 'custom';
+  const styleHint = () => {
+    const a = autoStyle(cfg.endpoint);
+    $('cap-style-hint').textContent = cfg.style === 'auto' ? `Automatic uses ${a === 'virtual' ? 'virtual-hosted' : 'path'} addressing for this endpoint (virtual-hosted for amazonaws.com, path-style for everything else).` : `Forced to ${cfg.style === 'virtual' ? 'virtual-hosted' : 'path'} addressing.`;
+  };
+  const paint = (except) => {
+    for (const [k, id] of Object.entries(fields)) if (id !== except) $(id).value = cfg[k] ?? '';
     $('cap-exp').value = String(cfg.expiry);
-    $('cap-preset-hint').textContent = PRESETS[$('cap-preset').value].hint;
+    $('cap-region').placeholder = regionFromEndpoint(cfg.endpoint) || 'us-east-1';
     $('cap-public').hidden = cfg.linkType === 'presigned';
     $('cap-expiry').hidden = cfg.linkType !== 'presigned';
+    styleHint();
   };
   const loadS3 = async () => {
-    try { cfg = { ...DEFAULT_S3, ...((await chrome.storage.local.get('captureS3')).captureS3 || {}) }; } catch { /* ignore */ }
+    try {
+      const m = migrateS3((await chrome.storage.local.get('captureS3')).captureS3 || {});
+      cfg = m.cfg;
+      if (m.changed) await chrome.storage.local.set({ captureS3: cfg });
+    } catch { /* ignore */ }
     paint();
   };
   let saveT = 0;
   const persist = () => { clearTimeout(saveT); saveT = setTimeout(() => chrome.storage.local.set({ captureS3: cfg }), 200); };
+  // Region follows the endpoint until the user types their own.
+  const followEndpoint = () => {
+    if (cfg.regionAuto || !String(cfg.region || '').trim()) { cfg.region = regionFromEndpoint(cfg.endpoint) || 'us-east-1'; cfg.regionAuto = true; $('cap-region').value = cfg.region; }
+  };
   for (const [k, id] of Object.entries(fields)) {
-    $(id).addEventListener('input', () => { cfg[k] = $(id).value.trim(); if (k === 'linkType') paint(); persist(); });
-    $(id).addEventListener('change', () => { cfg[k] = $(id).value.trim(); paint(); persist(); });
+    const take = (e) => {
+      cfg[k] = $(id).value.trim();
+      if (k === 'region') { cfg.regionAuto = !cfg.region; if (cfg.regionAuto) followEndpoint(); }
+      if (k === 'endpoint') { followEndpoint(); }
+      if (k === 'linkType' || k === 'style' || k === 'endpoint') paint(id);
+      persist();
+    };
+    $(id).addEventListener('input', take);
+    $(id).addEventListener('change', take);
   }
   $('cap-exp').onchange = () => { cfg.expiry = Number($('cap-exp').value); persist(); };
-  $('cap-preset').onchange = () => {
-    const p = PRESETS[$('cap-preset').value];
-    cfg.preset = $('cap-preset').value; cfg.endpoint = p.endpoint; cfg.region = p.region; cfg.style = p.style;
-    paint(); persist();
+  q('capture-s3-advanced').onclick = () => {
+    const open = $('cap-advanced').hidden;
+    $('cap-advanced').hidden = !open;
+    q('capture-s3-advanced').textContent = open ? 'Hide' : 'Show';
+    q('capture-s3-advanced').setAttribute('aria-expanded', String(open));
   };
   const result = (t, bad) => { const r = $('cap-result'); r.textContent = t; r.dataset.bad = bad ? 'true' : 'false'; };
   q('capture-s3-test').onclick = async (e) => {

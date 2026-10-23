@@ -122,7 +122,7 @@ const newest = async () => (await list())[0];
 const freshAfter = async (n0) => { for (let i = 0; i < 60; i++) { const l = await list(); if (l.length > n0 || (l[0] && l.length === 30)) return l[0]; await sleep(150); } return null; };
 
 const page = await ctx.newPage();
-await page.goto(`${SITE}/plain`); await page.bringToFront();
+await page.goto(`${SITE}/plain`); await page.bringToFront(); await sleep(800);
 const [VW, VH] = await page.evaluate(() => [innerWidth, innerHeight]);
 // the clipboard is read from the http page (permission can't be granted to extension origins in Playwright)
 const readClip = async () => {
@@ -336,7 +336,7 @@ await panel.setViewportSize({ width: 380, height: 760 });
 await panel.goto(`chrome-extension://${extId}/sidepanel.html?windowId=${panelWinId}`);
 await panel.waitForSelector('[data-testid=address-field]');
 {
-  check('side panel: camera button sits in the address row next to Boost', await panel.locator('.addr-row [data-testid=capture-button]').count() === 1 && await panel.locator('.addr-row [data-testid=boost-button]').count() === 1);
+  check('side panel: camera button sits in the footer next to Boost', await panel.locator('#footer [data-testid=capture-button]').count() === 1 && await panel.locator('#footer [data-testid=boost-button]').count() === 1 && await panel.locator('.addr-row [data-testid=capture-button]').count() === 0);
   await panel.locator('[data-testid=capture-button]').click();
   const items = await panel.locator('[data-testid=context-menu-item]').allTextContents();
   check('camera menu: Visible area / Full page / Region / Recent captures', items.length === 4 && /Visible/.test(items[0]) && /Full/.test(items[1]) && /Region/.test(items[2]) && /Recent/.test(items[3]), JSON.stringify(items));
@@ -377,51 +377,62 @@ await panel.waitForSelector('[data-testid=address-field]');
 
 // ------------------------------------------------------------------ settings (persistence, validation, test connection)
 {
-  await panel.locator('[data-testid=settings-button]').click();
-  await panel.waitForSelector('[data-testid=capture-settings]');
-  await panel.locator('[data-testid=capture-settings] .sec-h').scrollIntoViewIfNeeded();
-  check('settings: defaults — editor / annotation on / ask-where off', await panel.locator('[data-testid=capture-after]').inputValue() === 'editor' && await panel.locator('[data-testid=capture-annotate]').isChecked() && !(await panel.locator('[data-testid=capture-ask-where]').isChecked()));
-  await panel.locator('[data-testid=capture-after]').selectOption('thumbnail');
-  await panel.locator('[data-testid=capture-annotate]').uncheck();
-  await panel.locator('[data-testid=capture-ask-where]').check();
+  const openShots = async () => {
+    const pg = await ctx.newPage(); await pg.setViewportSize({ width: 860, height: 700 });
+    await pg.goto(`chrome-extension://${extId}/settings.html#screenshots`);
+    await pg.waitForSelector('[data-testid=capture-settings]');
+    return pg;
+  };
+  // migration: a v2.9 config with a provider preset loses `provider`/`preset`, keeps its values, and is persisted again
+  await helper.evaluate(() => chrome.storage.local.set({ captureS3: { provider: 'r2', preset: 'r2', endpoint: 'https://acc.r2.cloudflarestorage.com', region: 'auto', bucket: 'old', accessKeyId: 'AK', secretAccessKey: 'SK', style: 'path', prefix: 'p/', naming: 'random', linkType: 'public', publicBase: 'https://x/', expiry: 3600 } }));
+  const mig = await helper.evaluate(async () => { const m = await import(chrome.runtime.getURL('capture/common.js')); const c = await m.getS3Config(); return { c, stored: (await chrome.storage.local.get('captureS3')).captureS3 }; });
+  check('S3 migration: provider/preset dropped, bucket + keys kept, stored again without them', !('provider' in mig.c) && !('preset' in mig.c) && mig.c.bucket === 'old' && mig.c.accessKeyId === 'AK' && !('provider' in mig.stored) && !('preset' in mig.stored), JSON.stringify(mig.stored));
+  const regs = await helper.evaluate(async () => { const m = await import(chrome.runtime.getURL('capture/s3.js')); return ['https://x.r2.cloudflarestorage.com', 'https://s3.eu-west-2.amazonaws.com', 'https://nyc3.digitaloceanspaces.com', 'https://s3.us-west-004.backblazeb2.com', 'https://s3.eu-central-1.wasabisys.com', 'http://127.0.0.1:9000'].map((e) => m.regionFromEndpoint(e)); });
+  check('S3 region auto-detect: R2 auto, AWS, DigitalOcean, Backblaze, Wasabi; unknown host gives none', JSON.stringify(regs) === JSON.stringify(['auto', 'eu-west-2', 'nyc3', 'us-west-004', 'eu-central-1', null]), JSON.stringify(regs));
+  await helper.evaluate(() => chrome.storage.local.remove('captureS3'));
+  let sp = await openShots();
+  check('settings: defaults — editor / annotation on / ask-where off', await sp.locator('[data-testid=capture-after]').inputValue() === 'editor' && await sp.locator('[data-testid=capture-annotate]').isChecked() && !(await sp.locator('[data-testid=capture-ask-where]').isChecked()));
+  await sp.locator('[data-testid=capture-after]').selectOption('thumbnail');
+  await sp.locator('[data-testid=capture-annotate]').uncheck();
+  await sp.locator('[data-testid=capture-ask-where]').check();
   const sync = await helper.evaluate(() => chrome.storage.sync.get(['captureAfter', 'captureAnnotate', 'captureAskWhere']));
   check('settings: stored in storage.sync (captureAfter, captureAnnotate, captureAskWhere)', sync.captureAfter === 'thumbnail' && sync.captureAnnotate === false && sync.captureAskWhere === true, JSON.stringify(sync));
-  await panel.locator('[data-testid=capture-s3-preset]').selectOption('r2');
-  check('settings: R2 preset prefills region auto + path style', await panel.locator('[data-testid=capture-s3-region]').inputValue() === 'auto' && await panel.locator('[data-testid=capture-s3-style]').inputValue() === 'path' && (await panel.locator('[data-testid=capture-s3-endpoint]').inputValue()).includes('r2.cloudflarestorage.com'));
-  await panel.locator('[data-testid=capture-s3-preset]').selectOption('aws');
-  check('settings: AWS preset → us-east-1, virtual-hosted', await panel.locator('[data-testid=capture-s3-region]').inputValue() === 'us-east-1' && await panel.locator('[data-testid=capture-s3-style]').inputValue() === 'virtual');
-  await panel.locator('[data-testid=capture-s3-preset]').selectOption('custom');
-  const fill = async (t, v) => { await panel.locator(`[data-testid=${t}]`).fill(v); };
+  check('settings: no provider presets', await sp.locator('[data-testid=capture-s3-preset]').count() === 0);
+  await sp.locator('[data-testid=capture-s3-endpoint]').fill('https://abc.r2.cloudflarestorage.com');
+  check('settings: R2 endpoint auto-fills region "auto"', await sp.locator('[data-testid=capture-s3-region]').inputValue() === 'auto');
+  await sp.locator('[data-testid=capture-s3-endpoint]').fill('https://s3.eu-west-2.amazonaws.com');
+  check('settings: AWS endpoint auto-fills its region', await sp.locator('[data-testid=capture-s3-region]').inputValue() === 'eu-west-2');
+  await sp.locator('[data-testid=capture-s3-endpoint]').fill('https://nyc3.digitaloceanspaces.com');
+  check('settings: DigitalOcean endpoint auto-fills nyc3', await sp.locator('[data-testid=capture-s3-region]').inputValue() === 'nyc3');
+  await sp.locator('[data-testid=capture-s3-advanced]').click();
+  check('settings: Addressing sits under Advanced (automatic by default)', await sp.locator('[data-testid=capture-s3-style]').inputValue() === 'auto');
+  const fill = async (t, v) => { await sp.locator(`[data-testid=${t}]`).fill(v); };
   await fill('capture-s3-endpoint', S3URL); await fill('capture-s3-region', 'us-east-1'); await fill('capture-s3-bucket', 'shots');
   await fill('capture-s3-key', CREDS.accessKeyId); await fill('capture-s3-secret', 'wrong-secret'); await fill('capture-s3-prefix', 'screenshots/{yyyy}/{mm}/');
-  await panel.locator('[data-testid=capture-s3-style]').selectOption('path');
-  await panel.locator('[data-testid=capture-s3-linktype]').selectOption('public'); await fill('capture-s3-base', `${S3URL}/shots/`);
-  await panel.evaluate(() => document.querySelector('#scroll-settings').scrollTop = document.querySelector('[data-testid=capture-settings]').offsetTop - 40);
-  await panel.screenshot({ path: path.join(SHOTS, 'capture-settings-top.png') });
-  await panel.locator('[data-testid=capture-s3-test]').click();
-  await panel.waitForFunction(() => /Signature|match|Connected|Could not/i.test(document.querySelector('[data-testid=capture-s3-result]').textContent), null, { timeout: 8000 });
-  const bad = await panel.locator('[data-testid=capture-s3-result]').textContent();
+  await sp.locator('[data-testid=capture-s3-linktype]').selectOption('public'); await fill('capture-s3-base', `${S3URL}/shots/`);
+  await sp.screenshot({ path: path.join(SHOTS, 'capture-settings-top.png') });
+  await sp.locator('[data-testid=capture-s3-test]').click();
+  await sp.waitForFunction(() => /Signature|match|Connected|Could not/i.test(document.querySelector('[data-testid=capture-s3-result]').textContent), null, { timeout: 8000 });
+  const bad = await sp.locator('[data-testid=capture-s3-result]').textContent();
   check('test connection: wrong secret shows the exact server error', /403/.test(bad) && /SignatureDoesNotMatch/.test(bad) && /does not match the signature/.test(bad), bad);
   await fill('capture-s3-secret', CREDS.secretAccessKey);
   store.clear(); s3log.length = 0;
-  await panel.locator('[data-testid=capture-s3-test]').click();
-  await panel.waitForFunction(() => /Connected/.test(document.querySelector('[data-testid=capture-s3-result]').textContent), null, { timeout: 8000 });
+  await sp.locator('[data-testid=capture-s3-test]').click();
+  await sp.waitForFunction(() => /Connected/.test(document.querySelector('[data-testid=capture-s3-result]').textContent), null, { timeout: 8000 });
   check('test connection: PUT sidebar-test.txt then DELETE it (both signed correctly)', s3log.length === 2 && s3log[0].method === 'PUT' && /sidebar-test\.txt$/.test(s3log[0].path) && s3log[1].method === 'DELETE' && s3log.every((l) => l.ok) && store.size === 0, JSON.stringify(s3log));
   await sleep(400);
-  await panel.reload(); await panel.waitForSelector('[data-testid=settings-button]');
-  if (!(await panel.locator('[data-testid=settings-view]').isVisible())) await panel.locator('[data-testid=settings-button]').click();
-  await panel.waitForSelector('[data-testid=capture-settings]');
-  check('settings: persist across reloads (incl. S3 fields)', await panel.locator('[data-testid=capture-after]').inputValue() === 'thumbnail' && !(await panel.locator('[data-testid=capture-annotate]').isChecked()) && await panel.locator('[data-testid=capture-s3-bucket]').inputValue() === 'shots' && await panel.locator('[data-testid=capture-s3-key]').inputValue() === CREDS.accessKeyId);
+  await sp.close(); sp = await openShots();
+  check('settings: persist across reloads (incl. S3 fields)', await sp.locator('[data-testid=capture-after]').inputValue() === 'thumbnail' && !(await sp.locator('[data-testid=capture-annotate]').isChecked()) && await sp.locator('[data-testid=capture-s3-bucket]').inputValue() === 'shots' && await sp.locator('[data-testid=capture-s3-key]').inputValue() === CREDS.accessKeyId);
   const inLocal = await helper.evaluate(() => Promise.all([chrome.storage.local.get('captureS3'), chrome.storage.sync.get('captureS3')]));
   check('credentials live in storage.local only (never sync)', !!inLocal[0].captureS3 && inLocal[0].captureS3.secretAccessKey === CREDS.secretAccessKey && !inLocal[1].captureS3);
-  check('settings page says the keys stay in the browser and go only to the endpoint', /never synced/.test(await panel.locator('[data-testid=capture-upload-settings]').textContent()));
-  await panel.locator('[data-testid=capture-upload-settings]').scrollIntoViewIfNeeded();
-  await panel.screenshot({ path: path.join(SHOTS, 'capture-settings-upload.png') });
-  await panel.locator('[data-testid=capture-s3-clear]').click(); await sleep(300);
+  check('settings page says the keys stay in the browser and go only to the endpoint', /never synced/.test(await sp.locator('[data-testid=capture-upload-settings]').textContent()));
+  await sp.locator('[data-testid=capture-upload-settings]').scrollIntoViewIfNeeded();
+  await sp.screenshot({ path: path.join(SHOTS, 'capture-settings-upload.png') });
+  await sp.locator('[data-testid=capture-s3-clear]').click(); await sleep(300);
   const cleared = await helper.evaluate(() => chrome.storage.local.get('captureS3'));
   check('Clear credentials wipes key + secret only', cleared.captureS3.accessKeyId === '' && cleared.captureS3.secretAccessKey === '' && cleared.captureS3.bucket === 'shots');
   await setS3(S3CFG); await setSync({ captureAfter: 'editor', captureAnnotate: true, captureAskWhere: false });
-  await panel.locator('[data-testid=settings-view] [data-testid=back-button]').click().catch(() => {});
+  await sp.close();
 }
 
 // ------------------------------------------------------------------ upload from the editor (public base URL, then presigned)
@@ -470,7 +481,7 @@ await panel.waitForSelector('[data-testid=address-field]');
   check('timestamp naming: key is "Screenshot YYYY-MM-DD at HH.MM.SS.png"', /Screenshot%20\d{4}-\d\d-\d\d%20at%20\d\d\.\d\d\.\d\d\.png/.test(link2));
   const g2 = await fetch(link2);
   check('presigned link fetches the object (server verified the signature with aws4)', g2.ok && (await g2.arrayBuffer()).byteLength === [...store.values()][0].length);
-  const tampered = await fetch(link2.replace(/X-Amz-Signature=./, 'X-Amz-Signature=0'));
+  const tampered = await fetch(link2.replace(/X-Amz-Signature=(.)/, (m, c) => 'X-Amz-Signature=' + (c === '0' ? '1' : '0')));
   check('presigned link with a tampered signature is rejected', tampered.status === 403);
   await ed2.close();
   await setS3({ ...S3CFG });

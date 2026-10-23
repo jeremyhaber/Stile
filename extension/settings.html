@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sidebar Settings</title>
+  <link rel="stylesheet" href="settings.css">
+  <link rel="stylesheet" href="boost.css">
+  <link rel="stylesheet" href="capture/capture-view.css">
+  <script type="module" src="settings.js"></script>
+</head>
+<body class="settings-page">
+  <div class="win" data-testid="settings-window">
+    <nav class="nav" id="nav" aria-label="Settings sections" data-testid="settings-nav"></nav>
+    <main class="pane" id="pane">
+      <header class="pane-h"><h1 id="pane-title" data-testid="settings-title"></h1></header>
+      <div class="pane-body" id="pane-body"></div>
+    </main>
+  </div>
+  <div id="toast-root" aria-live="polite"></div>
+</body>
+</html>
