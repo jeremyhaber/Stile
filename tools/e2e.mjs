@@ -679,6 +679,48 @@ async function main() {
   const wb = await swEval(async () => { const w = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }); return { left: w.left, top: w.top, width: w.width, height: w.height }; });
   check('activate from another profile applies window bounds', wb.width === 900 && wb.height === 640, JSON.stringify(wb));
 
+  // ---- v2.7: toolbar badge, offline card, overlay toggle
+  {
+    const dbg = () => cmd({ cmd: 'debugState' });
+    const untilSt = async (fn, ms = 8000) => { for (let t = 0; t < ms; t += 250) { const d = await dbg(); if (fn(d)) return d; await sleep(250); } return dbg(); };
+    let d = await untilSt((x) => x?.helper?.status === 'connected' && x.settings?.appEverConnected);
+    check('v2.7: appEverConnected stored after the first connection', d.settings?.appEverConnected === true);
+    check('v2.7: badge cleared and title "Sidebar" while connected', d.badge?.text === '' && d.badge?.title === 'Sidebar', JSON.stringify(d.badge));
+    const menu = () => (d.contextMenus || []).find((m) => m.id === 'overlay-toggle');
+    check('v2.7: context menu item exists while connected (checkbox, action context, checked)', menu()?.type === 'checkbox' && menu().checked === true && menu().contexts?.[0] === 'action', JSON.stringify(d.contextMenus));
+    check('v2.7: offline card hidden while connected', (await panel.locator('[data-testid="app-offline-card"]').isVisible()) === false);
+
+    await panel.locator('[data-testid="settings-button"]').click(); await sleep(400);
+    const sw = panel.locator('[data-testid="overlay-enabled"]');
+    check('v2.7: settings switch present, checked by default', (await sw.isVisible()) && (await sw.isChecked()));
+    await sw.uncheck(); await sleep(600);
+    const stj = () => JSON.parse(fs.readFileSync(path.join(helperDir, 'state.json'), 'utf8'));
+    check('v2.7: switch sends setOverlayEnabled (persisted in state.json)', stj().overlayEnabled === false, JSON.stringify(stj()));
+    d = await dbg();
+    check('v2.7: context menu follows the switch', menu()?.checked === false && d.settings?.overlayEnabled === false);
+    host.broadcast({ type: 'overlayEnabled', enabled: true }); await sleep(600);
+    d = await dbg();
+    check('v2.7: broadcast from the app updates switch and menu', (await sw.isChecked()) && menu()?.checked === true && d.settings?.overlayEnabled === true);
+    await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(300);
+
+    // drop the connection (the app "quit")
+    for (const c of [...host.conns]) c.sock.destroy();
+    d = await untilSt((x) => x?.helper?.status !== 'connected');
+    check('v2.7: helper reported as disconnected', d.helper?.status !== 'connected', JSON.stringify(d.helper));
+    d = await untilSt((x) => x?.badge?.text === '!');
+    check('v2.7: badge "!" after having connected once', d.badge?.text === '!' && /isn't running/.test(d.badge?.title || ''), JSON.stringify(d.badge));
+    check('v2.7: context menu removed while disconnected', !menu(), JSON.stringify(d.contextMenus));
+    await sleep(500);
+    const card = panel.locator('[data-testid="app-offline-card"]');
+    check('v2.7: offline card shown with both buttons', (await card.isVisible()) && /isn't running/.test(await card.innerText()) && (await panel.locator('[data-testid="app-offline-open"]').isVisible()) && (await panel.locator('[data-testid="app-offline-retry"]').isVisible()));
+    // Retry reconnects (the reference host is still listening)
+    await panel.locator('[data-testid="app-offline-retry"]').click();
+    d = await untilSt((x) => x?.helper?.status === 'connected' && x.badge?.text === '');
+    check('v2.7: Retry reconnects, badge cleared, menu back', d.helper?.status === 'connected' && d.badge?.text === '' && !!menu(), JSON.stringify([d.helper?.status, d.badge]));
+    await sleep(400);
+    check('v2.7: offline card hidden after reconnect', (await card.isVisible()) === false);
+  }
+
   check('no page errors in panel', errors.length === 0, errors.slice(0, 3).join(' | '));
   const swErrs = await swEval(() => (self.__errs || []).length).catch(() => 0);
   await ctx.close();

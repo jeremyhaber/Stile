@@ -74,7 +74,7 @@ class Client {
     return found;
   }
   async request(m, type) {
-    const rt = { getProfiles: 'profiles', identify: 'identified', switchProfile: 'switchResult', setGlobalSettings: 'settings', setProfileStyle: 'profiles' };
+    const rt = { getProfiles: 'profiles', identify: 'identified', switchProfile: 'switchResult', setGlobalSettings: 'settings', setProfileStyle: 'profiles', setOverlayEnabled: 'overlayEnabled' };
     this.send(m);
     return this.recv(type ?? rt[m.type] ?? m.type);
   }
@@ -101,6 +101,7 @@ check('colour: falls back to default_avatar_fill_color', by['Profile 2']?.color 
 check('profile name and email parsed', by.Default?.email === 'me@example.com' && by.Default?.name === 'Personal');
 check('empty email is ""', by['Profile 2']?.email === '');
 check('hello: default archiveDefaultMinutes 720', r?.settings?.archiveDefaultMinutes === 720);
+check('hello: overlayEnabled defaults to true', r?.settings?.overlayEnabled === true, j(r?.settings));
 
 // chromeTheme from Preferences
 const ct = by.Default?.chromeTheme;
@@ -191,6 +192,26 @@ r = await A.request({ type: 'setGlobalSettings', settings: { archiveDefaultMinut
 check('invalid archiveDefaultMinutes rejected', !!r?.error, j(r));
 check('invalid value leaves state unchanged', readJson(path.join(appDir, 'state.json')).archiveDefaultMinutes === 0);
 await A.request({ type: 'setGlobalSettings', settings: { archiveDefaultMinutes: 720 } });
+for (const c of [B, C, D0]) c.msgs.length = 0;
+A.msgs.length = 0;
+// setOverlayEnabled (v2.7)
+r = await A.request({ type: 'setOverlayEnabled', enabled: false, requestId: 11 });
+check('setOverlayEnabled: reply', r?.type === 'overlayEnabled' && r.enabled === false && r.requestId === 11, j(r));
+check('setOverlayEnabled: persisted to state.json', readJson(path.join(appDir, 'state.json')).overlayEnabled === false, slurp(path.join(appDir, 'state.json')));
+for (const [n, c] of [['B', B], ['C', C], ['D0', D0]]) {
+  const m = await c.recv('overlayEnabled');
+  check(`setOverlayEnabled: broadcast to connection ${n}`, m?.enabled === false && !('requestId' in m), j(m));
+}
+check('setOverlayEnabled: sender gets no unsolicited broadcast', await A.quiet(300));
+check('setOverlayEnabled: other state keys preserved', readJson(path.join(appDir, 'state.json')).archiveDefaultMinutes === 720);
+const D1 = spawnClient();
+r = await D1.request({ type: 'hello' });
+check('hello after set: includes overlayEnabled false', r?.settings?.overlayEnabled === false, j(r?.settings));
+r = await A.request({ type: 'setOverlayEnabled', enabled: 'yes' });
+check('setOverlayEnabled: non-boolean rejected, unchanged', !!r?.error && r.enabled === false && readJson(path.join(appDir, 'state.json')).overlayEnabled === false, j(r));
+r = await A.request({ type: 'setOverlayEnabled', enabled: true });
+check('setOverlayEnabled: re-enable', r?.enabled === true && readJson(path.join(appDir, 'state.json')).overlayEnabled === true);
+D1.closeStdin();
 D0.closeStdin();
 B.msgs.length = 0; C.msgs.length = 0; A.msgs.length = 0;
 

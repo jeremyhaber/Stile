@@ -245,23 +245,8 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         bridge = nil
         loadedKey = "waiting"
         pageLoaded = false
-        let html = """
-        <!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-        <style>
-        :root{color-scheme:light dark}
-        body{margin:0;font:13px -apple-system,system-ui,sans-serif;display:flex;height:100vh;align-items:center;justify-content:center;
-          background:Canvas;color:CanvasText}
-        .box{padding:24px;text-align:center;max-width:240px;opacity:.85}
-        h1{font-size:14px;margin:0 0 10px}
-        p{margin:6px 0;line-height:1.45;opacity:.75}
-        .mini{display:none;height:100vh;align-items:center;justify-content:center;font-size:18px;opacity:.5}
-        @media (max-width:120px){.box{display:none}.mini{display:flex}}
-        </style>
-        <div class="mini">&hellip;</div>
-        <div class="box"><h1>Waiting for the Sidebar extension&hellip;</h1>
-        <p>Make sure the Sidebar extension is loaded and enabled in this Chrome profile.</p>
-        <p>This window connects automatically.</p></div>
-        """
+        // Never shown over Chrome's tabs (the panel is ordered out until a live connection maps the window).
+        let html = "<!doctype html><meta charset=\"utf-8\"><style>:root{color-scheme:light dark}body{margin:0;background:Canvas}</style>"
         webView.loadHTMLString(html, baseURL: nil)
     }
 

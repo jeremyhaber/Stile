@@ -301,7 +301,14 @@ enum HostStore {
     }
 
     static func settings(from st: [String: Any]) -> [String: Any] {
-        ["archiveDefaultMinutes": validMinutes(st["archiveDefaultMinutes"]) ?? 720]
+        ["archiveDefaultMinutes": validMinutes(st["archiveDefaultMinutes"]) ?? 720,
+         "overlayEnabled": overlayEnabled(from: st)]
+    }
+
+    /// Global on/off for the overlay (v2.7); anything but an explicit `false` means on.
+    static func overlayEnabled(from st: [String: Any]) -> Bool {
+        if isBool(st["overlayEnabled"]), let b = st["overlayEnabled"] as? Bool { return b }
+        return true
     }
 
     static func currentSettings() -> [String: Any] { settings(from: readState()) }

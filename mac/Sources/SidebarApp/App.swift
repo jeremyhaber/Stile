@@ -26,9 +26,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let mgr = OverlayManager(server: server)
         manager = mgr
 
-        HotKey.register { [weak mgr] in
+        HotKey.registerPin { [weak mgr] in
             Task { @MainActor in
                 mgr?.togglePinFocused(requireChromeFrontmost: true)
+            }
+        }
+        HotKey.registerToggleOverlay { [weak mgr] in
+            Task { @MainActor in
+                mgr?.toggleOverlay(requireChromeFrontmost: true)
             }
         }
 

@@ -51,7 +51,8 @@
     "identity.email",
     "tabGroups",
     "scripting",
-    "userScripts"
+    "userScripts",
+    "contextMenus"
   ],
   "host_permissions": [
     "<all_urls>"

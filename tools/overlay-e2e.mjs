@@ -460,6 +460,12 @@ async function main() {
   check('App: launch at login switch posts setLaunchAtLogin(true)', lastHost('setLaunchAtLogin')?.value === true && await panel.locator('[data-testid="app-launch-login"]').isChecked());
   setHost({ launchAtLogin: false }); await sleep(300);
   check('App: launch at login follows hostState', !(await panel.locator('[data-testid="app-launch-login"]').isChecked()));
+  const ovSw = panel.locator('[data-testid="overlay-enabled"]');
+  check('App: "Show sidebar over Chrome\'s tabs" switch present and on', (await ovSw.isVisible()) && (await ovSw.isChecked()));
+  await ovSw.uncheck(); await sleep(600);
+  check('App: overlay switch sends setOverlayEnabled to the app (state.json)', JSON.parse(fs.readFileSync(path.join(appDir, 'state.json'), 'utf8')).overlayEnabled === false);
+  refApp.broadcast({ type: 'overlayEnabled', enabled: true }); await sleep(600);
+  check('App: overlay switch follows the app broadcast', await ovSw.isChecked());
   setHost({ accessibility: false }); await sleep(300);
   check('App: missing accessibility shows status and "Open settings"', /needed/i.test(await panel.locator('[data-testid="app-accessibility"]').innerText()) && await panel.locator('[data-testid="app-accessibility-open"]').isVisible());
   await panel.locator('[data-testid="app-accessibility-open"]').click(); await sleep(200);

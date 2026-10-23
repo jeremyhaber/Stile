@@ -21,6 +21,8 @@ final class OverlayManager {
     private var observers: [NSObjectProtocol] = []
     private var started = false
     private var anyConnectedSince: Date?
+    /// Global on/off (state.json `overlayEnabled`, owned by the host server).
+    private(set) var overlayEnabled = true
 
     init(server: HostServer) {
         self.server = server
@@ -29,6 +31,7 @@ final class OverlayManager {
     func start() {
         if started { return }
         started = true
+        overlayEnabled = server.overlayEnabled
 
         mapper.windowsProvider = { [weak self] in self?.tracker.windows ?? [] }
         mapper.bridgesProvider = { [weak self] in self?.server.identified ?? [] }
@@ -151,6 +154,13 @@ final class OverlayManager {
     }
 
     private func settingsChanged() {
+        let on = server.overlayEnabled
+        if on != overlayEnabled {
+            overlayEnabled = on
+            Log.write("overlay: \(on ? "enabled" : "disabled")")
+            for c in controllers.values { c.setOverlayEnabled(on) }
+            closer.refreshTargets(supportedWindows())
+        }
         for c in controllers.values { c.settingsChanged() }
     }
 
@@ -172,6 +182,7 @@ final class OverlayManager {
                     self.followLastActivity = Date()
                     self.startFollowing()
                 }
+                c.overlayEnabled = overlayEnabled
                 controllers[w.key] = c
                 c.attach(mapper.map[w.key])
             }
@@ -208,6 +219,7 @@ final class OverlayManager {
     }
 
     private func pointerMoved() {
+        guard overlayEnabled else { return }
         let p = NSEvent.mouseLocation
         let front = tracker.chromeFrontmost
         for c in controllers.values { c.pointerMoved(p, chromeFrontmost: front) }
@@ -218,13 +230,13 @@ final class OverlayManager {
     private func mouseButtonEvent(_ type: NSEvent.EventType, at loc: NSPoint) {
         switch type {
         case .leftMouseDown:
-            if tracker.chromeFrontmost {
+            if overlayEnabled && tracker.chromeFrontmost {
                 followLastActivity = Date()
                 startFollowing()
                 for c in controllers.values { c.dragBegan(mouse: loc) }
             }
         case .leftMouseDragged:
-            if tracker.chromeFrontmost {
+            if overlayEnabled && tracker.chromeFrontmost {
                 followLastActivity = Date()
                 startFollowing()
                 for c in controllers.values { c.dragMoved(mouse: loc) }
@@ -297,7 +309,14 @@ final class OverlayManager {
         return controllers.values.first(where: { $0.window.visible })
     }
 
+    /// Control+Option+Shift+S: flips `overlayEnabled` (saved, broadcast to every extension connection).
+    func toggleOverlay(requireChromeFrontmost: Bool) {
+        if requireChromeFrontmost && !tracker.chromeFrontmost { return }
+        server.setOverlayEnabled(!server.overlayEnabled, from: nil)
+    }
+
     func togglePinFocused(requireChromeFrontmost: Bool) {
+        if !overlayEnabled { return }
         if requireChromeFrontmost && !tracker.chromeFrontmost { return }
         guard let c = focusedController() else { return }
         c.setPinned(c.state != .pinned)

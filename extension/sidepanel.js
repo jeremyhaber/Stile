@@ -163,6 +163,8 @@ const S = {
   pinned: [],
   archive: [],
   helper: null,
+  appEverConnected: false,
+  overlayEnabled: true,
   archiveMinutes: null,
   globalMinutes: DEFAULT_ARCHIVE_MINUTES,
   profileDir: null,
@@ -212,7 +214,7 @@ async function load() {
     chrome.windows.getAll({ populate: true, windowTypes: ['normal'] }).catch(() => []),
     (chrome.tabGroups ? chrome.tabGroups.query({}).catch(() => []) : Promise.resolve([])),
     chrome.storage.session.get(['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'incTabNames', 'incLockedTabs']).catch(() => ({})),
-    chrome.storage.local.get(['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs', 'faviconCache']).catch(() => ({})),
+    chrome.storage.local.get(['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs', 'faviconCache', 'appEverConnected', 'overlayEnabled']).catch(() => ({})),
     chrome.storage.sync.get(['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor']).catch(() => ({}))
   ]);
   let roots = await getRoots().catch(() => null);
@@ -277,6 +279,8 @@ async function load() {
   S.favCache = loc.faviconCache || {};
   S.bindings = ses.bindings || {};
   S.helper = ses.helper || null;
+  S.appEverConnected = !!loc.appEverConnected;
+  S.overlayEnabled = loc.overlayEnabled !== false;
   S.lastActive = loc.lastActive || {};
   S.archive = loc.archive || [];
   S.globalMinutes = typeof loc.globalDefaultMinutes === 'number' ? loc.globalDefaultMinutes : DEFAULT_ARCHIVE_MINUTES;
@@ -416,6 +420,7 @@ function draw() {
   drawTheme();
   drawProfiles();
   drawPopoutBar();
+  drawOfflineCard();
   // Overlay compact mode is the same DOM as expanded (clipped by the app), so the lists stay drawn behind settings/archive too.
   if (S.view === 'main' || (OVERLAY && isCompact())) { drawHint(); drawFavs(); drawPinned(); drawToday(); }
   drawFooter();
@@ -1129,6 +1134,34 @@ function drawSettings() {
   else { status.textContent = `Error: ${hs.error || 'unknown'}`; dot.classList.add('bad'); }
   status.dataset.status = (hs && hs.status) || 'checking';
   $('helper-retry').hidden = connected;
+  $('field-overlay-enabled').hidden = !connected;
+  $('set-overlay-enabled').checked = S.overlayEnabled;
+}
+
+// v2.7: card shown when the Mac app isn't connected (only once it has connected before, so side-panel-only users aren't nagged).
+let offlineTryAt = 0;
+let offlineFailed = false;
+let offlineTimer = null;
+function drawOfflineCard() {
+  const hs = S.helper;
+  const down = !OVERLAY && S.appEverConnected && !!(hs && (hs.status === 'not_installed' || hs.status === 'error'));
+  $('app-offline').hidden = !down;
+  if (!down) { offlineFailed = false; offlineTryAt = 0; return; }
+  $('app-offline-msg').textContent = offlineFailed
+    ? "Couldn't start it. Open Sidebar.app from your Applications folder."
+    : "Open it to cover Chrome's tabs with this sidebar.";
+}
+async function offlineRetry(launch) {
+  offlineFailed = false;
+  offlineTryAt = Date.now();
+  await cmd('retryHelper');
+  drawOfflineCard();
+  if (!launch) return;
+  clearTimeout(offlineTimer);
+  offlineTimer = setTimeout(() => {
+    const hs = S.helper;
+    if (!(hs && hs.status === 'connected')) { offlineFailed = true; drawOfflineCard(); }
+  }, 5000);
 }
 
 // ---- profile icon + colour editor (Settings > Profiles)
@@ -1959,6 +1992,12 @@ function setupStatic() {
   });
   $('set-profile-pick').addEventListener('change', (e) => { if (e.target.value) cmd('setProfileDir', { dir: e.target.value }); });
   $('helper-retry').addEventListener('click', () => cmd('retryHelper'));
+  $('app-offline-open').addEventListener('click', () => offlineRetry(true));
+  $('app-offline-retry').addEventListener('click', () => offlineRetry(false));
+  $('set-overlay-enabled').addEventListener('change', async (e) => {
+    const r = await cmd('setOverlayEnabled', { enabled: e.target.checked });
+    if (!r || !r.ok) scheduleRender();
+  });
   $('shortcut-btn').addEventListener('click', () => safe(chrome.tabs.create({ url: 'chrome://extensions/shortcuts' })));
   const openLeft = () => safe(chrome.tabs.create({ url: 'chrome://settings/appearance' }));
   $('left-btn').addEventListener('click', openLeft);
@@ -2025,7 +2064,7 @@ function setupListeners() {
     const keys = Object.keys(changes);
     const rel = {
       session: ['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'overlayConnected', 'incTabNames', 'incLockedTabs'],
-      local: ['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'roots', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs'],
+      local: ['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'roots', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs', 'appEverConnected', 'overlayEnabled'],
       sync: ['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor']
     }[area];
     if (rel && keys.some((k) => rel.includes(k))) {

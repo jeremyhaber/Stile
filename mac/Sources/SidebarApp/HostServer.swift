@@ -219,6 +219,8 @@ final class HostServer {
     private(set) var overlayRunning = false
     private var handoffs: [String: (bounds: [String: Any]?, at: Date)] = [:]
     private var missingCache: (list: [(dir: String, name: String)], at: Date)?
+    /// Global overlay on/off (state.json `overlayEnabled`, default true); the app is the source of truth.
+    private(set) var overlayEnabled: Bool = HostStore.overlayEnabled(from: HostStore.readState())
 
     func start() {
         signal(SIGPIPE, SIG_IGN)
@@ -366,6 +368,8 @@ final class HostServer {
             doSwitch(m, c)
         case "setGlobalSettings":
             doSetSettings(m, c)
+        case "setOverlayEnabled":
+            doSetOverlayEnabled(m, c)
         default:
             Log.write("host: unknown message type '\(type)'")
             c.reply(m, ["type": "error", "error": "unknown message type '\(type)'"])
@@ -376,7 +380,7 @@ final class HostServer {
         v as? [String: Any]
     }
 
-    private func broadcast(except c: ProfileBridge, _ msg: [String: Any]) {
+    private func broadcast(except c: ProfileBridge?, _ msg: [String: Any]) {
         // Every other open connection, identified or not (same as the Node reference).
         for b in bridges where b !== c && !b.closed { b.sendToExt(msg) }
     }
@@ -429,6 +433,24 @@ final class HostServer {
         }
         Log.write("host: switch to '\(target)': launched Chrome")
         c.reply(m, ["type": "switchResult", "ok": true, "method": "launched"])
+    }
+
+    /// Saves `overlayEnabled`, tells every connection except `origin`, and posts a settings change so the
+    /// overlay hides or resumes. Also used by the global hotkey (`origin` nil: all connections are told).
+    func setOverlayEnabled(_ on: Bool, from origin: ProfileBridge?) {
+        _ = HostStore.updateState(["overlayEnabled": on])
+        overlayEnabled = on
+        broadcast(except: origin, ["type": "overlayEnabled", "enabled": on])
+        Settings.post()
+    }
+
+    private func doSetOverlayEnabled(_ m: [String: Any], _ c: ProfileBridge) {
+        guard HostStore.isBool(m["enabled"]), let on = m["enabled"] as? Bool else {
+            c.reply(m, ["type": "overlayEnabled", "enabled": overlayEnabled, "error": "invalid enabled"])
+            return
+        }
+        setOverlayEnabled(on, from: c)
+        c.reply(m, ["type": "overlayEnabled", "enabled": on])
     }
 
     private func doSetSettings(_ m: [String: Any], _ c: ProfileBridge) {

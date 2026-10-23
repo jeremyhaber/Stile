@@ -28,6 +28,16 @@
         </div>
       </div>
       <div class="scroll" id="scroll-main">
+        <div id="app-offline" class="hint-card" data-testid="app-offline-card" hidden>
+          <div class="hc-body">
+            <strong>Sidebar.app isn't running</strong>
+            <span id="app-offline-msg" data-testid="app-offline-message">Open it to cover Chrome's tabs with this sidebar.</span>
+            <span class="hc-actions">
+              <button type="button" class="btn small primary" id="app-offline-open" data-testid="app-offline-open">Open Sidebar.app</button>
+              <button type="button" class="btn small" id="app-offline-retry" data-testid="app-offline-retry">Retry</button>
+            </span>
+          </div>
+        </div>
         <div id="vt-hint" class="hint-card" data-testid="vertical-tabs-hint" hidden>
           <div class="hc-body">
             <strong>Turn on vertical tabs to get the full sidebar</strong>
@@ -145,6 +155,9 @@
             <span id="helper-status" data-testid="helper-status"></span>
             <button type="button" class="btn small" id="helper-retry" data-testid="helper-retry">Retry</button>
           </div>
+        </div>
+        <div class="field" id="field-overlay-enabled" hidden>
+          <label class="check"><input type="checkbox" id="set-overlay-enabled" data-testid="overlay-enabled"><span>Show sidebar over Chrome's tabs</span></label>
         </div>
         <div class="field app" id="field-app" data-testid="settings-app" hidden>
           <label>App</label>

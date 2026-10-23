@@ -207,7 +207,7 @@ class HostServer extends EventEmitter {
     }
     const handlers = {
       hello: this.doHello, identify: this.doIdentify, getProfiles: this.doGetProfiles,
-      setProfileStyle: this.doSetStyle, switchProfile: this.doSwitch, setGlobalSettings: this.doSetSettings,
+      setProfileStyle: this.doSetStyle, switchProfile: this.doSwitch, setGlobalSettings: this.doSetSettings, setOverlayEnabled: this.doSetOverlayEnabled,
     };
     const h = Object.hasOwn(handlers, m.type) ? handlers[m.type] : null;
     if (!h) { this.log(`unknown message type '${m.type}'`); return this.reply(conn, m, { type: 'error', error: `unknown message type '${m.type}'` }); }
@@ -236,7 +236,10 @@ class HostServer extends EventEmitter {
   }
 
   settingsFrom(st) {
-    return { archiveDefaultMinutes: validMinutes(st.archiveDefaultMinutes) ? Number(st.archiveDefaultMinutes) : DEFAULT_ARCHIVE_MINUTES };
+    return {
+      archiveDefaultMinutes: validMinutes(st.archiveDefaultMinutes) ? Number(st.archiveDefaultMinutes) : DEFAULT_ARCHIVE_MINUTES,
+      overlayEnabled: st.overlayEnabled !== false,
+    };
   }
 
   /** First launch: take over the Perl helper's state.json (settings and profile styles). */
@@ -378,6 +381,16 @@ class HostServer extends EventEmitter {
     const settings = this.settingsFrom(st);
     this.broadcast({ type: 'settings', settings }, conn);
     this.reply(conn, m, { type: 'settings', settings });
+  }
+
+  doSetOverlayEnabled(conn, m) {
+    if (typeof m.enabled !== 'boolean') {
+      return this.reply(conn, m, { type: 'overlayEnabled', enabled: this.readState().overlayEnabled !== false, error: 'invalid enabled' });
+    }
+    this.updateState((st) => { st.overlayEnabled = m.enabled; });
+    this.broadcast({ type: 'overlayEnabled', enabled: m.enabled }, conn);
+    this.reply(conn, m, { type: 'overlayEnabled', enabled: m.enabled });
+    this.emit('overlayEnabled', { enabled: m.enabled });
   }
 
   doSetStyle(conn, m) {

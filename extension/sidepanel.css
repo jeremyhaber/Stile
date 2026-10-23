@@ -767,3 +767,5 @@ html.compact .kbd-hint { opacity: 0; pointer-events: none; }
   content: "\21C4\FE0E"; position: absolute; right: 6px; top: 50%; transform: translateY(-50%); font-size: 13px; line-height: 1; color: var(--accent-text); pointer-events: none;
 }
 .split-row .half { position: relative; }
+
+.hc-actions { display: flex; gap: 6px; margin-top: 6px; }

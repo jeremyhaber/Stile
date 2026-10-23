@@ -137,6 +137,56 @@ async function setHelper(patch) {
   const next = { ...cur, ...patch };
   for (const k of Object.keys(next)) if (next[k] === undefined) delete next[k];
   await chrome.storage.session.set({ helper: next });
+  await updateBadge(next.status).catch(() => {});
+}
+
+// ---------------------------------------------------------------- v2.7: toolbar badge + context menu + overlay toggle
+const MENU_ID = 'overlay-toggle';
+const menuItems = {};   // id -> { id, title, type, checked, contexts } (chrome.contextMenus has no getter; exposed via debugState)
+
+async function updateBadge(status) {
+  if (status === undefined) status = (await sget('session', 'helper', {})).status;
+  if (!status || status === 'checking') return;
+  if (status === 'connected') {
+    await chrome.storage.local.set({ appEverConnected: true });
+    await chrome.action.setBadgeText({ text: '' });
+    await chrome.action.setTitle({ title: 'Sidebar' });
+    await syncMenu(true);
+    return;
+  }
+  await syncMenu(false);
+  if (await sget('local', 'appEverConnected', false)) {
+    await chrome.action.setBadgeText({ text: '!' });
+    await chrome.action.setBadgeBackgroundColor({ color: '#f59e0b' });
+    await chrome.action.setTitle({ title: "Sidebar.app isn't running \u2014 click for details" });
+  }
+}
+
+async function syncMenu(connected) {
+  if (!chrome.contextMenus) return;
+  const checked = (await sget('local', 'overlayEnabled', true)) !== false;
+  try {
+    if (!connected) {
+      for (const k of Object.keys(menuItems)) delete menuItems[k];
+      await chrome.contextMenus.removeAll();
+      return;
+    }
+    if (menuItems[MENU_ID]) {
+      menuItems[MENU_ID].checked = checked;
+      await chrome.contextMenus.update(MENU_ID, { checked });
+      return;
+    }
+    const item = { id: MENU_ID, title: "Show sidebar over Chrome's tabs", type: 'checkbox', checked, contexts: ['action'] };
+    await chrome.contextMenus.removeAll();
+    await new Promise((res) => chrome.contextMenus.create(item, () => { void chrome.runtime.lastError; res(); }));
+    menuItems[MENU_ID] = item;
+  } catch (e) { console.warn('[sidebar] context menu', e); }
+}
+
+async function storeOverlayEnabled(v) {
+  if (typeof v !== 'boolean') return;
+  await chrome.storage.local.set({ overlayEnabled: v });
+  if (menuItems[MENU_ID]) await syncMenu(true);
 }
 
 async function archiveThreshold() {
@@ -320,6 +370,7 @@ async function handshake(p) {
     if (r.settings && typeof r.settings.archiveDefaultMinutes === 'number') {
       await chrome.storage.local.set({ globalDefaultMinutes: r.settings.archiveDefaultMinutes });
     }
+    if (r.settings) await storeOverlayEnabled(r.settings.overlayEnabled);
     const dir = await resolveProfileDir(profiles);
     await enqueue(() => setHelper({ status: 'connected', error: undefined, profiles, currentProfileDir: dir }));
     if (dir) { try { await nreq({ type: 'identify', profileDir: dir }); } catch (e) { console.warn('identify failed', e); } }
@@ -364,6 +415,7 @@ function onHelperMessage(m) {
   else if (m.type === 'profiles' && Array.isArray(m.profiles)) {
     enqueue(() => setHelper({ profiles: m.profiles })).catch(() => {});
   }
+  else if (m.type === 'overlayEnabled' && !m.requestId) storeOverlayEnabled(m.enabled).catch(() => {});
   else if (m.type === 'settings' && m.settings && typeof m.settings.archiveDefaultMinutes === 'number') {
     chrome.storage.local.set({ globalDefaultMinutes: m.settings.archiveDefaultMinutes }).catch(() => {});
   }
@@ -768,7 +820,7 @@ function siteOf(url) {
 }
 
 // ---------------------------------------------------------------- commands
-const unqueued = new Set(['switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle']);
+const unqueued = new Set(['switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle', 'setOverlayEnabled']);
 
 const commands = {
   async ensureRoots() {
@@ -1027,6 +1079,15 @@ const commands = {
     await setHelper({ currentProfileDir: dir || null });
     if (dir && helperConnected()) { try { await nreq({ type: 'identify', profileDir: dir }); } catch { /* ignore */ } }
     return { ok: true };
+  },
+
+  async setOverlayEnabled({ enabled }) {
+    if (!helperConnected()) return { ok: false, error: 'helper unavailable' };
+    try {
+      const r = await nreq({ type: 'setOverlayEnabled', enabled: !!enabled });
+      if (r && r.type === 'overlayEnabled' && typeof r.enabled === 'boolean') { await storeOverlayEnabled(r.enabled); return { ok: true, enabled: r.enabled }; }
+      return { ok: false, error: (r && r.error) || 'helper refused' };
+    } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
   },
 
   async retryHelper() {
@@ -1370,8 +1431,12 @@ const commands = {
         globalDefaultMinutes: await sget('local', 'globalDefaultMinutes', DEFAULT_ARCHIVE_MINUTES),
         profileDir: await sget('local', 'profileDir', null),
         mergeOnClose: await sget('sync', 'mergeOnClose', true),
-        effectiveMinutes: await archiveThreshold()
-      }
+        effectiveMinutes: await archiveThreshold(),
+        overlayEnabled: (await sget('local', 'overlayEnabled', true)) !== false,
+        appEverConnected: !!(await sget('local', 'appEverConnected', false))
+      },
+      contextMenus: Object.values(menuItems),
+      badge: { text: await chrome.action.getBadgeText({}).catch(() => null), title: await chrome.action.getTitle({}).catch(() => null) }
     };
   }
 };
@@ -1536,6 +1601,14 @@ function dispatchCommand(msg, sender) {
   const fn = () => commands[msg.cmd](msg);
   return unqueued.has(msg.cmd) ? fn() : enqueue(fn);
 }
+
+if (chrome.contextMenus) {
+  chrome.contextMenus.onClicked.addListener((info) => {
+    if (info.menuItemId !== MENU_ID) return;
+    dispatchCommand({ cmd: 'setOverlayEnabled', enabled: !!info.checked }).catch(() => {});
+  });
+}
+enqueue(() => updateBadge()).catch(() => {});
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.cmd !== 'string') return false;

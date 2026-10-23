@@ -26,6 +26,11 @@ final class OverlayController {
     let key: Int
     private(set) var window: ChromeWindow
     let sidebar = SidebarPanel()
+    /// Small "Sidebar isn't set up for this profile" pill shown instead of a panel over the rail.
+    private let notice = SetupNoticePanel()
+    private var noticeCandidates: [(dir: String, name: String)] = []
+    /// Global on/off (set by the manager). While off, nothing of ours is on screen.
+    var overlayEnabled = true
 
     private var visible = false
     private var chromeFrontmost = false
@@ -120,6 +125,7 @@ final class OverlayController {
         sidebar.onPointerEnter = { [weak self] in self?.pointerEntered() }
         sidebar.onPointerExit = { [weak self] in self?.pointerExited() }
         sidebar.onResize = { [weak self] w in self?.liveResize(to: w) }
+        notice.onDismissed = { [weak self] in self?.updateNotice() }
         sidebar.onResizeEnded = { [weak self] in
             guard let self = self else { return }
             self.resizing = false
@@ -158,10 +164,12 @@ final class OverlayController {
         captureTimer?.invalidate()
         captureTimer = nil
         sidebar.teardown()
+        notice.teardown()
     }
 
     func attach(_ mapping: WindowMapper.Mapping?) {
         if let m = mapping, !m.bridge.closed {
+            noticeCandidates = []
             unmappedSince = nil
             unmappedVisibleSince = nil
             if unsupported { setUnsupported(false) }
@@ -172,6 +180,7 @@ final class OverlayController {
             }
         } else {
             if bridge != nil || chromeWindowId != nil {
+                noticeCandidates = []   // the 10 s grace before any setup notice starts over
                 bridge = nil
                 chromeWindowId = nil
                 sidebar.showWaiting()
@@ -179,6 +188,27 @@ final class OverlayController {
             }
             if unmappedSince == nil { unmappedSince = Date() }
         }
+        // The sidebar is only ever shown for a window mapped to a live connection.
+        if computeVisible() != visible { update(window: window, chromeFrontmost: chromeFrontmost) }
+        updateNotice()
+    }
+
+    /// Mapped to an extension window whose connection is live.
+    private var liveMapped: Bool {
+        if let b = bridge, !b.closed { return true }
+        return false
+    }
+
+    /// The sidebar panel may be on screen: Chrome window visible and supported, overlay on, live mapping.
+    private func computeVisible() -> Bool {
+        window.visible && !unsupported && overlayEnabled && liveMapped
+    }
+
+    /// Manager: the global `overlayEnabled` changed. Hides everything, or resumes (the update rescans the rail).
+    func setOverlayEnabled(_ on: Bool) {
+        overlayEnabled = on
+        update(window: window, chromeFrontmost: chromeFrontmost)
+        pushHostState()
     }
 
     /// Visible but not matched to an extension window.
@@ -238,9 +268,10 @@ final class OverlayController {
             hideAll()
             sidebar.showWaiting()
         } else {
-            visible = window.visible
+            visible = computeVisible()
             if visible { rescan(reason: "supported") }
         }
+        updateNotice()
     }
 
     /// Candidates for the setup card: when profiles are connected, only the one positively identified.
@@ -248,23 +279,44 @@ final class OverlayController {
 
     /// True when this window has had no extension for more than 10 s (the manager then asks for the setup card).
     var needsSetupCheck: Bool {
-        guard bridge == nil, visible, let since = unmappedSince else { return false }
+        guard bridge == nil, overlayEnabled, window.visible, !unsupported, let since = unmappedSince else { return false }
         return Date().timeIntervalSince(since) > 10
     }
 
     func applySetup(candidates: [(dir: String, name: String)]) {
-        if candidates.isEmpty {
-            sidebar.showWaiting()
-        } else {
-            sidebar.showSetup(candidates: candidates)
+        noticeCandidates = candidates
+        updateNotice()
+    }
+
+    // MARK: Setup notice
+
+    /// Bottom-left pill: 8 pt from the window's left and bottom edges.
+    private func layoutNotice(in frame: CGRect) {
+        let size = notice.pillSize
+        let ax = CGRect(x: frame.minX + 8, y: frame.maxY - 8 - size.height, width: size.width, height: size.height)
+        let ns = Geometry.flip(ax)
+        if notice.frame != ns { notice.setFrame(ns, display: true) }
+    }
+
+    /// Shown only for a visible, supported window with no live mapping, a profile positively lacking the
+    /// extension (see `applySetup`), the overlay on, and not dismissed for that profile.
+    private func updateNotice() {
+        let cands = noticeCandidates.filter { !SetupNoticePanel.isDismissed($0.dir) }
+        guard overlayEnabled, window.visible, !unsupported, !liveMapped, !cands.isEmpty else {
+            notice.hide()
+            return
         }
+        notice.configure(candidates: cands)
+        layoutNotice(in: window.frame)
+        orderAbove(notice)
     }
 
     func update(window w: ChromeWindow, chromeFrontmost f: Bool) {
         let wasVisible = visible
         window = w
         chromeFrontmost = f
-        visible = w.visible && !unsupported
+        visible = computeVisible()
+        defer { updateNotice() }
         if !visible {
             hideAll()
             return
@@ -617,6 +669,7 @@ final class OverlayController {
 
     /// Display-link frame: `real` is the window-server bounds, `mouse` is in NSEvent (bottom-left) coordinates.
     func followTick(real: CGRect?, mouse: NSPoint) {
+        if notice.isVisible, let r = real, drag == nil { layoutNotice(in: r) }
         guard visible, let r = real else { return }
         if drag != nil {
             advance(mouse: topLeft(mouse), tick: true, real: r)
@@ -1098,6 +1151,7 @@ final class OverlayController {
             "screenCapture": Permissions.screenCaptureGranted,
             "compact": s == .collapsed || s == .hidden,
             "railWidth": Int(lastCollapsedRailWidth.rounded()),
+            "overlayEnabled": overlayEnabled,
         ]
         if let c = chromeColor { obj["chromeColor"] = c } else { obj["chromeColor"] = NSNull() }
         sidebar.sendHostState(obj, force: force)
