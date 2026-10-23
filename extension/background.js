@@ -40,28 +40,59 @@ async function tabExists(id) {
   try { await chrome.tabs.get(id); return true; } catch { return false; }
 }
 
-// ---------------------------------------------------------------- v1.2: tab names (SW-owned, storage.local.tabNames)
-const getTabNames = () => sget('local', 'tabNames', {});
-const setTabNames = (n) => chrome.storage.local.set({ tabNames: n });
+// ---------------------------------------------------------------- tab state: names (v1.2) and locks (v2.6), SW-owned
+// Normal tabs live in storage.local (survive restarts, re-attached by URL); incognito tabs (v2.6) only in storage.session.
+const TAB_KEYS = { names: ['tabNames', 'incTabNames', 'tabNamesPending'], locks: ['lockedTabs', 'incLockedTabs', 'lockedTabsPending'] };
+const kget = (kind, inc) => sget(inc ? 'session' : 'local', TAB_KEYS[kind][inc ? 1 : 0], {});
+const kset = (kind, inc, v) => chrome.storage[inc ? 'session' : 'local'].set({ [TAB_KEYS[kind][inc ? 1 : 0]]: v });
+const kall = async (kind) => ({ ...(await kget(kind, true)), ...(await kget(kind, false)) });
+async function kdrop(kind, tabId) {
+  for (const inc of [false, true]) {
+    const o = await kget(kind, inc);
+    if (tabId in o) { delete o[tabId]; await kset(kind, inc, o); }
+  }
+}
+const getTabNames = () => kall('names');
+const getLocks = () => kall('locks');
 
-// After a browser restart tab ids change: re-attach names by exact URL (first unclaimed match).
-// 'init' stashes every stored name (stale ids could collide with new tabs); 'retry' tries again while the
-// session is still restoring; 'final' also drops whatever is left.
-async function rematchTabNames(mode) {
-  let pending = await sget('local', 'tabNamesPending', []);
-  let names = await getTabNames();
-  if (mode === 'init') { pending = pending.concat(Object.values(names)); names = {}; }
+// After a browser restart tab ids change: re-attach names/locks by exact URL (first unclaimed match).
+// 'init' stashes every stored entry (stale ids could collide with new tabs); 'retry' tries again while the
+// session is still restoring; 'final' also drops whatever is left. Incognito tabs never survive a restart.
+async function rematchByUrl(kind, mode) {
+  const pk = TAB_KEYS[kind][2];
+  let pending = await sget('local', pk, []);
+  let map = await kget(kind, false);
+  if (mode === 'init') { pending = pending.concat(Object.values(map)); map = {}; }
   if (!pending.length && mode !== 'init') return;
   let tabs = [];
   try { tabs = await chrome.tabs.query({}); } catch { /* ignore */ }
   const left = [];
   for (const p of pending) {
-    const t = tabs.find((x) => !names[x.id] && (x.url || x.pendingUrl) === p.url);
-    if (t) names[t.id] = { name: p.name, url: p.url };
+    const t = tabs.find((x) => !x.incognito && !map[x.id] && (x.url || x.pendingUrl) === p.url);
+    if (t) map[t.id] = { ...p };
     else left.push(p);
   }
-  await chrome.storage.local.set({ tabNames: names, tabNamesPending: mode === 'final' ? [] : left });
+  await chrome.storage.local.set({ [TAB_KEYS[kind][0]]: map, [pk]: mode === 'final' ? [] : left });
 }
+const rematchTabState = async (mode) => { await rematchByUrl('names', mode); await rematchByUrl('locks', mode); };
+
+// Keep the stored URL of a name/lock in step with the tab's URL.
+async function refreshTabUrls(id, url) {
+  for (const kind of ['names', 'locks']) {
+    for (const inc of [false, true]) {
+      const o = await kget(kind, inc);
+      if (o[id] && o[id].url !== url) { o[id] = { ...o[id], url }; await kset(kind, inc, o); }
+    }
+  }
+}
+
+async function windowIsIncognito(windowId) {
+  try { return !!(await chrome.windows.get(windowId)).incognito; } catch { return false; }
+}
+async function incognitoAllowed() {
+  try { return !!(await chrome.extension.isAllowedIncognitoAccess()); } catch { return false; }
+}
+const INCOGNITO_ERR = 'Incognito tabs can\u2019t move between incognito and normal windows';
 
 // ---------------------------------------------------------------- v1.2: favicon cache (SW-owned, storage.local.faviconCache)
 const FAV_CAP = 1000;
@@ -72,6 +103,7 @@ function favHost(url) {
 }
 function noteFavicon(tab) {
   try {
+    if (tab && tab.incognito) return;   // v2.6: incognito favicons are never cached
     const f = tab && tab.favIconUrl;
     if (!f || /^chrome(-extension)?:/i.test(f)) return;
     if (/^data:/i.test(f) && f.length > 20000) return;
@@ -185,7 +217,7 @@ async function addToArchive(tabs, out) {
   const now = Date.now();
   for (const t of tabs) {
     const url = t.url || t.pendingUrl || '';
-    if (isBlankUrl(url)) continue;
+    if (isBlankUrl(url) || t.incognito) continue;   // v2.6: incognito tabs are never archived
     const e = {
       id: crypto.randomUUID(),
       url,
@@ -221,6 +253,7 @@ async function sweep() {
   const archiveGrouped = await sget('sync', 'archiveGrouped', false);
   const normal = new Set(wins.filter((w) => w.type === 'normal' && !w.incognito).map((w) => w.id));
   const bindings = await getBindings();
+  const locks = await getLocks();
   const stored = await getLast();
   const last = {};
   const ids = new Set(tabs.map((t) => String(t.id)));
@@ -232,7 +265,7 @@ async function sweep() {
     if (!normal.has(t.windowId) || t.incognito) continue;
     if (last[t.id] == null) { last[t.id] = now; changed = true; continue; }
     if (!minutes || minutes < 0) continue;
-    if (t.active || t.pinned || bindings[t.id] || t.audible) continue;
+    if (t.active || t.pinned || bindings[t.id] || t.audible || locks[t.id]) continue;
     if (isGrouped(t) && !archiveGrouped) continue;
     if (now - last[t.id] < minutes * 60000) continue;
     (isBlankUrl(t.url || t.pendingUrl) ? toClose : toArchive).push(t);
@@ -411,6 +444,7 @@ async function rebuildSnapshot() {
   try { if (chrome.tabGroups) groups = await chrome.tabGroups.query({}); } catch { /* ignore */ }
   const gmap = new Map(groups.map((g) => [g.id, g]));
   const old = await sget('session', 'windowSnapshots', {});
+  const locks = await getLocks();
   const snaps = {};
   for (const [k, v] of Object.entries(old)) if (k !== 'groups' && Array.isArray(v)) snaps[k] = v;   // keep windows we can't see (closing)
   const used = {};
@@ -428,7 +462,7 @@ async function rebuildSnapshot() {
       }
       list.push({
         id: t.id, url, title: t.title || url, pinned: !!t.pinned, favIconUrl: t.favIconUrl || '',
-        groupKey: gk, splitKey: splitId(t) >= 0 ? String(splitId(t)) : null, active: !!t.active
+        groupKey: gk, splitKey: splitId(t) >= 0 ? String(splitId(t)) : null, active: !!t.active, locked: !!locks[t.id]
       });
     }
     snaps[w.id] = list;
@@ -477,7 +511,7 @@ async function bindByUrl(created, windowId) {
 async function restoreClosed(entries, groupInfo) {
   const { main, live } = await resolveMain();
   if (main == null || !live.length) return;   // Chrome is quitting
-  if (entries.length === 1) {
+  if (entries.length === 1 && !entries[0].locked) {
     const e = entries[0];
     const n = await addToArchive([{ url: e.url, title: e.title, favIconUrl: e.favIconUrl }]);
     if (n) await setLastMerge({ count: n, archived: true, fromClose: true });
@@ -493,6 +527,13 @@ async function restoreClosed(entries, groupInfo) {
     } catch (err) { console.warn('[sidebar] reopen failed', e.url, err && err.message); }
   }
   if (!created.length) return;
+  {
+    // v2.6: a locked tab that is recreated keeps its lock
+    const lk = await kget('locks', false);
+    let any = false;
+    for (const c of created) if (c.e.locked) { lk[c.id] = { url: c.url }; any = true; }
+    if (any) await kset('locks', false, lk);
+  }
   // groups
   if (chrome.tabGroups && typeof chrome.tabs.group === 'function') {
     const byGroup = new Map();
@@ -799,19 +840,25 @@ const commands = {
 
   async archiveTab({ tabId }) {
     const tab = await chrome.tabs.get(tabId);
-    await addToArchive([tab]);
+    await addToArchive([tab]);   // skips incognito tabs: they are just closed
     await removeTabs([tabId]);
-    return { ok: true };
+    return { ok: true, incognito: !!tab.incognito };
   },
 
   async clearToday({ windowId }) {
     const tabs = (await chrome.tabs.query({ windowId })).sort((a, b) => a.index - b.index);
     const bindings = await getBindings();
-    const list = tabs.filter((t) => !t.pinned && !bindings[t.id]);
+    const locks = await getLocks();
+    const list = tabs.filter((t) => !t.pinned && !bindings[t.id] && !locks[t.id]);
     if (!list.length) return { ok: true, archived: 0, closed: 0 };
+    const incognito = await windowIsIncognito(windowId);
     let blankId = null;
     if (list.length === tabs.length) {
       try { const nt = await chrome.tabs.create({ windowId, active: true }); blankId = nt.id; } catch (e) { console.warn('[sidebar] new tab', e && e.message); }
+    }
+    if (incognito) {   // v2.6: nothing is archived or undoable in an incognito window
+      await removeTabs(list.map((t) => t.id));
+      return { ok: true, archived: 0, closed: list.length, incognito: true };
     }
     const groupInfo = {};
     if (chrome.tabGroups) {
@@ -841,6 +888,7 @@ const commands = {
     const pivot = tabs.find((t) => t.id === tabId);
     if (!pivot) return { ok: false, error: 'No such tab' };
     const bindings = await getBindings();
+    const locks = await getLocks();
     const mine = new Set([pivot.id]);
     if (splitId(pivot) >= 0) for (const t of tabs) if (splitId(t) === splitId(pivot)) mine.add(t.id);
     const mi = tabs.filter((t) => mine.has(t.id)).map((t) => t.index);
@@ -852,7 +900,7 @@ const commands = {
     else if (which === 'others') scope = tabs.filter((t) => !mine.has(t.id));
     else if (which === 'all') scope = tabs;
     else return { ok: false, error: 'Unknown scope' };
-    const list = scope.filter((t) => !t.pinned && !bindings[t.id]);
+    const list = scope.filter((t) => !t.pinned && !bindings[t.id] && !locks[t.id]);
     if (dryRun) return { ok: true, closed: list.length };
     if (!list.length) return { ok: true, closed: 0 };
     if (list.length === tabs.length) {
@@ -996,6 +1044,7 @@ const commands = {
   async bringTab({ tabId, windowId }) {
     const tab = await chrome.tabs.get(tabId);
     if (tab.windowId !== windowId) {
+      if (!!tab.incognito !== await windowIsIncognito(windowId)) return { ok: false, error: INCOGNITO_ERR };
       let ids = [tabId];
       if (splitId(tab) >= 0) {
         const sib = (await chrome.tabs.query({ windowId: tab.windowId })).filter((t) => splitId(t) === splitId(tab)).sort((a, b) => a.index - b.index);
@@ -1035,6 +1084,8 @@ const commands = {
   async placeTab({ tabIds, refTabId, where, group, windowId }) {
     const ref = refTabId != null ? await chrome.tabs.get(refTabId) : null;
     const win = ref ? ref.windowId : windowId;
+    const winInc = await windowIsIncognito(win);
+    for (const id of tabIds) { if (!!(await chrome.tabs.get(id)).incognito !== winInc) return { ok: false, error: INCOGNITO_ERR }; }
     const grp = typeof group === 'number' ? group : NONE;
     let prev = ref ? ref.id : null;
     let w = where === 'before' ? 'before' : 'after';
@@ -1079,7 +1130,10 @@ const commands = {
       }
     }
     const props = { index: idx };
-    if (dest !== g.windowId) props.windowId = dest;
+    if (dest !== g.windowId) {
+      if (await windowIsIncognito(dest) !== await windowIsIncognito(g.windowId)) return { ok: false, error: INCOGNITO_ERR };
+      props.windowId = dest;
+    }
     await chrome.tabGroups.move(groupId, props);
     return { ok: true };
   },
@@ -1087,7 +1141,9 @@ const commands = {
   async moveToNewWindow({ tabId, groupId, splitViewId }) {
     if (groupId != null) {
       if (!chrome.tabGroups) return { ok: false, error: 'tab groups unavailable' };
-      const win = await chrome.windows.create({ focused: true });
+      let inc = false;
+      try { inc = await windowIsIncognito((await chrome.tabGroups.get(groupId)).windowId); } catch { /* ignore */ }
+      const win = await chrome.windows.create(inc ? { focused: true, incognito: true } : { focused: true });
       const blank = win.tabs && win.tabs[0];
       try { await chrome.tabGroups.move(groupId, { windowId: win.id, index: -1 }); } catch (e) {
         return { ok: false, windowId: win.id, error: String(e && e.message || e) };
@@ -1140,6 +1196,7 @@ const commands = {
         tabId = t.id;
       }
       if (tabId == null || tabId === targetTabId) return { ok: false, error: 'pick two different tabs' };
+      if (!!(await chrome.tabs.get(tabId)).incognito !== !!target.incognito) return { ok: false, error: INCOGNITO_ERR };
       for (const id of [tabId, targetTabId]) {
         const t = await chrome.tabs.get(id);
         if (splitId(t) >= 0 && typeof chrome.tabs.unsplit === 'function') { try { await chrome.tabs.unsplit(splitId(t)); } catch { /* ignore */ } }
@@ -1214,12 +1271,32 @@ const commands = {
   async renameTab({ tabId, name }) {
     let tab;
     try { tab = await chrome.tabs.get(tabId); } catch { return { ok: false, error: 'No such tab' }; }
-    const names = await getTabNames();
+    const inc = !!tab.incognito;
+    const names = await kget('names', inc);
     const v = typeof name === 'string' ? name.trim().slice(0, 200) : '';
     if (v) names[tabId] = { name: v, url: tab.url || tab.pendingUrl || '' };
     else delete names[tabId];
-    await setTabNames(names);
+    await kset('names', inc, names);
     return { ok: true, name: v };
+  },
+
+  // ---- v2.6: lock tabs (survive auto-archive, Clear and "close others/all/above/below"; closing the tab itself still works)
+  async setTabLock({ tabId, locked }) {
+    let tab;
+    try { tab = await chrome.tabs.get(tabId); } catch { return { ok: false, error: 'No such tab' }; }
+    const inc = !!tab.incognito;
+    const locks = await kget('locks', inc);
+    if (locked) locks[tabId] = { url: tab.url || tab.pendingUrl || '' };
+    else delete locks[tabId];
+    await kset('locks', inc, locks);
+    scheduleSnapshot();
+    return { ok: true, locked: !!locked };
+  },
+
+  // Test hook: run the startup re-attach (names + locks by URL) in the given mode.
+  async debugRematch({ mode }) {
+    await rematchTabState(mode || 'retry');
+    return { ok: true };
   },
 
   // ---- v1.2: main window and pop-outs
@@ -1261,7 +1338,8 @@ const commands = {
       const ws = await chrome.windows.getAll({ populate: true });
       windows = ws.map((w) => ({
         id: w.id, focused: !!w.focused, type: w.type,
-        tabs: (w.tabs || []).map((t) => ({ id: t.id, url: t.url || t.pendingUrl || '', groupId: t.groupId === undefined ? -1 : t.groupId, splitViewId: t.splitViewId === undefined ? -1 : t.splitViewId, index: t.index }))
+        incognito: !!w.incognito,
+        tabs: (w.tabs || []).map((t) => ({ id: t.id, incognito: !!t.incognito, url: t.url || t.pendingUrl || '', groupId: t.groupId === undefined ? -1 : t.groupId, splitViewId: t.splitViewId === undefined ? -1 : t.splitViewId, index: t.index }))
       }));
     } catch { /* ignore */ }
     try { if (chrome.tabGroups) groups = await chrome.tabGroups.query({}); } catch { /* ignore */ }
@@ -1279,6 +1357,8 @@ const commands = {
       groups,
       splitSupported: SPLIT_OK,
       tabNames: await getTabNames(),
+      lockedTabs: await getLocks(),
+      incognitoAllowed: await incognitoAllowed(),
       faviconCache: await sget('local', 'faviconCache', {}),
 
       bindings: await getBindings(),
@@ -1313,7 +1393,7 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.runtime.onStartup.addListener(() => {
   enqueue(async () => {
-    await rematchTabNames('init');
+    await rematchTabState('init');
     await setupCommon();
     await resetAllLastActive();
     await setBindings({});
@@ -1327,7 +1407,7 @@ chrome.runtime.onStartup.addListener(() => {
   // Session restore may still be creating tabs; the rebuild is purely additive.
   for (const ms of [3000, 10000]) {
     setTimeout(() => enqueue(rebuildBindings).catch(() => {}), ms);
-    setTimeout(() => enqueue(() => rematchTabNames(ms === 10000 ? 'final' : 'retry')).catch(() => {}), ms);
+    setTimeout(() => enqueue(() => rematchTabState(ms === 10000 ? 'final' : 'retry')).catch(() => {}), ms);
   }
 });
 
@@ -1357,8 +1437,8 @@ chrome.tabs.onRemoved.addListener((tabId, info) => {
     if (tabId in last) { delete last[tabId]; await setLast(last); }
     const b = await getBindings();
     if (tabId in b) { delete b[tabId]; await setBindings(b); }
-    const names = await getTabNames();
-    if (tabId in names) { delete names[tabId]; await setTabNames(names); }
+    await kdrop('names', tabId);
+    await kdrop('locks', tabId);
   }).catch(() => {});
 });
 
@@ -1400,10 +1480,7 @@ chrome.tabs.onMoved.addListener(() => scheduleSnapshot());
 chrome.tabs.onUpdated.addListener((id, change, tab) => {
   if ('favIconUrl' in change) noteFavicon(tab);
   if ('url' in change && change.url) {
-    enqueue(async () => {
-      const names = await getTabNames();
-      if (names[id] && names[id].url !== change.url) { names[id] = { ...names[id], url: change.url }; await setTabNames(names); }
-    }).catch(() => {});
+    enqueue(() => refreshTabUrls(id, change.url)).catch(() => {});
   }
   if ('url' in change || 'title' in change || 'pinned' in change || 'groupId' in change || 'splitViewId' in change) scheduleSnapshot();
 });

@@ -82,6 +82,13 @@ final class OverlayController {
     private var bridge: ProfileBridge?
     private var chromeWindowId: Int?
     private var unmappedSince: Date? = Date()
+    private var unmappedVisibleSince: Date?
+
+    /// Not handled by the extension (typically incognito without "Allow in Incognito"): no sidebar, no setup
+    /// card, Chrome's own UI stays visible. See `evaluateSupport`.
+    private(set) var unsupported = false
+    /// Profiles without a connected extension whose name matches this window's title (positive identification).
+    private var lackingMatch: [(dir: String, name: String)] = []
 
     private let dwell = OneShot()
     private let hideTimer = OneShot()
@@ -156,6 +163,8 @@ final class OverlayController {
     func attach(_ mapping: WindowMapper.Mapping?) {
         if let m = mapping, !m.bridge.closed {
             unmappedSince = nil
+            unmappedVisibleSince = nil
+            if unsupported { setUnsupported(false) }
             if bridge !== m.bridge || chromeWindowId != m.windowId {
                 bridge = m.bridge
                 chromeWindowId = m.windowId
@@ -175,6 +184,68 @@ final class OverlayController {
     /// Visible but not matched to an extension window.
     var isUnmapped: Bool { visible && bridge == nil }
 
+    var isMapped: Bool { bridge != nil }
+
+    /// On screen (ignoring `unsupported`) and not matched to an extension window: the mapper should keep trying.
+    var wantsMapping: Bool { window.visible && bridge == nil }
+
+    private var looksIncognito: Bool {
+        let el = window.element
+        if let t = AX.string(el, AXName.axTitle)?.trimmingCharacters(in: .whitespaces),
+           t.lowercased().hasSuffix("(incognito)") { return true }
+        for attr in ["AXRoleDescription", AXName.axDescription] {
+            if let d = AX.string(el, attr), d.range(of: "incognito", options: .caseInsensitive) != nil { return true }
+        }
+        return false
+    }
+
+    /// Decides whether this window is unsupported: unmapped and either looks incognito, or no connected profile
+    /// reported it for more than 3 s (counted from when it became visible / a profile connected) while at least
+    /// one profile is connected. A window whose title positively names a profile without the extension stays
+    /// supported so it can show the setup card. Returns true when the state changed.
+    @discardableResult
+    func evaluateSupport(anyConnected: Bool, connectedSince: Date?,
+                         lacking: [(dir: String, name: String)]) -> Bool {
+        var new = false
+        if bridge != nil {
+            unmappedVisibleSince = nil
+            lackingMatch = []
+        } else if !window.visible {
+            unmappedVisibleSince = nil
+            new = unsupported   // cannot tell while hidden; keep the last verdict
+        } else {
+            if unmappedVisibleSince == nil { unmappedVisibleSince = Date() }
+            let title = AX.string(window.element, AXName.axTitle) ?? ""
+            lackingMatch = lacking.filter { !$0.name.isEmpty && title.hasSuffix(" - " + $0.name) }
+            if looksIncognito {
+                new = true
+            } else if anyConnected && lackingMatch.isEmpty {
+                let start = max(unmappedVisibleSince ?? Date(), connectedSince ?? .distantPast)
+                new = Date().timeIntervalSince(start) > 3
+            }
+        }
+        if new == unsupported { return false }
+        setUnsupported(new)
+        return true
+    }
+
+    private func setUnsupported(_ on: Bool) {
+        if unsupported == on { return }
+        unsupported = on
+        Log.write("window \(key): \(on ? "unsupported (not reported by any connected profile, or incognito)" : "supported")")
+        if on {
+            visible = false
+            hideAll()
+            sidebar.showWaiting()
+        } else {
+            visible = window.visible
+            if visible { rescan(reason: "supported") }
+        }
+    }
+
+    /// Candidates for the setup card: when profiles are connected, only the one positively identified.
+    var lackingProfiles: [(dir: String, name: String)] { lackingMatch }
+
     /// True when this window has had no extension for more than 10 s (the manager then asks for the setup card).
     var needsSetupCheck: Bool {
         guard bridge == nil, visible, let since = unmappedSince else { return false }
@@ -193,7 +264,7 @@ final class OverlayController {
         let wasVisible = visible
         window = w
         chromeFrontmost = f
-        visible = w.visible
+        visible = w.visible && !unsupported
         if !visible {
             hideAll()
             return

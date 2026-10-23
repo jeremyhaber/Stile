@@ -174,6 +174,8 @@ const S = {
   leftHintDismissed: false,
   mergeOnClose: true,
   tabNames: {},
+  lockedTabs: {},
+  incognito: false,
   favCache: {},
   boundAny: new Map(),
   mainWindowId: null,
@@ -209,8 +211,8 @@ async function load() {
     chrome.tabs.query({ windowId: S.windowId }).catch(() => []),
     chrome.windows.getAll({ populate: true, windowTypes: ['normal'] }).catch(() => []),
     (chrome.tabGroups ? chrome.tabGroups.query({}).catch(() => []) : Promise.resolve([])),
-    chrome.storage.session.get(['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge']).catch(() => ({})),
-    chrome.storage.local.get(['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'faviconCache']).catch(() => ({})),
+    chrome.storage.session.get(['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'incTabNames', 'incLockedTabs']).catch(() => ({})),
+    chrome.storage.local.get(['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs', 'faviconCache']).catch(() => ({})),
     chrome.storage.sync.get(['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor']).catch(() => ({}))
   ]);
   let roots = await getRoots().catch(() => null);
@@ -228,7 +230,14 @@ async function load() {
     } catch { roots = null; }
   }
   S.tabs = tabs.slice().sort((a, b) => a.index - b.index);
-  S.otherWins = wins.filter((w) => w.id !== S.windowId && w.type === 'normal' && !w.incognito)
+  // v2.6: incognito is a separate world. A panel in an incognito window lists only incognito windows, a normal one only normal windows.
+  {
+    let own = wins.find((w) => w.id === S.windowId);
+    if (!own) own = await chrome.windows.get(S.windowId).catch(() => null);
+    S.incognito = !!(own && own.incognito) || (S.tabs.length > 0 && S.tabs.every((t) => t.incognito));
+  }
+  const sameWorld = (w) => !!w.incognito === S.incognito;
+  S.otherWins = wins.filter((w) => w.id !== S.windowId && w.type === 'normal' && sameWorld(w))
     .map((w) => ({ id: w.id, focused: !!w.focused, tabs: (w.tabs || []).slice().sort((a, b) => a.index - b.index) }));
   S.groups = new Map((groups || []).map((g) => [g.id, g]));
   S.groupTabs = new Map();
@@ -247,7 +256,7 @@ async function load() {
   S.archiveGrouped = !!syn.archiveGrouped;
   S.sidebarColor = normSidebarColor(syn.sidebarColor);
   S.mergeOnClose = syn.mergeOnClose !== false;
-  S.normalCount = wins.filter((w) => w.type === 'normal' && !w.incognito).length;
+  S.normalCount = wins.filter((w) => w.type === 'normal' && sameWorld(w)).length;
   {
     const order = Array.isArray(ses.windowOrder) ? ses.windowOrder : [];
     S.mainWindowId = ses.mainWindowId != null ? ses.mainWindowId : (order[0] != null ? order[0] : null);
@@ -263,7 +272,8 @@ async function load() {
   }
   S.ownStyle = syn.ownStyle || null;
   S.leftHintDismissed = !!loc.leftHintDismissed;
-  S.tabNames = loc.tabNames || {};
+  S.tabNames = { ...(ses.incTabNames || {}), ...(loc.tabNames || {}) };
+  S.lockedTabs = { ...(ses.incLockedTabs || {}), ...(loc.lockedTabs || {}) };
   S.favCache = loc.faviconCache || {};
   S.bindings = ses.bindings || {};
   S.helper = ses.helper || null;
@@ -281,6 +291,7 @@ async function load() {
 }
 
 function isPopout() {
+  if (S.incognito) return false;   // v2.6: no main window / pop-out logic in the incognito world
   return S.mainWindowId != null && S.windowId !== S.mainWindowId && S.normalCount > 0;
 }
 
@@ -562,7 +573,7 @@ function drawProfiles() {
 function drawPopoutBar() {
   const pop = isPopout();
   $('popout-bar').hidden = !pop;
-  $('merge-all').hidden = S.normalCount < 2;
+  $('merge-all').hidden = S.normalCount < 2 || S.incognito;
 }
 
 function mergeToast(r) {
@@ -576,8 +587,8 @@ const goToWindow = (windowId) => safe(chrome.windows.update(windowId, { focused:
 function showWindowMenu(ev, wid) {
   const isMain = wid === S.mainWindowId;
   showMenu(ev, [
-    !isMain ? { label: 'Merge into main window', action: 'merge-window', run: () => mergeWindowCmd(wid) } : null,
-    !isMain ? { label: 'Make this the main window', action: 'make-main', run: () => cmd('setMainWindow', { windowId: wid }) } : null,
+    !isMain && !S.incognito ? { label: 'Merge into main window', action: 'merge-window', run: () => mergeWindowCmd(wid) } : null,
+    !isMain && !S.incognito ? { label: 'Make this the main window', action: 'make-main', run: () => cmd('setMainWindow', { windowId: wid }) } : null,
     wid !== S.windowId ? { label: 'Go to window', action: 'go-to-window', run: () => goToWindow(wid) } : null
   ]);
 }
@@ -782,7 +793,7 @@ function sectionEl(sec) {
   h('span', { class: 'chev' }, icon('chevron', 14)),
   h('span', { class: 'wmeta', text: `${isMain ? 'Main window' : 'Window'} · ${plural(sec.visible.length, 'tab')}` }),
   h('span', { class: 'wsub', text: active ? (active.title || '') : '' }),
-  isMain ? null : h('button', {
+  isMain || S.incognito ? null : h('button', {
     type: 'button', class: 'text-btn wmerge', title: 'Merge into main window', 'aria-label': 'Merge into main window', 'data-testid': 'window-merge', text: 'Merge',
     onclick: (ev) => { ev.stopPropagation(); mergeWindowCmd(sec.id); },
     onkeydown: (ev) => ev.stopPropagation()
@@ -831,7 +842,7 @@ function openTab(tab) {
 
 function archiveClock(tab, isActive) {
   const minutes = effectiveMinutes();
-  if (minutes > 0 && !isActive && !tab.pinned && !tab.audible && S.lastActive[tab.id] && (gidOf(tab) < 0 || S.archiveGrouped)) {
+  if (minutes > 0 && !isActive && !tab.pinned && !tab.audible && !tab.incognito && !S.incognito && !S.lockedTabs[tab.id] && S.lastActive[tab.id] && (gidOf(tab) < 0 || S.archiveGrouped)) {
     const remaining = minutes * 60000 - (Date.now() - S.lastActive[tab.id]);
     if (remaining > 0 && remaining < 3600000) {
       const mins = Math.max(1, Math.ceil(remaining / 60000));
@@ -850,7 +861,7 @@ function todayRow(tab, act, other) {
   const renaming = renamingId === 'n' + tab.id;
   const clock = archiveClock(tab, isActive || tab.active);
   const row = h('div', {
-    class: 'row today-row' + (isActive ? ' active' : '') + (named ? ' named' : ''), role: 'listitem', tabindex: '0', draggable: renaming ? null : 'true',
+    class: 'row today-row' + (isActive ? ' active' : '') + (named ? ' named' : '') + (isLocked(tab) ? ' locked' : ''), role: 'listitem', tabindex: '0', draggable: renaming ? null : 'true',
     'data-testid': 'today-row', 'data-key': 't' + tab.id, 'data-tab-id': tab.id, 'data-window-id': tab.windowId, 'data-nav': '', 'data-url': url, 'data-title': title,
     'data-active': isActive ? 'true' : 'false', 'aria-current': isActive ? 'true' : null, title: named ? `${named} — ${real}` : title,
     'data-named': named ? 'true' : null,
@@ -870,6 +881,7 @@ function todayRow(tab, act, other) {
   renaming
     ? renameInput(title, (v) => cmd('renameTab', { tabId: tab.id, name: v }), true)
     : h('span', { class: 'title', text: title, ondblclick: (ev) => { ev.stopPropagation(); startRename('n' + tab.id); } }),
+  lockBadge(tab),
   tab.audible ? h('span', { class: 'badge-ic audio', title: 'Playing audio', 'data-testid': 'audible-icon' }, icon('speaker', 13)) : null,
   clock,
   h('button', {
@@ -890,7 +902,7 @@ function splitRow(u, act, other) {
     const renaming = renamingId === 'n' + t.id;
     const isActive = !other && !!(act && act.id === t.id);
     return h('div', {
-      class: 'half' + (isActive ? ' active' : ''), tabindex: '0', draggable: renaming || other ? null : 'true',
+      class: 'half' + (isActive ? ' active' : '') + (isLocked(t) ? ' locked' : ''), tabindex: '0', draggable: renaming || other ? null : 'true',
       ondragstart: (ev) => { ev.stopPropagation(); startDrag(ev, { type: 'tab', tabId: t.id, windowId: t.windowId, fromSplit: u.splitId, splitTabIds: [a.id, b.id] }, ev.currentTarget); },
       ondragend: endDrag, title: named ? `${named} — ${real}` : title, 'data-testid': 'split-half', 'data-tab-id': t.id, 'data-key': 't' + t.id, 'data-nav': '',
       'data-active': isActive ? 'true' : 'false',
@@ -906,6 +918,7 @@ function splitRow(u, act, other) {
     renaming
       ? renameInput(title, (v) => cmd('renameTab', { tabId: t.id, name: v }), true)
       : h('span', { class: 'title', text: title, ondblclick: (ev) => { ev.stopPropagation(); startRename('n' + t.id); } }),
+    lockBadge(t),
     h('button', {
       type: 'button', class: 'icon-btn act close', title: 'Close tab', 'aria-label': 'Close tab', 'data-testid': 'today-close',
       onclick: (ev) => { ev.stopPropagation(); safe(chrome.tabs.remove(t.id)); }
@@ -930,6 +943,8 @@ function splitRow(u, act, other) {
 }
 
 const nameOf = (t) => (t && S.tabNames[t.id] && S.tabNames[t.id].name) || '';
+const isLocked = (t) => !!(t && S.lockedTabs[t.id]);
+const lockBadge = (t) => (isLocked(t) ? h('span', { class: 'badge-ic lock', title: 'Locked', 'data-testid': 'lock-icon' }, icon('lock', 12)) : null);
 
 function winTabs(wid) {
   if (wid === S.windowId) return S.tabs;
@@ -949,7 +964,7 @@ function closeScope(tab, which) {
   const scope = which === 'above' ? tabs.filter((t) => t.index < lo)
     : which === 'below' ? tabs.filter((t) => t.index > hi)
       : which === 'others' ? tabs.filter((t) => !mine.has(t.id)) : tabs;
-  return scope.filter((t) => !t.pinned && !S.bindings[t.id]);
+  return scope.filter((t) => !t.pinned && !S.bindings[t.id] && !S.lockedTabs[t.id]);
 }
 
 async function closeMany(tab, which) {
@@ -978,6 +993,7 @@ function drawFooter() {
   $('archive-btn').setAttribute('aria-pressed', S.view === 'archive' ? 'true' : 'false');
   $('archive-btn').setAttribute('aria-label', n ? `Archive, ${n} tabs` : 'Archive');
   $('settings-btn').setAttribute('aria-pressed', S.view === 'settings' ? 'true' : 'false');
+  $('clear').title = S.incognito ? 'Close all of Today\u2019s tabs (incognito tabs aren\u2019t archived)' : "Archive all of Today's tabs";
 }
 
 // ---- archive view
@@ -1486,8 +1502,10 @@ function showTabMenu(ev, tab, opts = {}) {
   }
   items.push({ label: 'Rename tab', action: 'rename-tab', run: () => startRename('n' + tab.id) });
   if (nameOf(tab)) items.push({ label: 'Reset name', action: 'reset-name', run: () => cmd('renameTab', { tabId: tab.id, name: '' }) });
+  const locked = isLocked(tab);
+  items.push({ label: locked ? 'Unlock tab' : 'Lock tab', action: locked ? 'unlock' : 'lock', run: () => cmd('setTabLock', { tabId: tab.id, locked: !locked }) });
   items.push(
-    { label: 'Archive tab', action: 'archive', run: () => cmd('archiveTab', { tabId: tab.id }) },
+    S.incognito || tab.incognito ? null : { label: 'Archive tab', action: 'archive', run: () => cmd('archiveTab', { tabId: tab.id }) },
     '-',
     { label: 'Duplicate tab', action: 'duplicate', run: () => safe(chrome.tabs.duplicate(tab.id)) },
     { label: 'Close tab', action: 'close', run: () => safe(chrome.tabs.remove(tab.id)) },
@@ -1914,6 +1932,7 @@ function setupStatic() {
   $('clear').addEventListener('click', async () => {
     const r = await cmd('clearToday', { windowId: S.windowId });
     if (!r || !r.ok) toast((r && r.error) || 'Could not clear Today');
+    else if (r.incognito) toast(`Closed ${plural(r.closed, 'tab')}. Incognito tabs aren\u2019t archived`, { ms: 5000 });
     else if (r.archived > 0) toast(`Archived ${plural(r.archived, 'tab')}`, { undo: () => doUndo(r.undoId), ms: 8000 });
   });
   $('tidy').hidden = !HAS_GROUPS;
@@ -2005,8 +2024,8 @@ function setupListeners() {
   chrome.storage.onChanged.addListener((changes, area) => {
     const keys = Object.keys(changes);
     const rel = {
-      session: ['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'overlayConnected'],
-      local: ['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'roots', 'collapsedWindows', 'leftHintDismissed', 'tabNames'],
+      session: ['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'overlayConnected', 'incTabNames', 'incLockedTabs'],
+      local: ['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'roots', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs'],
       sync: ['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor']
     }[area];
     if (rel && keys.some((k) => rel.includes(k))) {

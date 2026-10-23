@@ -493,6 +493,167 @@ async function main() {
   const afterUndo = await panel.locator('[data-testid="today-list"] > [data-testid="today-row"]').count();
   check('Undo brings cleared tabs back', afterUndo >= beforeClear, `${afterUndo} vs ${beforeClear}`);
 
+  // ---- v2.6: lock tabs
+  {
+    const dbg = () => cmd({ cmd: 'debugState' });
+    const firstRow = panel.locator('[data-testid="today-list"] > [data-testid="today-row"]').first();
+    const lid = Number(await firstRow.getAttribute('data-tab-id'));
+    const rowOf = (id) => panel.locator(`[data-testid="today-row"][data-tab-id="${id}"]`);
+    await firstRow.click({ button: 'right' }); await sleep(300);
+    check('v2.6 lock: the tab menu offers "Lock tab" (data-action=lock)', (await panel.locator('[data-testid="context-menu-item"][data-action="lock"]').count()) === 1 && (await panel.locator('[data-action="unlock"]').count()) === 0);
+    await panel.locator('[data-testid="context-menu-item"][data-action="lock"]').click(); await sleep(900);
+    let d = await dbg();
+    check('v2.6 lock: lockedTabs[tabId] = { url } is stored by the worker and shown in debugState', d.lockedTabs?.[lid] && d.lockedTabs[lid].url.startsWith('http'), JSON.stringify(d.lockedTabs));
+    check('v2.6 lock: the row shows a lock icon', (await rowOf(lid).locator('[data-testid="lock-icon"]').count()) === 1);
+    await rowOf(lid).click({ button: 'right' }); await sleep(300);
+    check('v2.6 lock: a locked tab offers "Unlock tab" (data-action=unlock)', (await panel.locator('[data-action="unlock"]').count()) === 1 && (await panel.locator('[data-action="lock"]').count()) === 0);
+    await panel.locator('[data-action="unlock"]').click(); await sleep(900);
+    d = await dbg();
+    check('v2.6 lock: Unlock tab removes the lock and the icon', !d.lockedTabs?.[lid] && (await rowOf(lid).locator('[data-testid="lock-icon"]').count()) === 0);
+
+    // effects, in a window of their own
+    const prevMin = d.settings.archiveMinutes;
+    const urlsL = [0, 1, 2, 3, 4].map((i) => U('alpha') + `?l=${i}`);
+    const wL = await swEval(async (urls) => (await chrome.windows.create({ url: urls })).id, urlsL);
+    await sleep(1500);
+    const idOf = async (i) => swEval(async ([w, k]) => (await chrome.tabs.query({ windowId: w })).find((t) => t.url.endsWith(k))?.id ?? null, [wL, `?l=${i}`]);
+    const ids = {}; for (const i of [0, 1, 2, 3, 4]) ids[i] = await idOf(i);
+    await cmd({ cmd: 'setTabLock', tabId: ids[1], locked: true });
+    await cmd({ cmd: 'setTabLock', tabId: ids[3], locked: true });
+    await cmd({ cmd: 'setProfileArchive', minutes: 60 });
+    await swEval(async ([w, mine]) => {
+      const { lastActive = {} } = await chrome.storage.local.get('lastActive');
+      for (const t of await chrome.tabs.query({})) lastActive[t.id] = t.windowId === w ? Date.now() - 3 * 3600e3 : Date.now();
+      await chrome.storage.local.set({ lastActive });
+    }, [wL]);
+    const arc0 = (await dbg()).archive.length;
+    await cmd({ cmd: 'runArchiveNow' }); await sleep(900);
+    d = await dbg();
+    const live = async () => swEval(async (w) => (await chrome.tabs.query({ windowId: w })).map((t) => t.url.split('?')[1]), wL);
+    let alive = await live();
+    const archivedL = d.archive.map((a) => a.url.split('?')[1]);
+    check('v2.6 lock: auto-archive never archives a locked tab (idle unlocked ones are archived)', alive.includes('l=1') && alive.includes('l=3') && !alive.includes('l=2') && !alive.includes('l=4') && archivedL.includes('l=2') && archivedL.includes('l=4') && !archivedL.includes('l=1') && !archivedL.includes('l=3'), JSON.stringify({ alive, archivedL }));
+    check('v2.6 lock: the lock survives runArchiveNow', !!d.lockedTabs?.[ids[1]] && !!d.lockedTabs?.[ids[3]] && d.archive.length === arc0 + 2, String(d.archive.length - arc0));
+    await cmd({ cmd: 'setProfileArchive', minutes: prevMin ?? undefined });
+    for (const i of [5, 6]) await swEval(async ([w, u]) => chrome.tabs.create({ windowId: w, url: u, active: false }), [wL, U('alpha') + `?l=${i}`]);
+    await sleep(600);
+    ids[5] = await idOf(5); ids[6] = await idOf(6);
+    const dry = async (which, tabId) => (await cmd({ cmd: 'closeTabs', windowId: wL, tabId, which, dryRun: true })).closed;
+    const counts = { others: await dry('others', ids[0]), below: await dry('below', ids[0]), above: await dry('above', ids[6]), all: await dry('all', ids[0]) };
+    check('v2.6 lock: close others / below / above / all skip locked tabs and the dry-run count excludes them', counts.others === 2 && counts.below === 2 && counts.above === 2 && counts.all === 3, JSON.stringify(counts));
+    await cmd({ cmd: 'closeTabs', windowId: wL, tabId: ids[0], which: 'others' }); await sleep(700);
+    alive = await live();
+    check('v2.6 lock: "close others" really leaves the locked tabs', alive.join() === 'l=0,l=1,l=3', alive.join());
+    const tidy = await cmd({ cmd: 'tidyWindow', windowId: wL });
+    const grouped = await swEval(async ([w, a, b]) => [(await chrome.tabs.get(a)).groupId, (await chrome.tabs.get(b)).groupId], [wL, ids[1], ids[3]]);
+    check('v2.6 lock: Tidy still groups locked tabs', tidy.ok && tidy.tidied === 3 && grouped.every((g) => g >= 0), JSON.stringify([tidy, grouped]));
+    await cmd({ cmd: 'undo', id: tidy.undoId }); await sleep(500);
+    const arc1 = (await dbg()).archive.length;
+    const clr = await cmd({ cmd: 'clearToday', windowId: wL }); await sleep(800);
+    alive = await live();
+    check('v2.6 lock: Clear skips locked tabs', clr.ok && clr.archived === 1 && alive.join() === 'l=1,l=3' && (await dbg()).archive.length === arc1 + 1, JSON.stringify([clr.archived, alive]));
+    // closing the locked tab itself still works and drops its lock
+    await swEval(async (id) => chrome.tabs.remove(id), ids[1]); await sleep(800);
+    d = await dbg();
+    check('v2.6 lock: closing a locked tab itself works and drops its lock', !(await live()).includes('l=1') && !d.lockedTabs?.[ids[1]] && !!d.lockedTabs?.[ids[3]]);
+    // restart re-attach by exact URL (stored entries stashed as pending, tab ids "changed")
+    const lurl = d.lockedTabs[ids[3]].url;
+    await swEval(async (u) => chrome.storage.local.set({ lockedTabs: {}, lockedTabsPending: [{ url: u }] }), lurl);
+    await cmd({ cmd: 'debugRematch', mode: 'retry' });
+    d = await dbg();
+    check('v2.6 lock: restart rematch re-attaches a pending lock to the tab with the same URL', d.lockedTabs?.[ids[3]]?.url === lurl);
+    await swEval(async ([id, u]) => chrome.storage.local.set({ lockedTabs: { [id]: { url: u }, 99999: { url: 'http://stale.example/' } } }), [ids[3], lurl]);
+    await cmd({ cmd: 'debugRematch', mode: 'init' });
+    const pend = await swEval(async () => (await chrome.storage.local.get('lockedTabsPending')).lockedTabsPending);
+    d = await dbg();
+    check('v2.6 lock: startup init stashes stale ids, keeps the matching one, retries the rest', d.lockedTabs?.[ids[3]]?.url === lurl && !d.lockedTabs?.[99999] && pend.some((p) => p.url === 'http://stale.example/'), JSON.stringify(pend));
+    await cmd({ cmd: 'debugRematch', mode: 'final' });
+    check('v2.6 lock: the final pass drops unmatched entries', (await swEval(async () => (await chrome.storage.local.get('lockedTabsPending')).lockedTabsPending)).length === 0);
+    // a locked tab in a window that closes (merged back from its snapshot) keeps its lock on the recreated tab
+    await swEval(async ([w, u]) => chrome.tabs.create({ windowId: w, url: u, active: false }), [wL, U('alpha') + '?l=7']);
+    await sleep(1200);
+    const snapLocked = await swEval(async (w) => (((await chrome.storage.session.get('windowSnapshots')).windowSnapshots || {})[w] || []).map((e) => `${e.url.split('?')[1]}:${e.locked}`), wL);
+    check('v2.6 lock: window snapshots remember which tabs are locked', snapLocked.includes('l=3:true') && snapLocked.includes('l=7:false'), JSON.stringify(snapLocked));
+    const mergeOn = (await dbg()).settings.mergeOnClose;
+    const mainNow = (await dbg()).mainWindowId;
+    await swEval(async (w) => chrome.windows.remove(w), wL);
+    await sleep(4500);
+    d = await dbg();
+    const back = await swEval(async (m) => (await chrome.tabs.query({ windowId: m })).filter((t) => /\?l=[37]$/.test(t.url)).map((t) => [t.id, t.url.split('?')[1]]), mainNow);
+    const l3 = back.find((b) => b[1] === 'l=3');
+    check('v2.6 lock: a locked tab recreated by merge-back carries its lock', mergeOn && !!l3 && !!d.lockedTabs?.[l3[0]] && back.length === 2, JSON.stringify([mergeOn, back, d.lockedTabs]));
+    await swEval(async (ids) => { for (const id of ids) await chrome.tabs.remove(id).catch(() => {}); }, back.map((b) => b[0]));
+    await sleep(600);
+  }
+
+  // ---- v2.6: incognito (the harness can't enable "Allow in Incognito": tabs/windows of one window are stamped incognito inside the worker)
+  {
+    const dbg = () => cmd({ cmd: 'debugState' });
+    const wI = await swEval(async (urls) => {
+      const inc = (globalThis.__incWins = new Set());
+      const o = (globalThis.__origApis = { q: chrome.tabs.query, g: chrome.tabs.get, wg: chrome.windows.get, wa: chrome.windows.getAll });
+      const st = (t) => (t && inc.has(t.windowId) ? { ...t, incognito: true } : t);
+      const sw = (w) => (w && inc.has(w.id) ? { ...w, incognito: true, tabs: w.tabs && w.tabs.map(st) } : w);
+      chrome.tabs.query = async (q) => (await o.q.call(chrome.tabs, q)).map(st);
+      chrome.tabs.get = async (id) => st(await o.g.call(chrome.tabs, id));
+      chrome.windows.get = async (id, q) => sw(await o.wg.call(chrome.windows, id, q));
+      chrome.windows.getAll = async (q) => (await o.wa.call(chrome.windows, q)).map(sw);
+      const w = await chrome.windows.create({ url: urls });
+      inc.add(w.id);
+      return w.id;
+    }, [0, 1].map((i) => U('bravo') + `?i=${i}`));
+    await sleep(1500);
+    const tabsI = async () => swEval(async (w) => (await chrome.tabs.query({ windowId: w })).map((t) => ({ id: t.id, url: t.url.split('?')[1], inc: !!t.incognito })), wI);
+    let ti = await tabsI();
+    check('v2.6 incognito (stub): the worker sees the window as incognito', ti.length === 2 && ti.every((t) => t.inc), JSON.stringify(ti));
+    await swEval(async () => { await new Promise((r) => setTimeout(r, 100)); });
+    const mainNow = (await dbg()).mainWindowId;
+    await cmd({ cmd: 'setProfileArchive', minutes: 60 });
+    await swEval(async ([w]) => {
+      const { lastActive = {} } = await chrome.storage.local.get('lastActive');
+      for (const t of await chrome.tabs.query({})) lastActive[t.id] = t.windowId === w ? Date.now() - 3 * 3600e3 : Date.now();
+      await chrome.storage.local.set({ lastActive });
+    }, [wI]);
+    const arc0 = (await dbg()).archive.length;
+    await cmd({ cmd: 'runArchiveNow' }); await sleep(800);
+    ti = await tabsI();
+    check('v2.6 incognito: idle incognito tabs are never auto-archived', ti.length === 2 && (await dbg()).archive.length === arc0, `${ti.length} tabs, archive ${arc0} -> ${(await dbg()).archive.length}`);
+    await cmd({ cmd: 'setProfileArchive', minutes: undefined });
+    // names / locks of incognito tabs: storage.session only
+    await cmd({ cmd: 'renameTab', tabId: ti[0].id, name: 'Secret' });
+    await cmd({ cmd: 'setTabLock', tabId: ti[1].id, locked: true });
+    const stor = await swEval(async () => ({ ls: await chrome.storage.local.get(['tabNames', 'lockedTabs']), ss: await chrome.storage.session.get(['incTabNames', 'incLockedTabs']) }));
+    check('v2.6 incognito: tab names and locks are kept in storage.session only, never storage.local', stor.ss.incTabNames?.[ti[0].id]?.name === 'Secret' && !!stor.ss.incLockedTabs?.[ti[1].id] && !stor.ls.tabNames?.[ti[0].id] && !stor.ls.lockedTabs?.[ti[1].id], JSON.stringify(stor));
+    const dd = await dbg();
+    check('v2.6 incognito: debugState still reports them (merged)', dd.tabNames?.[ti[0].id]?.name === 'Secret' && !!dd.lockedTabs?.[ti[1].id]);
+    // never in window snapshots
+    await swEval(async (w) => chrome.tabs.create({ windowId: w, url: 'http://127.0.0.1/i-extra', active: false }), wI);
+    await sleep(1000);
+    const snaps = await swEval(async () => (await chrome.storage.session.get('windowSnapshots')).windowSnapshots || {});
+    check('v2.6 incognito: incognito windows never get a window snapshot', !(String(wI) in snaps) && !Object.values(snaps).some((v) => Array.isArray(v) && v.some((e) => /\?i=/.test(e.url))), JSON.stringify(Object.keys(snaps)));
+    // no crossing the boundary
+    const nrm = await swEval(async (m) => (await chrome.tabs.query({ windowId: m })).find((t) => !t.active && /^http/.test(t.url))?.id, mainNow);
+    const x1 = await cmd({ cmd: 'bringTab', tabId: ti[0].id, windowId: mainNow });
+    const x2 = await cmd({ cmd: 'bringTab', tabId: nrm, windowId: wI });
+    const x3 = await cmd({ cmd: 'placeTab', tabIds: [ti[0].id], windowId: mainNow, group: -1 });
+    check('v2.6 incognito: tabs are never moved across the incognito / normal boundary', x1.ok === false && x2.ok === false && x3.ok === false && /ncognito/.test(x1.error || ''), JSON.stringify([x1, x2, x3]));
+    // Clear in an incognito window closes (no archive, no undo)
+    const arc1 = (await dbg()).archive.length;
+    const clr = await cmd({ cmd: 'clearToday', windowId: wI }); await sleep(700);
+    ti = await tabsI();
+    check('v2.6 incognito: Clear closes instead of archiving (incognito:true, no undo), skipping the locked tab', clr.ok && clr.incognito === true && clr.archived === 0 && clr.closed === 2 && !clr.undoId && (await dbg()).archive.length === arc1 && ti.length === 1 && ti[0].url === 'i=1', JSON.stringify([clr, ti]));
+    const lu = await cmd({ cmd: 'lastUndo' });
+    check('v2.6 incognito: nothing undoable was recorded', !lu.kind || lu.kind === 'tidy' || lu.windowId !== wI);
+    // closing the incognito window never merges anything back
+    const nBefore = await swEval(async (m) => (await chrome.tabs.query({ windowId: m })).length, mainNow);
+    await swEval(async (w) => chrome.windows.remove(w), wI);
+    await sleep(4000);
+    const nAfterI = await swEval(async (m) => ({ n: (await chrome.tabs.query({ windowId: m })).length, any: (await chrome.tabs.query({})).some((t) => /\?i=/.test(t.url)) }), mainNow);
+    check('v2.6 incognito: closing an incognito window never merges its tabs back or archives them', nAfterI.n === nBefore && !nAfterI.any && (await dbg()).archive.length === arc1);
+    await swEval(async () => { const o = globalThis.__origApis; chrome.tabs.query = o.q; chrome.tabs.get = o.g; chrome.windows.get = o.wg; chrome.windows.getAll = o.wa; });
+    check('v2.6 incognito: debugState.incognitoAllowed is a boolean', typeof (await dbg()).incognitoAllowed === 'boolean');
+  }
+
   // Pinned favicon fallback (letter tile, not globe) for a never-visited URL
   await swEval(async () => { const { pinnedId } = await chrome.storage.local.get('pinnedId'); const tree = await chrome.bookmarks.search({ title: 'Pinned' }); const p = tree.find((b) => !b.url); if (p) await chrome.bookmarks.create({ parentId: p.id, title: 'Never visited', url: 'https://never-visited.example/' }); });
   await sleep(1200);

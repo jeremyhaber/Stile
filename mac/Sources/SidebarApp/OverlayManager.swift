@@ -20,6 +20,7 @@ final class OverlayManager {
     private var bridgeSubscriptions: [UUID: (ProfileBridge, UUID)] = [:]
     private var observers: [NSObjectProtocol] = []
     private var started = false
+    private var anyConnectedSince: Date?
 
     init(server: HostServer) {
         self.server = server
@@ -33,7 +34,10 @@ final class OverlayManager {
         mapper.bridgesProvider = { [weak self] in self?.server.identified ?? [] }
         mapper.onChange = { [weak self] in self?.applyMapping() }
 
-        closer.mappingProvider = { [weak self] key in self?.mapper.map[key] }
+        closer.mappingProvider = { [weak self] key in
+            guard let self = self, self.controllers[key]?.unsupported != true else { return nil }
+            return self.mapper.map[key]
+        }
         closer.chromePid = { [weak self] in self?.tracker.pid ?? 0 }
         closer.focusedWindowKey = { [weak self] in self?.tracker.focusedWindowKey() }
         closer.ensureTap()
@@ -92,19 +96,32 @@ final class OverlayManager {
         tickCount += 1
         closer.ensureTap()
         let quiet = Date().timeIntervalSince(tracker.lastGeometryEvent) < 0.5
-        if tickCount % 5 == 0, !server.identified.isEmpty, controllers.values.contains(where: { $0.isUnmapped }) {
-            mapper.schedule()   // retry matching windows to extension windows
+        let anyConnected = !server.identified.isEmpty
+        let wanting = controllers.values.filter { $0.wantsMapping }
+        if anyConnected, !wanting.isEmpty,
+           tickCount % 5 == 0 || wanting.contains(where: { !$0.unsupported }) {
+            mapper.schedule()   // retry matching windows to extension windows (every second during the 3 s grace)
         }
         var candidates: [(dir: String, name: String)]?
+        func missing() -> [(dir: String, name: String)] {
+            if candidates == nil { candidates = server.missingProfiles() }
+            return candidates ?? []
+        }
+        var supportChanged = false
         for c in controllers.values {
+            let lacking = (anyConnected && c.wantsMapping) ? missing() : []
+            if c.evaluateSupport(anyConnected: anyConnected, connectedSince: anyConnectedSince, lacking: lacking) {
+                supportChanged = true
+            }
             c.railTick(quiet: quiet)
             if tickCount % 5 == 0 { c.sampleColor(push: false) }   // cheap; only pushed when it changed
             if c.needsSetupCheck {
-                if candidates == nil { candidates = server.missingProfiles() }
-                c.applySetup(candidates: candidates ?? [])
+                // With any profile connected, only a window positively identified as lacking the extension gets the card.
+                c.applySetup(candidates: anyConnected ? c.lackingProfiles : missing())
             }
             c.pushHostState()
         }
+        if supportChanged { closer.refreshTargets(supportedWindows()) }
     }
 
     // MARK: Events
@@ -112,6 +129,11 @@ final class OverlayManager {
     private func bridgesChanged() {
         // Subscribe to window events on each bridge once; drop subscriptions of closed bridges.
         let live = server.identified
+        if live.isEmpty {
+            anyConnectedSince = nil
+        } else if anyConnectedSince == nil {
+            anyConnectedSince = Date()
+        }
         for b in live where bridgeSubscriptions[b.id] == nil {
             let token = b.addSubscriber { [weak self] msg in
                 guard (msg["type"] as? String) == "bridgeEvent",
@@ -160,7 +182,7 @@ final class OverlayManager {
             c.teardown()
             controllers.removeValue(forKey: k)
         }
-        closer.refreshTargets(wins)
+        closer.refreshTargets(supportedWindows())
         mapper.schedule()
         if Date().timeIntervalSince(tracker.lastGeometryEvent) < 0.3 {
             followLastActivity = Date()
@@ -177,6 +199,12 @@ final class OverlayManager {
 
     private func applyMapping() {
         for (k, c) in controllers { c.attach(mapper.map[k]) }
+        closer.refreshTargets(supportedWindows())
+    }
+
+    /// Windows eligible for close interception: everything except unsupported (unmapped incognito etc.) windows.
+    private func supportedWindows() -> [ChromeWindow] {
+        tracker.windows.filter { controllers[$0.key]?.unsupported != true }
     }
 
     private func pointerMoved() {

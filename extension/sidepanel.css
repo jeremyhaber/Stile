@@ -716,6 +716,18 @@ html.overlay.compact .row .badge-ic.audio {
 html.overlay.compact .row .badge-ic.audio svg { display: none; }
 html.overlay.compact .row .badge-ic:not(.audio) { opacity: 0 !important; pointer-events: none; }
 
+/* v2.6 lock: small icon after the title when expanded; a tiny badge at the icon's bottom-right inside the pill when compact */
+.row .badge-ic.lock { color: var(--dim); }
+.row .badge-ic.lock svg { width: 12px; height: 12px; }
+html.overlay.compact .row .badge-ic.lock {
+  opacity: 1 !important; position: absolute; bottom: 4px; left: calc(var(--icon-x) - var(--gut) + 2px); width: 11px; height: 11px; padding: 1px;
+  box-sizing: content-box; border-radius: 4px; background: var(--bg); box-shadow: 0 0 0 1px var(--bg); color: var(--fg); pointer-events: none; z-index: 2;
+}
+html.overlay.compact .row .badge-ic.lock svg { width: 11px; height: 11px; }
+html.overlay.compact .split-row .half { position: relative; }
+html.overlay.compact .split-row .half .badge-ic.lock { left: calc(50% - 2px); bottom: 3px; width: 9px; height: 9px; }
+html.overlay.compact .split-row .half .badge-ic.lock svg { width: 9px; height: 9px; }
+
 /* footer: archive icon centred in its pill */
 html.overlay #archive-btn { transition: background-color var(--t), margin-left var(--morph), padding-left var(--morph), width var(--morph), color var(--t); }
 html.overlay.compact #archive-btn { margin-left: calc(var(--pill-l) - var(--gut)); padding-left: calc(var(--icon-x) - 8px - var(--pill-l)); width: var(--pill); overflow: hidden; border-radius: 10px; }

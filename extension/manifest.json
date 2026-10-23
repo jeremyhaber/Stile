@@ -4,6 +4,7 @@
   "version": "1.2.0",
   "description": "An Arc-style side panel: favourites, pinned tabs, today's tabs, auto-archive and profile switching.",
   "minimum_chrome_version": "116",
+  "incognito": "spanning",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzdeEuaIu2+SMvOlZh8DQoCr4pR8Jqxi5Ln/5JnEf3shuxpT+EdRPi3Gefw25R09s1Vh/aE70n5eA4lilqf18su5+7lQ+wvJc/kCeNFwsrhyi9XK/sbbCEoPN/x+ssSuht2wCCcEZ9Z4EmQ/j9S7Mr+tm8ci/6KErXUbjNS4/EzHrj41TMpbjx/CbGb4L7Bvf4oIvoTKoYBCzQ3czmGrcFQ8q3+tuY75yUatLeZukQXPAz6nohLTncAJF4OuUSCwBVs3Y9juRbFuvmD4owNkSGCG6jEjtUgIW2SFYUqtgYiitpfAMBJb95oy4PiqBxub8zWGQZEM9zkbdyQ+HYN0yZQIDAQAB",
   "icons": {
     "16": "icons/icon16.png",

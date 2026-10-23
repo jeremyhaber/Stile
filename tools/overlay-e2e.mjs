@@ -76,14 +76,22 @@ const app = {
 // TEST-ONLY split hook: Chromium 141 has no split API, so tabs served to the page through this test transport can be stamped with a
 // splitViewId (app.splitMap: tabId -> splitViewId). Production code paths are untouched.
 app.splitMap = {};
+// TEST-ONLY incognito hook (v2.6): the harness cannot enable "Allow in Incognito", so windows listed in app.incWins are served to the page as
+// incognito (window.incognito / tab.incognito = true). Production code paths are untouched.
+app.incWins = new Set();
 const stampSplit = (o) => {
   if (!o || typeof o !== 'object') return;
   if (Array.isArray(o)) { o.forEach(stampSplit); return; }
-  if (typeof o.id === 'number' && 'windowId' in o && 'index' in o) o.splitViewId = app.splitMap[o.id] ?? -1;
-  else for (const v of Object.values(o)) stampSplit(v);
+  if (typeof o.id === 'number' && 'windowId' in o && 'index' in o) {
+    o.splitViewId = app.splitMap[o.id] ?? -1;
+    if (app.incWins.size) o.incognito = app.incWins.has(o.windowId);
+  } else {
+    if (app.incWins.size && typeof o.id === 'number' && 'focused' in o && 'state' in o) o.incognito = app.incWins.has(o.id);
+    for (const v of Object.values(o)) stampSplit(v);
+  }
 };
 const toSse = (obj) => {
-  if (Object.keys(app.splitMap).length && (obj.type === 'bridgeResult' || obj.type === 'bridgeEvent')) { obj = JSON.parse(JSON.stringify(obj)); stampSplit(obj.result); stampSplit(obj.args); }
+  if ((Object.keys(app.splitMap).length || app.incWins.size) && (obj.type === 'bridgeResult' || obj.type === 'bridgeEvent')) { obj = JSON.parse(JSON.stringify(obj)); stampSplit(obj.result); stampSplit(obj.args); }
   const d = `data: ${JSON.stringify(obj)}\n\n`; for (const r of app.sse) r.write(d);
 };
 const toHelper = (msg) => refApp.sendBridge('Default', msg);
@@ -109,7 +117,15 @@ const appSrv = http.createServer((req, res) => {
     req.on('data', (d) => { body += d; });
     req.on('end', () => {
       let m; try { m = JSON.parse(body); } catch { res.writeHead(400).end(); return; }
-      if (m.type === 'bridge') { app.bridgeCalls.push(m); res.writeHead(toHelper(m) ? 204 : 503).end(); return; }
+      if (m.type === 'bridge') {
+        app.bridgeCalls.push(m);
+        // TEST-ONLY: Clear in a (stubbed) incognito window gets the incognito answer without touching the real tabs.
+        if (m.call === 'sidebar.cmd' && m.args?.[0]?.cmd === 'clearToday' && app.incWins.has(m.args[0].windowId)) {
+          toSse({ type: 'bridgeResult', id: m.id, ok: true, result: { ok: true, archived: 0, closed: 2, incognito: true } });
+          res.writeHead(204).end(); return;
+        }
+        res.writeHead(toHelper(m) ? 204 : 503).end(); return;
+      }
       if (m.type === 'host') {
         app.hostLog.push({ action: m.action, value: m.value, t: Date.now() });
         if (m.action === 'ready') hostState();
@@ -916,6 +932,118 @@ async function main() {
     check('mergeWindow on a window that does not exist fails cleanly', bad?.ok && bad.result?.ok === false, JSON.stringify(bad?.result));
     await swEval(async (ids) => { for (const id of ids) await chrome.tabs.remove(id).catch(() => {}); }, pop.tabs);
     await sleep(500);
+  }
+
+
+  // ---- v2.6: lock tabs (menu, icon, compact badge) and incognito as a separate world
+  {
+    setHost({ state: 'peek', compact: false, railWidth: 56 }); await sleep(500);
+    const dbgState = async () => (await rawCall('sidebar.cmd', [{ cmd: 'debugState' }]))?.result;
+    const lRow = panel.locator('[data-testid="today-list"] > [data-testid="today-row"][data-url^="http://127.0.0.1"][data-active="false"]').last();
+    const tid = Number(await lRow.getAttribute('data-tab-id'));
+    check('v2.6 lock: no lock icon on an unlocked row', (await lRow.locator('[data-testid="lock-icon"]').count()) === 0);
+    const m1 = await openMenu(lRow);
+    check('v2.6 lock: the native tab menu offers "Lock tab"', !!findItem(m1.items, (i) => i.label === 'Lock tab') && !findItem(m1.items, (i) => i.label === 'Unlock tab'), JSON.stringify(m1.items.map((i) => i.label)));
+    await panel.evaluate((id) => window.__sidebarMenuResult(id), findItem(m1.items, (i) => i.label === 'Lock tab').id); await sleep(900);
+    const st1 = await dbgState();
+    check('v2.6 lock: choosing it stores lockedTabs[tabId] = { url } (SW-owned)', st1.lockedTabs?.[tid] && /^http:\/\/127\.0\.0\.1/.test(st1.lockedTabs[tid].url), JSON.stringify(st1.lockedTabs));
+    check('v2.6 lock: the row shows a lock icon after its title', (await lRow.locator('[data-testid="lock-icon"]').count()) === 1 && await lRow.evaluate((r) => r.querySelector('.title').getBoundingClientRect().right <= r.querySelector('[data-testid="lock-icon"]').getBoundingClientRect().left + 1));
+    const m2 = await openMenu(lRow);
+    check('v2.6 lock: a locked row offers "Unlock tab" instead', !!findItem(m2.items, (i) => i.label === 'Unlock tab') && !findItem(m2.items, (i) => i.label === 'Lock tab'));
+    // a locked tab survives auto-archive while an equally idle unlocked one is archived
+    const idle = await swEval(async (w) => (await chrome.tabs.create({ windowId: w, url: 'http://127.0.0.1/idle-unlocked', active: false })).id, mainWin);
+    await swEval(async ([a, b]) => { const { lastActive = {} } = await chrome.storage.local.get('lastActive'); lastActive[a] = Date.now() - 3 * 3600e3; lastActive[b] = Date.now() - 3 * 3600e3; await chrome.storage.local.set({ lastActive }); await chrome.storage.sync.set({ archiveMinutes: 60 }); }, [tid, idle]);
+    const arc0 = (await dbgState()).archive.length;
+    await panel.evaluate(() => window.__sidebarMenuResult(null)); await sleep(200);
+    const ran = await rawCall('sidebar.cmd', [{ cmd: 'runArchiveNow' }]); await sleep(700);
+    const st2 = await dbgState();
+    const alive = await swEval(async (ids) => { const out = []; for (const id of ids) { try { await chrome.tabs.get(id); out.push(true); } catch { out.push(false); } } return out; }, [tid, idle]);
+    await swEval(async () => chrome.storage.sync.remove('archiveMinutes'));
+    check('v2.6 lock: runArchiveNow keeps the locked tab (and its lock) and archives the unlocked idle one', ran?.result?.ok && alive[0] === true && alive[1] === false && st2.lockedTabs?.[tid] && st2.archive.length > arc0, JSON.stringify({ alive, arc: [arc0, st2.archive.length] }));
+    // unlock via the menu
+    await until(() => lRow.locator('[data-testid="lock-icon"]').count().then((n) => n === 1), 3000);
+    const m3 = await openMenu(lRow);
+    await panel.evaluate((id) => window.__sidebarMenuResult(id), findItem(m3.items, (i) => i.label === 'Unlock tab').id); await sleep(900);
+    check('v2.6 lock: Unlock tab removes the lock and the icon', !(await dbgState()).lockedTabs?.[tid] && (await lRow.locator('[data-testid="lock-icon"]').count()) === 0);
+    // compact: a tiny badge at the icon's bottom-right, inside the pill, same row positions
+    await rawCall('sidebar.cmd', [{ cmd: 'setTabLock', tabId: tid, locked: true }]); await sleep(800);
+    const geo = () => lRow.evaluate((r) => {
+      const b = r.querySelector('[data-testid="lock-icon"]').getBoundingClientRect(), f = r.querySelector('.fav-ic').getBoundingClientRect(), p = r.querySelector('.rbg').getBoundingClientRect();
+      const rr = r.getBoundingClientRect();
+      return { h: rr.height, b: { x: b.x, y: b.y, r: b.right, bt: b.bottom, w: b.width, cx: b.x + b.width / 2, cy: b.y + b.height / 2 }, f: { cx: f.x + f.width / 2, cy: f.y + f.height / 2 }, p: { x: p.x, r: p.right, y: p.y, bt: p.bottom }, y: rr.y, o: getComputedStyle(r.querySelector('[data-testid="lock-icon"]')).opacity };
+    });
+    const gE = await geo();
+    setHost({ compact: true, railWidth: 56 }); await sleep(600);
+    const gC = await geo();
+    check('v2.6 lock (compact): a lock badge sits at the favicon\'s bottom-right, inside the pill and the 56px strip, fully visible', gC.o === '1' && gC.b.cx > gC.f.cx && gC.b.cy > gC.f.cy && gC.b.x >= gC.p.x - 0.5 && gC.b.r <= gC.p.r + 0.5 && gC.b.bt <= gC.p.bt + 0.5 && gC.b.r <= 56, JSON.stringify(gC));
+    check('v2.6 lock (compact): the row keeps its height (the badge adds nothing to the layout)', Math.abs(gE.h - gC.h) <= 0.5, JSON.stringify([gE.h, gC.h]));
+    // split halves carry the lock too
+    await rawCall('sidebar.cmd', [{ cmd: 'setTabLock', tabId: splitIds[0], locked: true }]); await sleep(800);
+    const sg = await panel.evaluate((id) => {
+      const half = document.querySelector(`[data-testid="split-half"][data-tab-id="${id}"]`); const badge = half && half.querySelector('[data-testid="lock-icon"]');
+      const bg = document.querySelector('[data-testid="split-row"] .rbg').getBoundingClientRect();
+      if (!badge) return null; const b = badge.getBoundingClientRect();
+      return { x: b.x, r: b.right, bt: b.bottom, o: getComputedStyle(badge).opacity, bgx: bg.x, bgr: bg.right, bgbt: bg.bottom };
+    }, splitIds[0]);
+    check('v2.6 lock (compact): a locked split half shows the badge inside the pair pill', !!sg && sg.o === '1' && sg.x >= sg.bgx - 0.5 && sg.r <= sg.bgr + 3 && sg.bt <= sg.bgbt + 0.5, JSON.stringify(sg));
+    setHost({ compact: false, railWidth: 48 }); await sleep(500);
+    check('v2.6 lock (expanded): the split half has its lock icon after the title', await panel.evaluate((id) => { const h = document.querySelector(`[data-testid="split-half"][data-tab-id="${id}"]`); const b = h && h.querySelector('[data-testid="lock-icon"]'); return !!b && h.querySelector('.title').getBoundingClientRect().right <= b.getBoundingClientRect().left + 1; }, splitIds[0]));
+    await rawCall('sidebar.cmd', [{ cmd: 'setTabLock', tabId: splitIds[0], locked: false }]);
+    await rawCall('sidebar.cmd', [{ cmd: 'setTabLock', tabId: tid, locked: false }]); await sleep(500);
+    check('v2.6 lock: closeScope in the panel mirrors the worker (locked tabs are not counted)', await (async () => {
+      await rawCall('sidebar.cmd', [{ cmd: 'setTabLock', tabId: tid, locked: true }]); await sleep(700);
+      const other = panel.locator('[data-testid="today-list"] > [data-testid="today-row"]').nth(0);
+      const n = hostCount('contextMenu');
+      await other.click({ button: 'right' }); await until(() => hostCount('contextMenu') > n, 3000);
+      const items = lastHost('contextMenu').value.items;
+      const dry = await rawCall('sidebar.cmd', [{ cmd: 'closeTabs', windowId: mainWin, tabId: Number(await other.getAttribute('data-tab-id')), which: 'others', dryRun: true }]);
+      await panel.evaluate(() => window.__sidebarMenuResult(null)); await sleep(200);
+      const total = await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).length, mainWin);
+      return !!findItem(items, (i) => /^Close other/.test(i.label)) && dry.result.closed <= total - 2;
+    })());
+    await rawCall('sidebar.cmd', [{ cmd: 'setTabLock', tabId: tid, locked: false }]); await sleep(300);
+
+    // ---- incognito is a separate world (stubbed: windows in app.incWins are served as incognito)
+    const wInc = await swEval(async ([a, b]) => { const w = await chrome.windows.create({ url: [a, b], focused: false }); return { id: w.id, tabs: (await chrome.tabs.query({ windowId: w.id })).map((t) => t.id) }; }, [U('inc-one'), U('inc-two')]);
+    const wInc2 = await swEval(async (a) => { const w = await chrome.windows.create({ url: a, focused: false }); return w.id; }, U('inc-three'));
+    await sleep(1200);
+    await swEval(async (w) => chrome.windows.update(w, { focused: true }), mainWin);
+    const secOf = (id) => panel.locator(`[data-testid="window-section"][data-window-id="${id}"]`).count();
+    await until(async () => (await secOf(wInc.id)) === 1, 6000);
+    check('v2.6 incognito (control): before the stub both other windows are listed as sections in the normal panel', (await secOf(wInc.id)) === 1 && (await secOf(wInc2)) === 1);
+    app.incWins = new Set([wInc.id, wInc2]);
+    await swEval(async (w) => { const t = await chrome.tabs.create({ windowId: w, url: 'about:blank', active: false }); await chrome.tabs.remove(t.id); }, mainWin);
+    await until(async () => (await secOf(wInc.id)) === 0, 6000);
+    check('v2.6 incognito: a normal-window panel lists no incognito window', (await secOf(wInc.id)) === 0 && (await secOf(wInc2)) === 0 && (await panel.locator('[data-testid="today-row"][data-url*="inc-"]').count()) === 0);
+    check('v2.6 incognito: Merge all / pop-out bar are not offered for them either', !(await panel.locator('[data-testid="merge-all"]').isVisible()) || (await swEval(async () => (await chrome.windows.getAll({ windowTypes: ['normal'] })).length)) - 2 >= 2);
+    const beforeP = new Set(ctx.pages());
+    const pageInc = `${APP}/sidepanel.html?mode=overlay&windowId=${wInc.id}&bridgeHttp=${encodeURIComponent(APP)}`;
+    await swEval(async (u) => chrome.windows.create({ url: u, type: 'popup', width: 320, height: 860 }), pageInc);
+    const pInc = await until(() => ctx.pages().find((p) => !beforeP.has(p) && p.url().startsWith(APP)), 8000, 100);
+    await pInc.setViewportSize({ width: 320, height: 860 });
+    await until(async () => (await pInc.locator('[data-testid="today-list"] > [data-testid="today-row"]').count()) === 2, 8000);
+    const incRows = await pInc.locator('[data-testid="today-list"] > [data-testid="today-row"]').evaluateAll((els) => els.map((e) => e.dataset.url));
+    check('v2.6 incognito: a panel in an incognito window lists only its own tabs', incRows.length === 2 && incRows.every((u) => /inc-/.test(u)), JSON.stringify(incRows));
+    check('v2.6 incognito: ...and the other incognito window as a section, never a normal window', (await pInc.locator('[data-testid="window-section"]').count()) === 1 && (await pInc.locator(`[data-testid="window-section"][data-window-id="${wInc2}"]`).count()) === 1 && (await pInc.locator(`[data-testid="window-section"][data-window-id="${mainWin}"]`).count()) === 0);
+    check('v2.6 incognito: no main-window / pop-out logic (no merge buttons, no pop-out bar, no Merge all)', (await pInc.locator('[data-testid="window-merge"]').count()) === 0 && !(await pInc.locator('[data-testid="popout-bar"]').isVisible()) && !(await pInc.locator('[data-testid="merge-all"]').isVisible()));
+    const nI = hostCount('contextMenu');
+    await pInc.locator('[data-testid="today-list"] > [data-testid="today-row"]').first().click({ button: 'right' });
+    await until(() => hostCount('contextMenu') > nI, 3000);
+    const incItems = lastHost('contextMenu').value.items;
+    check('v2.6 incognito: the tab menu has no Archive tab, but still Lock tab', !findItem(incItems, (i) => i.label === 'Archive tab') && !!findItem(incItems, (i) => i.label === 'Lock tab'), JSON.stringify(incItems.map((i) => i.label)));
+    await pInc.evaluate(() => window.__sidebarMenuResult(null)); await sleep(200);
+    check('v2.6 incognito: no archive-soon clock on incognito rows', (await pInc.locator('[data-testid="archive-soon"]').count()) === 0);
+    check('v2.6 incognito: Clear says it closes (title note)', /incognito/i.test(await pInc.locator('[data-testid="clear-button"]').getAttribute('title')));
+    const nRowsBefore = await panel.locator('[data-testid="today-list"] > [data-testid="today-row"]').count();
+    await pInc.locator('[data-testid="clear-button"]').click(); await sleep(600);
+    const toastTxt = await pInc.locator('[data-testid="toast"]').first().innerText();
+    check('v2.6 incognito: Clear shows "Incognito tabs aren’t archived" with no Undo', /Incognito tabs aren.t archived/.test(toastTxt) && (await pInc.locator('[data-testid="toast-undo"]').count()) === 0, toastTxt);
+    check('v2.6 incognito: the normal panel never got the incognito clear (control: its rows are intact)', nRowsBefore >= 1 && (await panel.locator('[data-testid="today-list"] > [data-testid="today-row"]').count()) === nRowsBefore, String(nRowsBefore));
+    await pInc.close();
+    app.incWins = new Set();
+    await swEval(async (ids) => { for (const id of ids) await chrome.windows.remove(id).catch(() => {}); }, [wInc.id, wInc2]);
+    await sleep(2500);
+    await swEval(async (w) => chrome.windows.update(w, { focused: true }), mainWin);
   }
 
   // ---- connection drop: the extension stops forwarding; reconnecting resumes
