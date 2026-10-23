@@ -143,6 +143,12 @@
             <span id="app-ax-status" data-testid="app-accessibility"></span>
             <button type="button" class="btn small" id="app-ax-open" data-testid="app-accessibility-open">Open settings</button>
           </div>
+          <div class="status-line">
+            <span id="app-sc-label">Match Chrome's colour exactly</span>
+            <span id="app-sc-status" data-testid="app-screen-capture"></span>
+            <button type="button" class="btn small" id="app-sc-on" data-testid="app-screen-capture-on">Turn on</button>
+          </div>
+          <p class="hint" id="app-sc-note" data-testid="app-screen-capture-note">Needs Screen Recording permission. Sidebar only looks at Chrome's window.</p>
           <p class="hint" id="app-float-note" data-testid="app-float-note" hidden>Couldn't control Chrome's tab rail; pinned sidebar will float over the page.</p>
           <button type="button" class="btn" id="app-rescan" data-testid="app-rescan">Find Chrome's tab rail again</button>
           <p class="hint" id="app-version" data-testid="app-version"></p>
@@ -159,11 +165,6 @@
 
     <!-- BOOST HOOK 3 slot: setView('boost') empties this element and calls renderBoostView(rootEl, ctx) on it -->
     <section id="view-boost" class="view" hidden></section>
-
-    <!-- Compact strip (overlay mode, Chrome's rail collapsed): icons only, built by drawCompact() -->
-    <section id="view-compact" class="view" data-testid="compact-strip" aria-label="Sidebar">
-      <div id="compact-list" class="compact-list"></div>
-    </section>
 
     <footer id="footer" class="footer">
       <button type="button" id="archive-btn" class="foot-btn" aria-label="Archive" title="Archive" data-testid="archive-button"><span class="foot-ic" id="archive-ic"></span><span>Archive</span><span class="badge" id="archive-count" data-testid="archive-count" hidden></span></button>

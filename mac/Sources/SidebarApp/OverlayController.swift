@@ -45,6 +45,23 @@ final class OverlayController {
     private var loggedMissing = false
     private var controlFailed = false   // Chrome's expand/collapse button could not be pressed or had no effect
 
+    // Following (live move/resize from window-server bounds; no AX calls while it runs)
+    private var following = false
+    private var movedWhileFollowing = false
+
+    // Exact Chrome colour (needs Screen Recording permission)
+    private var chromeColor: String?
+    private var lastActive = false
+    private var captureDeadline = Date.distantPast
+    private var captureTimer: Timer?
+    private let sampleTimer = OneShot()
+
+    // Widths for the compact/expanded layout
+    private var lastCollapsedRailWidth: CGFloat = 48
+    private var lastExpandedRailWidth: CGFloat?
+    /// While Chrome is being asked to expand its rail, the web view is already laid out at this width.
+    private var pendingPinWidth: CGFloat?
+
     // State inputs (the visible state is derived, see `state`)
     private var peeking = false
     private var floatPin = false        // fallback pin: floating over the page at peek width
@@ -108,6 +125,9 @@ final class OverlayController {
         hideTimer.cancel()
         rescanTimer.cancel()
         pressTimer.cancel()
+        sampleTimer.cancel()
+        captureTimer?.invalidate()
+        captureTimer = nil
         sidebar.teardown()
     }
 
@@ -156,6 +176,12 @@ final class OverlayController {
             hideAll()
             return
         }
+        // Chrome dims an inactive window's frame colour: re-sample when this window gains/loses focus.
+        let active = f && isFocusedChromeWindow
+        if active != lastActive {
+            lastActive = active
+            scheduleSample(after: 0.2)
+        }
         if lastScan == .distantPast || !wasVisible {
             rescan(reason: wasVisible ? "first" : "shown")
         } else if w.frame.size != lastScanSize {
@@ -200,8 +226,11 @@ final class OverlayController {
             // Chrome's own rail is open: it is the pinned state; fallback floating pin no longer applies.
             floatPin = false
             peeking = false
+            pendingPinWidth = nil
         }
+        noteRailWidths()
         layout()
+        sampleColor(push: false)
         pushHostState()
     }
 
@@ -262,6 +291,7 @@ final class OverlayController {
 
     private func railControlFailed(wantExpanded: Bool) {
         controlFailed = true
+        pendingPinWidth = nil
         if wantExpanded { floatPin = true; peeking = false }
         layout()
         pushHostState()
@@ -361,6 +391,20 @@ final class OverlayController {
         orderAbove(sidebar)
     }
 
+    /// Width the web view is laid out at: always the target expanded width. When collapsed the panel is only
+    /// the rail wide and clips the left strip of the same layout.
+    private func contentWidth(for s: SidebarState, logical w: CGFloat) -> CGFloat {
+        if s == .collapsed {
+            return max(pendingPinWidth ?? max(peekWidth, Settings.minWidth), w)
+        }
+        return w
+    }
+
+    private func noteRailWidths() {
+        guard let r = rail else { return }
+        if r.expanded { lastExpandedRailWidth = r.rel.width } else { lastCollapsedRailWidth = r.rel.width }
+    }
+
     private func panelFrame(logical ns: NSRect, state s: SidebarState) -> NSRect {
         var f = ns
         if isFloating(s) { f.size.width += Self.shadowWidth }
@@ -368,10 +412,9 @@ final class OverlayController {
     }
 
     private func applyChrome(ax: CGRect, state s: SidebarState) {
-        let floating = isFloating(s)
         let w = windowAX
         let touchesBottomLeft = abs(ax.minX - w.minX) <= 2 && abs(ax.maxY - w.maxY) <= 2
-        sidebar.setCorners(right: floating, bottomLeft: touchesBottomLeft)
+        sidebar.setCorners(bottomLeft: touchesBottomLeft)
         sidebar.handle.isHidden = !canResize(s)
     }
 
@@ -381,7 +424,7 @@ final class OverlayController {
         return false
     }
 
-    func layout() {
+    func layout(following isFollowing: Bool = false) {
         guard visible else { return }
         let s = state
         if s == .hidden {
@@ -391,8 +434,23 @@ final class OverlayController {
         if animating { return }
         let ax = logicalAXRect(for: s)
         let ns = Geometry.flip(ax)
-        sidebar.setFrame(panelFrame(logical: ns, state: s), display: true)
-        sidebar.fitContent(width: ns.width, shadow: isFloating(s) ? Self.shadowWidth : 0)
+        let frame = panelFrame(logical: ns, state: s)
+        let shadow: CGFloat = isFloating(s) ? Self.shadowWidth : 0
+        if isFollowing {
+            // Hot path: nothing animates, nothing is redrawn eagerly, no ordering or corner work.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            NSAnimationContext.beginGrouping()
+            NSAnimationContext.current.duration = 0
+            NSAnimationContext.current.allowsImplicitAnimation = false
+            sidebar.setFrame(frame, display: false)
+            sidebar.fitContent(panelWidth: ns.width, contentWidth: contentWidth(for: s, logical: ns.width), shadow: shadow)
+            NSAnimationContext.endGrouping()
+            CATransaction.commit()
+            return
+        }
+        sidebar.setFrame(frame, display: true)
+        sidebar.fitContent(panelWidth: ns.width, contentWidth: contentWidth(for: s, logical: ns.width), shadow: shadow)
         applyChrome(ax: ax, state: s)
         orderAbove(sidebar)
     }
@@ -406,11 +464,77 @@ final class OverlayController {
         sidebar.orderOut(nil)
     }
 
-    /// Update from the live AX frame (called at display rate while the window moves).
-    func followLiveFrame() {
-        guard visible, let f = AX.frame(window.element), f != window.frame else { return }
-        window.frame = f
-        layout()
+    /// Update from the window server's live bounds (called once per display frame while Chrome moves or
+    /// resizes). No AX calls here.
+    func followBounds(_ b: CGRect?) {
+        guard visible, let b = b else { return }
+        let o = window.frame
+        if abs(b.minX - o.minX) < 0.5 && abs(b.minY - o.minY) < 0.5
+            && abs(b.width - o.width) < 0.5 && abs(b.height - o.height) < 0.5 { return }
+        following = true
+        movedWhileFollowing = true
+        window.frame = b
+        layout(following: true)
+        onLocalGeometryChange?()
+    }
+
+    /// Following is over: one AX rescan (the rail rect is window-relative, so only a resize can change it).
+    func endFollowing() {
+        let moved = movedWhileFollowing
+        following = false
+        movedWhileFollowing = false
+        guard visible else { return }
+        if moved {
+            rescanTimer.cancel()
+            rescan(reason: "after follow")
+        }
+        sampleColor()
+    }
+
+    // MARK: Chrome colour
+
+    private func scheduleSample(after t: TimeInterval) {
+        sampleTimer.schedule(after: t) { [weak self] in
+            self?.sampleTimer.clear()
+            self?.sampleColor()
+        }
+    }
+
+    /// Samples the rail colour; pushes host state when it changed.
+    func sampleColor(push: Bool = true) {
+        guard visible, !following else { return }
+        var color = chromeColor
+        if let r = rail, window.cgID != 0, Permissions.screenCaptureGranted {
+            let w = window.frame
+            let y = r.rel.height > 120 ? w.minY + r.rel.maxY - 40 : w.minY + r.rel.midY - 12
+            let rect = CGRect(x: w.minX + r.rel.minX + 6, y: y, width: 4, height: 24)
+            if let c = ChromeColor.sample(windowID: window.cgID, rect: rect) { color = c }
+        } else if !Permissions.screenCaptureGranted {
+            color = nil
+        }
+        if color != chromeColor {
+            chromeColor = color
+            if push { pushHostState() }
+        }
+    }
+
+    /// `requestScreenCapture` from the page: ask, then re-check every second for 30 s.
+    private func startCaptureRequest() {
+        Permissions.requestScreenCapture()
+        captureDeadline = Date().addingTimeInterval(30)
+        captureTimer?.invalidate()
+        captureTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.captureTick() }
+        }
+    }
+
+    private func captureTick() {
+        sampleColor(push: false)
+        pushHostState()
+        if Permissions.screenCaptureGranted || Date() > captureDeadline {
+            captureTimer?.invalidate()
+            captureTimer = nil
+        }
     }
 
     // MARK: State changes
@@ -420,9 +544,16 @@ final class OverlayController {
         hideTimer.cancel()
         animToken += 1
         animating = false
+        noteRailWidths()
+        pendingPinWidth = nil
         if railControllable {
             if on {
-                if !railExpanded { pressRail(wantExpanded: true) }
+                if !railExpanded {
+                    // Lay the web view out at the expanded width first (still clipped to the rail).
+                    pendingPinWidth = lastExpandedRailWidth ?? max(peekWidth, Settings.minWidth)
+                    layout()
+                    pressRail(wantExpanded: true)
+                }
             } else {
                 floatPin = false
                 if railExpanded { pressRail(wantExpanded: false) }
@@ -450,7 +581,8 @@ final class OverlayController {
         var start = target
         if before == .collapsed && sidebar.isVisible { start = sidebar.frame } else { start.size.width = 1 }
         sidebar.setFrame(start, display: false)
-        sidebar.fitContent(width: ns.width, shadow: Self.shadowWidth)
+        // Only the panel frame animates; the web view is already at the peek width.
+        sidebar.fitContent(panelWidth: ns.width, contentWidth: ns.width, shadow: Self.shadowWidth)
         applyChrome(ax: ax, state: .peek)
         orderAbove(sidebar)
         pushHostState()
@@ -620,6 +752,8 @@ final class OverlayController {
             Permissions.openSettings()
         case "rescanRail":
             forceRescan()
+        case "requestScreenCapture":
+            startCaptureRequest()
         case "openExtensions":
             if let dir = value as? String, !dir.isEmpty { HostActions.openExtensionsPage(profileDir: dir) }
         case "revealExtension":
@@ -695,7 +829,8 @@ final class OverlayController {
 
     func pushHostState(force: Bool = false) {
         let s = state
-        let obj: [String: Any] = [
+        noteRailWidths()
+        var obj: [String: Any] = [
             "state": s.hostName,
             "pinned": s == .pinned,
             "railFound": rail != nil,
@@ -704,7 +839,11 @@ final class OverlayController {
             "accessibility": Permissions.isTrusted,
             "appVersion": AppInfo.version,
             "peekWidth": Int(peekWidth),
+            "screenCapture": Permissions.screenCaptureGranted,
+            "compact": s == .collapsed || s == .hidden,
+            "railWidth": Int(lastCollapsedRailWidth.rounded()),
         ]
+        if let c = chromeColor { obj["chromeColor"] = c } else { obj["chromeColor"] = NSNull() }
         sidebar.sendHostState(obj, force: force)
     }
 

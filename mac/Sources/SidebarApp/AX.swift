@@ -153,6 +153,29 @@ enum CGInfo {
         return arr
     }
 
+    /// Live window-server bounds (top-left origin, same space as AX) for the given windows.
+    /// One window uses `.optionIncludingWindow`; several use a single on-screen list call.
+    static func boundsMap(ids: [CGWindowID]) -> [CGWindowID: CGRect] {
+        var out: [CGWindowID: CGRect] = [:]
+        if ids.isEmpty { return out }
+        let arr: [[String: Any]]
+        if ids.count == 1 {
+            arr = (CGWindowListCopyWindowInfo([.optionIncludingWindow], ids[0]) as? [[String: Any]]) ?? []
+        } else {
+            arr = (CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? []
+        }
+        let wanted = Set(ids)
+        for info in arr {
+            guard let n = info["kCGWindowNumber"] as? NSNumber else { continue }
+            let id = CGWindowID(n.uint32Value)
+            guard wanted.contains(id),
+                  let boundsDict = info["kCGWindowBounds"] as? NSDictionary,
+                  let b = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else { continue }
+            out[id] = b
+        }
+        return out
+    }
+
     /// Fallback CGWindowID by owner pid + bounds.
     static func match(pid: pid_t, frame: CGRect, in infos: [[String: Any]]) -> CGWindowID {
         for info in infos {

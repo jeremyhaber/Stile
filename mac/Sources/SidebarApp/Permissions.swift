@@ -9,6 +9,12 @@ final class Permissions: NSObject {
 
     static var isTrusted: Bool { AXIsProcessTrusted() }
 
+    /// Screen Recording permission (used only for the window-only colour sample of Chrome).
+    static var screenCaptureGranted: Bool { CGPreflightScreenCaptureAccess() }
+
+    @discardableResult
+    static func requestScreenCapture() -> Bool { CGRequestScreenCaptureAccess() }
+
     static func openSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)

@@ -398,15 +398,10 @@ function draw() {
     return k && (k === a || !a.matches('input,select')) ? k.dataset.key + (k === a ? '' : '|child') : null;
   })();
   drawTheme();
-  if (OVERLAY && HOSTS.state === 'collapsed') {
-    drawCompact();
-    drawFooter();
-    postActiveTitle();
-    return;
-  }
   drawProfiles();
   drawPopoutBar();
-  if (S.view === 'main') { drawHint(); drawFavs(); drawPinned(); drawToday(); }
+  // Overlay compact mode is the same DOM as expanded (clipped by the app), so the lists stay drawn behind settings/archive too.
+  if (S.view === 'main' || (OVERLAY && isCompact())) { drawHint(); drawFavs(); drawPinned(); drawToday(); }
   drawFooter();
   if (OVERLAY) postActiveTitle();
   if (S.view === 'archive') drawArchive();
@@ -466,7 +461,19 @@ function drawChromeTheme(cur) {
   root.classList.toggle('has-chrome-color', !!color);
   const scheme = ct && ct.colorScheme;
   resolvedDark = scheme === 'dark' ? true : scheme === 'light' ? false : !!(darkMq && darkMq.matches);
+  // The host's sampled Chrome colour is the exact background; text colour follows its luminance and the
+  // hover/active colours are mixed from it in CSS.
+  const cc = HOSTS.chromeColor;
+  root.classList.toggle('has-chrome-bg', !!cc);
+  if (cc) {
+    root.style.setProperty('--overlay-bg', cc);
+    resolvedDark = hexLuminance(cc) < 0.5;
+  } else root.style.removeProperty('--overlay-bg');
   root.dataset.theme = resolvedDark ? 'dark' : 'light';
+}
+function hexLuminance(hex) {
+  const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
 }
 
 // Round avatar (button or span) for a profile in its resolved style.
@@ -547,60 +554,6 @@ function drawHint() {
   $('left-hint').hidden = S.leftHintDismissed;
   // Chrome is in horizontal-tabs mode (the app found no rail): explain how to get the full sidebar.
   $('vt-hint').hidden = !(OVERLAY && HOSTS.railFound === false && !vtHintDismissed);
-}
-
-// ---- compact strip (overlay mode, state "collapsed"): icons only, like Chrome's collapsed vertical tab rail
-function compactBtn(testid, props, ...kids) {
-  return h('button', { type: 'button', class: 'cbtn' + (props.active ? ' active' : ''), 'data-testid': testid, 'data-nav': '',
-    'data-active': props.active ? 'true' : 'false', title: props.title, 'aria-label': props.title, onclick: props.onclick,
-    ...props.attrs }, ...kids);
-}
-
-function drawCompact() {
-  // The full lists are not rendered in compact mode (no text rows, no drag and drop).
-  for (const id of ['favs', 'pinned', 'today']) $(id).replaceChildren();
-  const act = activeTab();
-  const items = [];
-  const cur = currentProfile();
-  if (cur) {
-    items.push(avatarEl('button', cur.p, cur.style, {
-      type: 'button', 'data-testid': 'compact-profile', 'aria-label': `Profile ${cur.p.name}`, title: cur.p.name || 'Profile',
-      onclick: () => setView('main')
-    }));
-  }
-  const openDot = (tab) => (tab ? h('span', { class: 'odot', 'data-testid': 'open-dot' }) : null);
-  const favs = S.favs.map((n) => {
-    const tab = S.boundByBm.get(n.id);
-    const isActive = !!(tab && act && tab.id === act.id);
-    return compactBtn('compact-favourite', {
-      title: n.title || n.url, active: isActive, onclick: () => cmd('openItem', { bookmarkId: n.id, windowId: S.windowId }),
-      attrs: { 'data-id': n.id, 'data-url': n.url, 'data-open': tab ? 'true' : 'false' }
-    }, favEl(n.url, (tab || S.boundAny.get(n.id) || {}).favIconUrl), openDot(tab));
-  });
-  items.push(...favs);
-  if (favs.length) items.push(h('hr', { class: 'cdiv', 'data-testid': 'compact-divider' }));
-  for (const e of S.flat) {
-    const n = e.n;
-    const tab = n.url ? S.boundByBm.get(n.id) : null;
-    if (!tab) continue; // only pinned items that are open
-    const isActive = !!(act && tab.id === act.id);
-    items.push(compactBtn('compact-pinned', {
-      title: n.title || n.url, active: isActive, onclick: () => cmd('openItem', { bookmarkId: n.id, windowId: S.windowId }),
-      attrs: { 'data-id': n.id, 'data-url': n.url }
-    }, favEl(n.url, tab.favIconUrl)));
-  }
-  for (const tab of S.today) {
-    const isActive = !!(act && act.id === tab.id);
-    const url = tab.url || tab.pendingUrl || '';
-    const title = nameOf(tab) || tab.title || url || 'New Tab';
-    items.push(compactBtn('compact-tab', {
-      title, active: isActive, onclick: () => openTab(tab),
-      attrs: { 'data-tab-id': tab.id, 'data-url': url, 'data-window-id': tab.windowId, 'data-audible': tab.audible ? 'true' : null }
-    }, favEl(url, tab.favIconUrl), tab.audible ? h('span', { class: 'adot', 'data-testid': 'compact-audible', title: 'Playing audio' }) : null));
-  }
-  items.push(compactBtn('compact-new-tab', { title: 'New tab', onclick: () => safe(chrome.tabs.create({ windowId: S.windowId, active: true })) },
-    h('span', { class: 'fav-ic' }, icon('plus'))));
-  $('compact-list').replaceChildren(...items);
 }
 
 // ---- favourites
@@ -704,6 +657,7 @@ function pinnedRow(e, act) {
     row.querySelector('.chev').style.visibility = 'hidden';
   }
   row.style.setProperty('--depth', String(e.depth));
+  if (e.depth > 0) row.append(h('span', { class: 'guide', 'aria-hidden': 'true' }));
   return row;
 }
 
@@ -1501,6 +1455,7 @@ function confirmDialog({ title, message, okLabel = 'OK', danger = false }) {
 
 // ------------------------------------------------------------------ drag and drop
 function startDrag(e, payload, el) {
+  if (OVERLAY && isCompact()) { e.preventDefault(); return; }   // no drag and drop while compact
   if (e.target.closest && e.target.closest('.rename-input')) { e.preventDefault(); return; }
   dragging = payload;
   closeMenu();
@@ -1951,7 +1906,7 @@ function setupListeners() {
 
 // ------------------------------------------------------------------ overlay mode (host protocol)
 // Host state pushed by the app (`__sidebarHostState`): state is "collapsed" | "peek" | "pinned".
-const HOSTS = { state: 'peek', railFound: null, railControllable: true, launchAtLogin: false, accessibility: null, appVersion: '', pinMode: 'push' };
+const HOSTS = { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: null, railFound: null, railControllable: true, launchAtLogin: false, accessibility: null, appVersion: '', pinMode: 'push' };
 let vtHintDismissed = false;
 try { vtHintDismissed = localStorage.getItem('vtHintDismissed') === '1'; } catch { /* storage unavailable */ }
 const hostPost = (action, value) => { try { if (window.__sidebarHost) window.__sidebarHost.post(action, value); } catch { /* ignore */ } };
@@ -1980,30 +1935,69 @@ function isBusy() {
 function updateBusy() { postOnce('busy', isBusy()); }
 
 const isPinned = () => HOSTS.state === 'pinned';
+const isCompact = () => HOSTS.compact;
 
 function applyHostState(st) {
   if (!st) return;
-  const wasCompact = HOSTS.state === 'collapsed';
+  const wasCompact = HOSTS.compact;
+  const oldColor = HOSTS.chromeColor;
   if (st.state === 'collapsed' || st.state === 'peek' || st.state === 'pinned') HOSTS.state = st.state;
   else if (typeof st.pinned === 'boolean') HOSTS.state = st.pinned ? 'pinned' : 'peek'; // older hosts
+  if ('compact' in st) HOSTS.compact = !!st.compact;
+  else if (st.state) HOSTS.compact = HOSTS.state === 'collapsed';
+  if (typeof st.railWidth === 'number' && st.railWidth >= 24 && st.railWidth <= 200) HOSTS.railWidth = st.railWidth;
+  if ('chromeColor' in st) HOSTS.chromeColor = typeof st.chromeColor === 'string' && /^#[0-9a-f]{6}$/i.test(st.chromeColor) ? st.chromeColor.toLowerCase() : null;
+  if ('screenCapture' in st) HOSTS.screenCapture = typeof st.screenCapture === 'boolean' ? st.screenCapture : null;
   if ('railFound' in st) HOSTS.railFound = typeof st.railFound === 'boolean' ? st.railFound : null;
   if ('railControllable' in st) HOSTS.railControllable = st.railControllable !== false;
   if ('launchAtLogin' in st) HOSTS.launchAtLogin = !!st.launchAtLogin;
   if ('accessibility' in st) HOSTS.accessibility = typeof st.accessibility === 'boolean' ? st.accessibility : null;
   if (typeof st.appVersion === 'string') HOSTS.appVersion = st.appVersion;
   const root = document.documentElement;
-  // Chrome's own rail makes room when pinned, so the panel is only "floating" (rounded, over the page) in peek,
-  // or when pinned but the rail cannot be controlled.
-  root.classList.toggle('compact', HOSTS.state === 'collapsed');
+  root.style.setProperty('--icon-x', `${HOSTS.railWidth / 2}px`);
   root.classList.toggle('overlay-float', HOSTS.state === 'peek' || (isPinned() && !HOSTS.railControllable));
+  if (wasCompact !== HOSTS.compact) setCompact(HOSTS.compact);
   const btn = $('pin-toggle');
   btn.setAttribute('aria-pressed', isPinned() ? 'true' : 'false');
   const lbl = isPinned() ? 'Unpin sidebar' : 'Pin sidebar';
   btn.title = lbl; btn.setAttribute('aria-label', lbl);
   drawAppSettings();
   if (loaded) {
-    if (wasCompact !== (HOSTS.state === 'collapsed')) draw(); else drawHint();
+    if (oldColor !== HOSTS.chromeColor) { drawTheme(); }
+    drawHint();
   }
+}
+
+// Compact = the same layout as expanded, with fades (CSS on html.compact). The favourites grid <-> column change and the
+// sections under it are animated with FLIP so nothing jumps.
+function setCompact(on) {
+  const root = document.documentElement;
+  const flipEls = () => [...document.querySelectorAll('.fav-tile, .sec:not(.sec-favs)')];
+  const first = loaded && root.offsetParent !== undefined ? new Map(flipEls().map((el) => [el, el.getBoundingClientRect()])) : null;
+  root.classList.toggle('compact', on);
+  const list = $('scroll-main');
+  if (on) list.setAttribute('data-testid', 'compact-strip'); else list.removeAttribute('data-testid');
+  if (!first || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) return;
+  const moved = [];
+  for (const [el, r1] of first) {
+    if (!el.isConnected) continue;
+    const r2 = el.getBoundingClientRect();
+    const dx = r1.left - r2.left, dy = r1.top - r2.top;
+    const sx = r2.width ? r1.width / r2.width : 1, sy = r2.height ? r1.height / r2.height : 1;
+    const isTile = el.classList.contains('fav-tile');
+    if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5 && (!isTile || (Math.abs(sx - 1) < 0.01 && Math.abs(sy - 1) < 0.01))) continue;
+    el.style.transition = 'none';
+    el.style.transformOrigin = '0 0';
+    el.style.transform = isTile ? `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})` : `translate(${dx}px, ${dy}px)`;
+    moved.push(el);
+  }
+  if (!moved.length) return;
+  void root.offsetWidth; // commit the inverted state
+  for (const el of moved) {
+    el.style.transition = 'transform 160ms ease';
+    el.style.transform = '';
+  }
+  setTimeout(() => { for (const el of moved) { el.style.transition = ''; el.style.transformOrigin = ''; } }, 220);
 }
 
 // Settings > App (overlay mode only): mirrors the host state; changes are posted to the app.
@@ -2016,6 +2010,10 @@ function drawAppSettings() {
   $('app-ax-status').textContent = ax === true ? 'Accessibility access granted' : ax === false ? 'Accessibility access needed' : 'Accessibility access unknown';
   $('app-ax-dot').className = 'status-dot' + (ax === true ? ' ok' : ax === false ? ' bad' : '');
   $('app-ax-open').hidden = ax !== false;
+  const sc = HOSTS.screenCapture;
+  $('app-sc-status').textContent = sc === true ? 'On' : '';
+  $('app-sc-on').hidden = sc === true;
+  $('app-sc-note').hidden = sc === true;
   $('app-float-note').hidden = !(HOSTS.railFound !== false && !HOSTS.railControllable);
   $('app-version').textContent = HOSTS.appVersion ? `Sidebar ${HOSTS.appVersion}` : '';
 }
@@ -2030,6 +2028,7 @@ function setupOverlay() {
   $('app-pinned').addEventListener('change', (e) => hostPost('setPinned', e.target.checked));
   $('app-login').addEventListener('change', (e) => hostPost('setLaunchAtLogin', e.target.checked));
   $('app-ax-open').addEventListener('click', () => hostPost('openAccessibilitySettings', true));
+  $('app-sc-on').addEventListener('click', () => hostPost('requestScreenCapture', true));
   $('app-rescan').addEventListener('click', () => hostPost('rescanRail', true));
   $('app-quit').addEventListener('click', async () => {
     const ok = await confirmDialog({ title: 'Quit Sidebar?', message: 'The sidebar will disappear until you open Sidebar again.', okLabel: 'Quit Sidebar', danger: true });

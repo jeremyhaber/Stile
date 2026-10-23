@@ -514,7 +514,7 @@ html.overlay[data-theme="dark"] {
 html.overlay[data-theme="dark"].has-chrome-color { --bg: color-mix(in oklab, var(--chrome-user) 28%, #1f1f1f); --accent: color-mix(in oklab, var(--chrome-user) 60%, white); }
 html.overlay, html.overlay body { background: var(--bg); }
 html.overlay.overlay-float { background: transparent; }
-html.overlay.overlay-float body { border-radius: 0 10px 10px 0; overflow: hidden; }
+html.overlay body { border-radius: 0; }   /* v2.2: square corners in every state (the app clips the one window-corner case natively) */
 html.overlay #left-hint, html.overlay .field.tips { display: none !important; }
 /* pills: no borders, 8px radius */
 html.overlay .row.active, html.overlay .split-row .half.active { box-shadow: none; }
@@ -524,34 +524,95 @@ html.overlay #pin-toggle { width: 28px; height: 28px; }
 html.overlay #pin-toggle[aria-pressed="true"] { background: var(--active); color: var(--accent-text); }
 html.overlay #pin-toggle[aria-pressed="true"] svg { fill: currentColor; fill-opacity: 0.25; }
 html.overlay .footer .icon-btn { width: 28px; height: 28px; }
-#view-compact { display: none; }
 .field.app .hint { margin-left: 0; margin-right: 0; }
 .field.app .btn { margin-top: 6px; }
 .field.app .btn.small { margin: 0 0 0 auto; }
+.field.app .status-line > #app-sc-label { flex: 1; color: var(--fg); }
+.field.app .status-line > #app-sc-status:empty { display: none; }
 
-/* compact strip: icons in 36px squares, 8px gap */
-html.compact .view:not(#view-compact) { display: none !important; }
-html.compact #view-compact { display: flex; }
-.compact-list {
-  flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 8px 0;
-  overflow-y: auto; overflow-x: hidden; scrollbar-width: none;
+/* ---- v2.2: exact Chrome colour (host-sampled) ---- */
+html.overlay.has-chrome-bg[data-theme] {
+  --bg: var(--overlay-bg);
+  --hover: color-mix(in srgb, var(--fg) 6%, var(--overlay-bg));
+  --active: color-mix(in srgb, var(--fg) 12%, var(--overlay-bg));
+  --tile: color-mix(in srgb, var(--fg) 6%, var(--overlay-bg));
+  --input: color-mix(in srgb, var(--fg) 8%, var(--overlay-bg));
+  --ring: color-mix(in srgb, var(--fg) 24%, var(--overlay-bg));
 }
-.compact-list::-webkit-scrollbar { display: none; }
-.cbtn, html.compact #archive-btn, html.compact #pin-toggle {
-  position: relative; width: 36px; height: 36px; flex: none; border-radius: 8px; padding: 0;
-  display: inline-flex; align-items: center; justify-content: center; color: var(--dim);
-  transition: background-color var(--t), color var(--t);
+
+/* ---- v2.2: stable layout. One DOM for compact and expanded: the page is always laid out at the expanded width, a fixed
+   icon column sits at --icon-x (the centre of the collapsed rail) and html.compact only fades things, never moves them. ---- */
+html.overlay {
+  --icon-x: 24px;
+  --row-pad: calc(var(--icon-x) - 12px);   /* 4px list gutter + half of a 16px icon */
+  --t2: 160ms;
 }
-.cbtn:hover, html.compact #archive-btn:hover, html.compact #pin-toggle:hover { background: var(--hover); color: var(--fg); }
-.cbtn.active { background: var(--active); color: var(--fg); }
-.cbtn .fav-ic { width: 16px; height: 16px; }
-.cbtn .odot { position: absolute; bottom: 3px; left: 50%; width: 4px; height: 4px; margin-left: -2px; border-radius: 50%; background: var(--dim); }
-.cbtn.active .odot { background: var(--accent-text); }
-.cbtn .adot { position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent-text); box-shadow: 0 0 0 2px var(--bg); }
-.cdiv { width: 24px; height: 1px; margin: 0; border: 0; background: var(--ring); flex: none; }
-.compact-list .pbtn { width: 28px; height: 28px; opacity: 1; flex: none; }
-html.compact .footer { flex-direction: column; align-items: center; gap: 8px; padding: 8px 0; }
-html.compact .footer .spacer, html.compact #newwin-btn, html.compact #settings-btn, html.compact #archive-btn > span:not(.foot-ic) { display: none; }
-html.compact #archive-btn > #archive-count:not([hidden]) {
-  display: block; position: absolute; top: 5px; right: 5px; min-width: 0; width: 7px; height: 7px; padding: 0; border-radius: 50%; font-size: 0; background: var(--accent-text);
+html.overlay .top { padding: 10px 4px 4px; }
+html.overlay .scroll { padding: 4px 4px 12px; }
+html.overlay .sec-h { padding: 0 4px 0 var(--row-pad); }
+html.overlay .row { padding-left: var(--row-pad); }
+html.overlay .prow { padding-left: var(--row-pad); }
+html.overlay .prow .title { margin-left: calc(var(--depth, 0) * 16px); }
+html.overlay .row.drop-before::before, html.overlay .row.drop-after::after { left: calc(var(--row-pad) + var(--depth, 0) * 16px); }
+html.overlay .prow .chev { order: 9; }
+html.overlay .prow[data-kind="item"] .chev { display: none; }
+html.overlay .guide { position: absolute; left: calc(var(--icon-x) + 4px); top: 0; bottom: -2px; width: 1px; background: var(--ring); pointer-events: none; }
+html.overlay .today-row .fav-ic { order: -1; }
+html.overlay .group-row .chev { order: 9; }
+html.overlay .group-row .gdot { margin: 0 3px; }
+html.overlay .group-body { margin-left: 0; padding-left: 0; border-left: 0; position: relative; }
+html.overlay .group-body::before { content: ""; position: absolute; left: calc(var(--icon-x) + 4px); top: 0; bottom: 0; width: 2px; border-radius: 1px; background: var(--gc); z-index: 1; pointer-events: none; }
+html.overlay .group-body .row .title { margin-left: 16px; }
+html.overlay .split-row { padding-left: calc(var(--row-pad) - 4px); }
+html.overlay .split-row > .split-ic { order: 9; }
+html.overlay .footer { padding: 6px 4px 8px; }
+html.overlay #archive-btn { padding-left: var(--row-pad); gap: 8px; min-width: 0; }
+html.overlay #archive-btn .foot-ic { width: 16px; justify-content: center; }
+html.overlay .viewbar { padding: 10px 4px 4px; }
+
+/* profile switcher: current profile first, in the icon column */
+html.overlay .profiles { padding: 6px 0 6px calc(var(--icon-x) - 4px - 14px); gap: 10px; overflow-x: hidden; }
+html.overlay .pbtn[data-current="true"] { order: -1; }
+html.overlay .pbtn { transition: opacity var(--t2), transform var(--t); }
+
+/* address field -> 32px search button at the same left position */
+html.overlay .addr-row { margin-left: calc(var(--icon-x) - 4px - 16px); gap: 6px; }
+html.overlay .addr { flex: 0 1 100%; min-width: 0; overflow: hidden; border-radius: 8px; transition: flex-basis var(--t2) ease; }
+html.overlay .addr-ic { left: 8px; }
+html.overlay .addr input { height: 32px; border-radius: 8px; padding: 0 12px 0 32px; transition: box-shadow var(--t), background-color var(--t), color var(--t2); }
+html.overlay .boost-slot { transition: opacity var(--t2); }
+
+/* favourites */
+html.overlay .favs { transition: none; }
+
+/* hover-only controls and the like fade in place */
+html.overlay .sec-h h2, html.overlay .sec-actions, html.overlay #new-folder, html.overlay .gcount, html.overlay .badge, html.overlay .sub,
+html.overlay .window-head .wmeta, html.overlay .window-head .wsub, html.overlay .window-head .wmerge, html.overlay .prow .chev, html.overlay .group-row .chev,
+html.overlay .row .act, html.overlay .badge-ic, html.overlay .split-ic, html.overlay .footer .icon-btn, html.overlay .addr input::placeholder,
+html.overlay .fav-empty, html.overlay .tree .empty-drop, html.overlay .guide {
+  transition: opacity var(--t2), color var(--t2), background-color var(--t), transform var(--t);
 }
+
+html.overlay.compact .pbtn:not([data-current="true"]),
+html.overlay.compact .boost-slot,
+html.overlay.compact .sec-h h2, html.overlay.compact .sec-actions, html.overlay.compact #new-folder,
+html.overlay.compact .gcount, html.overlay.compact .badge, html.overlay.compact .sub,
+html.overlay.compact .window-head .wmeta, html.overlay.compact .window-head .wsub, html.overlay.compact .window-head .wmerge,
+html.overlay.compact .prow .chev, html.overlay.compact .group-row .chev, html.overlay.compact .row .act,
+html.overlay.compact .row .badge-ic, html.overlay.compact .split-ic, html.overlay.compact .footer .icon-btn {
+  opacity: 0 !important; pointer-events: none;
+}
+html.overlay.compact .row .title, html.overlay.compact .row .half .title { opacity: 0; }
+html.overlay #archive-btn > span:not(.foot-ic):not(.badge) { transition: opacity var(--t2); }
+html.overlay.compact #archive-btn > span:not(.foot-ic):not(.badge) { opacity: 0; }
+html.overlay.compact .addr { flex-basis: 32px; flex-shrink: 0; }
+html.overlay.compact .addr input { color: transparent; }
+html.overlay.compact .addr input::placeholder { color: transparent; }
+html.overlay.compact .addr input:hover { background: var(--hover); }
+html.overlay.compact .favs { grid-template-columns: 40px; justify-content: start; gap: 4px; padding-left: calc(var(--icon-x) - 4px - 20px); }
+html.overlay.compact .fav-empty, html.overlay.compact .tree .empty-drop { color: transparent; }
+html.overlay.compact .row .badge-ic { opacity: 0; }
+html.overlay .footer .icon-btn { opacity: 1; }
+html.overlay.compact #archive-count { opacity: 0; }
+html.compact .view:not(#view-main) { display: none !important; }
+html.compact #view-main[hidden] { display: flex !important; }

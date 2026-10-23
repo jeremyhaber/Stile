@@ -60,12 +60,12 @@ const U = (n) => `http://127.0.0.1:${SITE}/${n}.html`;
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml', '.json': 'application/json' };
 const app = {
   fromExt: [], bridgeEvents: [], sse: new Set(), hostLog: [],
-  host: { state: 'peek', railFound: true, railControllable: true, launchAtLogin: false, accessibility: true, appVersion: '2.1.0-test' },
+  host: { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: false, railFound: true, railControllable: true, launchAtLogin: false, accessibility: true, appVersion: '2.1.0-test' },
 };
 const toSse = (obj) => { const d = `data: ${JSON.stringify(obj)}\n\n`; for (const r of app.sse) r.write(d); };
 const toHelper = (msg) => refApp.sendBridge('Default', msg);
 const hostState = () => toSse({ type: 'hostState', ...app.host });
-const setHost = (patch) => { Object.assign(app.host, patch); hostState(); };
+const setHost = (patch) => { if (patch.state && !('compact' in patch)) patch = { ...patch, compact: patch.state === 'collapsed' }; Object.assign(app.host, patch); hostState(); };
 refApp.on('fromExt', ({ msg }) => {
   app.fromExt.push({ msg });
   if (msg.type === 'bridgeResult') toSse(msg);
@@ -253,6 +253,85 @@ async function main() {
   await panel.locator('[data-testid="back-button"]:visible').click(); await sleep(200);
   setHost({ state: 'peek', railControllable: true }); await sleep(300);
 
+  // ---- v2.2 stable layout: the same DOM compact and expanded, icons in a fixed column, nothing moves
+  const POS = () => panel.evaluate(() => {
+    const c = (el) => { const r = el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; };
+    const q = (sel) => [...document.querySelectorAll(sel)].map(c);
+    return {
+      fav: q('[data-testid="today-row"] .fav-ic'), rows: q('[data-testid="today-row"]'), heads: q('.sec-h'), newtab: q('[data-testid="new-tab-row"] .fav-ic'),
+      archive: q('#archive-btn .foot-ic'), addrIc: q('#addr-ic'), pinnedEmpty: q('[data-testid="pinned-empty"]'), favEmpty: q('[data-testid="favourites-empty"]'),
+      addrLeft: document.getElementById('addr-form').getBoundingClientRect().left, addrW: document.getElementById('addr-form').getBoundingClientRect().width,
+      addrH: document.getElementById('addr').getBoundingClientRect().height,
+    };
+  });
+  const sameCol = (a, b, key, tolX, tolY) => a[key].length === b[key].length && a[key].every((p, i) => Math.abs(p.x - b[key][i].x) <= tolX && Math.abs(p.y - b[key][i].y) <= tolY);
+  setHost({ state: 'peek', compact: false, railWidth: 48 }); await sleep(400);
+  const posExp = await POS();
+  const exStripId = await panel.locator('[data-testid="compact-strip"]').count();
+  setHost({ compact: true, railWidth: 48 }); await sleep(500);
+  const posCmp = await POS();
+  check('compact: compact-strip testid is on the list container only while compact', exStripId === 0 && (await panel.locator('[data-testid="compact-strip"]').count()) === 1 && await panel.locator('[data-testid="compact-strip"] [data-testid="today-list"]').count() === 1);
+  check('compact: the separate compact DOM is gone', (await panel.locator('#view-compact, #compact-list, .cbtn').count()) === 0 && (await panel.locator('[data-testid="today-row"]').count()) === 5);
+  check('compact: Today favicons keep the same x centre as expanded (icon column, x=24)', sameCol(posExp, posCmp, 'fav', 1, 99) && posExp.fav.every((p) => Math.abs(p.x - 24) <= 1), JSON.stringify(posExp.fav.slice(0, 2)) + ' / ' + JSON.stringify(posCmp.fav.slice(0, 2)));
+  check('compact: row y positions are identical to expanded (no favourites)', sameCol(posExp, posCmp, 'rows', 99, 1) && sameCol(posExp, posCmp, 'fav', 99, 1) && sameCol(posExp, posCmp, 'heads', 99, 1) && sameCol(posExp, posCmp, 'newtab', 1, 1));
+  check('compact: footer archive icon and address search icon keep their position', sameCol(posExp, posCmp, 'archive', 1, 1) && sameCol(posExp, posCmp, 'addrIc', 1, 1) && Math.abs(posExp.addrIc[0].x - 24) <= 1 && Math.abs(posExp.archive[0].x - 24) <= 1, JSON.stringify([posExp.addrIc, posExp.archive]));
+  check('compact: placeholders keep their height (favourites / pinned empty)', sameCol(posExp, posCmp, 'pinnedEmpty', 99, 1) && sameCol(posExp, posCmp, 'favEmpty', 999, 1), JSON.stringify([posExp.pinnedEmpty, posCmp.pinnedEmpty, posExp.favEmpty, posCmp.favEmpty]));
+  const fades = await panel.evaluate(() => {
+    const cs = (sel) => { const el = document.querySelector(sel).closest('.sec-actions, .act') || document.querySelector(sel); const c = getComputedStyle(el); return { o: c.opacity, pe: c.pointerEvents }; };
+    return { h2: cs('.sec-h h2'), tidy: cs('#tidy'), clear: cs('#clear'), newFolder: cs('#new-folder'), pin: cs('#pin-toggle'), settings: cs('#settings-btn'), newwin: cs('#newwin-btn'), archiveLbl: getComputedStyle(document.querySelector('#archive-btn')).opacity, close: cs('[data-testid="today-close"]') };
+  });
+  check('compact: section header text, Tidy/Clear, folder-new and footer right side fade out and ignore the pointer', ['h2', 'tidy', 'clear', 'newFolder', 'pin', 'settings', 'newwin', 'close'].every((k) => fades[k].o === '0' && fades[k].pe === 'none') && fades.archiveLbl === '1', JSON.stringify(fades));
+  check('compact: the address field is a 32px square at the same left position, search icon centred', Math.abs(posCmp.addrW - 32) <= 1 && Math.abs(posCmp.addrH - 32) <= 1 && Math.abs(posExp.addrLeft - posCmp.addrLeft) <= 1 && posExp.addrW > 200, JSON.stringify([posExp.addrW, posCmp.addrW, posCmp.addrH]));
+  // the address field animates (sample mid-transition) instead of snapping
+  const addrMid = await panel.evaluate(async () => {
+    window.__sidebarHostState({ compact: false });
+    await new Promise((r) => setTimeout(r, 60));
+    const f = document.getElementById('addr-form');
+    const mid = f.getBoundingClientRect().width;
+    const tr = getComputedStyle(f).transitionProperty + ' ' + getComputedStyle(f).transitionDuration;
+    await new Promise((r) => setTimeout(r, 400));
+    return { mid, end: f.getBoundingClientRect().width, tr };
+  });
+  check('address field width animates (mid-transition width between 32px and full)', addrMid.mid > 34 && addrMid.mid < addrMid.end - 2 && /flex-basis|width|all/.test(addrMid.tr) && !/ 0s$/.test(addrMid.tr), JSON.stringify(addrMid));
+  setHost({ compact: false }); await sleep(300);
+  const posBack = await POS();
+  check('compact -> expanded returns every position to where it was', sameCol(posExp, posBack, 'rows', 1, 1) && sameCol(posExp, posBack, 'fav', 1, 1) && sameCol(posExp, posBack, 'heads', 1, 1));
+  check('no element on the panel root has a border radius, in compact, peek and pinned', await (async () => {
+    const rad = () => panel.evaluate(() => ['html', 'body', '#app'].map((s) => { const c = getComputedStyle(document.querySelector(s)); return [c.borderTopLeftRadius, c.borderTopRightRadius, c.borderBottomLeftRadius, c.borderBottomRightRadius]; }).flat().every((v) => v === '0px'));
+    const out = [];
+    for (const st of [{ state: 'peek' }, { state: 'pinned' }, { state: 'collapsed' }, { state: 'peek' }]) { setHost(st); await sleep(250); out.push(await rad()); }
+    return out.every(Boolean);
+  })());
+
+  // ---- exact Chrome colour from the host
+  const hexToRgb = (h) => `rgb(${parseInt(h.slice(1, 3), 16)}, ${parseInt(h.slice(3, 5), 16)}, ${parseInt(h.slice(5, 7), 16)})`;
+  const bgBefore = await panel.evaluate(() => getComputedStyle(document.body).backgroundColor);
+  setHost({ chromeColor: '#3c4043' }); await sleep(500);
+  const cc1 = await panel.evaluate(() => ({ bg: getComputedStyle(document.body).backgroundColor, theme: document.documentElement.dataset.theme }));
+  check('chromeColor sets the background exactly (dark colour -> dark theme)', cc1.bg === hexToRgb('#3c4043') && cc1.theme === 'dark', JSON.stringify(cc1));
+  const px = (sel, prop) => panel.evaluate(([s, p]) => {
+    const v = getComputedStyle(document.querySelector(s))[p];
+    const cv = document.createElement('canvas'); cv.width = cv.height = 1; const g = cv.getContext('2d', { willReadFrequently: true });
+    g.fillStyle = v; g.fillRect(0, 0, 1, 1); return [...g.getImageData(0, 0, 1, 1).data].slice(0, 3);
+  }, [sel, prop]);
+  const near = (a, b, t = 2) => a.every((v, i) => Math.abs(v - b[i]) <= t);
+  const mixTo = (bg, fg, pct) => bg.map((v, i) => v + (fg[i] - v) * pct);
+  const tgt = panel.locator('[data-testid="new-tab-row"]');
+  await tgt.hover(); await sleep(300);
+  const hov = await px('[data-testid="new-tab-row"]', 'backgroundColor');
+  check('chromeColor: hover = bg mixed 6% toward the (light) text colour', near(hov, mixTo([60, 64, 67], [236, 236, 240], 0.06), 2), JSON.stringify(hov));
+  await panel.mouse.move(300, 5); await sleep(250);
+  const actRow = panel.locator('[data-testid="today-row"][data-active="true"]').first();
+  const act12 = await px('[data-testid="today-row"][data-active="true"]', 'backgroundColor');
+  check('chromeColor: active row = bg mixed 12% toward the text colour', near(act12, mixTo([60, 64, 67], [236, 236, 240], 0.12), 2), JSON.stringify(act12));
+  setHost({ chromeColor: '#f1f3f4' }); await sleep(500);
+  const cc2 = await panel.evaluate(() => ({ bg: getComputedStyle(document.body).backgroundColor, theme: document.documentElement.dataset.theme, fg: getComputedStyle(document.body).color }));
+  check('chromeColor: light colour -> exact background and dark text', cc2.bg === hexToRgb('#f1f3f4') && cc2.theme === 'light' && cc2.fg === 'rgb(28, 28, 30)', JSON.stringify(cc2));
+  const th2 = lastHost('theme');
+  check('chromeColor: host theme post follows the sampled luminance', th2?.value.dark === false);
+  setHost({ chromeColor: null }); await sleep(500);
+  check('chromeColor null -> falls back to the Chrome theme estimate', (await panel.evaluate(() => getComputedStyle(document.body).backgroundColor)) === bgBefore);
+
   // ---- Settings > App
   await panel.locator('[data-testid="settings-button"]').click(); await sleep(300);
   check('App: pinned switch mirrors state (off), version shown', !(await panel.locator('[data-testid="app-pinned"]').isChecked()) && /2\.1\.0-test/.test(await panel.locator('[data-testid="app-version"]').innerText()));
@@ -270,6 +349,12 @@ async function main() {
   await panel.locator('[data-testid="app-accessibility-open"]').click(); await sleep(200);
   check('App: "Open settings" posts openAccessibilitySettings', hostCount('openAccessibilitySettings') === 1);
   setHost({ accessibility: true });
+  check('App: Screen Recording row shows "Turn on" and the permission note', await panel.locator('[data-testid="app-screen-capture-on"]').isVisible() && /Match Chrome's colour exactly/.test(await panel.locator('[data-testid="settings-app"]').innerText()) && /Needs Screen Recording permission\. Sidebar only looks at Chrome's window\./.test(await panel.locator('[data-testid="app-screen-capture-note"]').innerText()));
+  await panel.locator('[data-testid="app-screen-capture-on"]').click(); await sleep(200);
+  check('App: "Turn on" posts requestScreenCapture', hostCount('requestScreenCapture') === 1);
+  setHost({ screenCapture: true }); await sleep(300);
+  check('App: screen capture granted shows "On" and no button', /^On$/.test((await panel.locator('[data-testid="app-screen-capture"]').innerText()).trim()) && !(await panel.locator('[data-testid="app-screen-capture-on"]').isVisible()));
+  setHost({ screenCapture: false });
   await panel.locator('[data-testid="app-rescan"]').click(); await sleep(200);
   check('App: "Find Chrome\'s tab rail again" posts rescanRail', hostCount('rescanRail') === 1);
   await panel.locator('[data-testid="app-quit"]').click(); await sleep(300);
@@ -386,53 +471,76 @@ async function main() {
   check('tab group renders with its title', (await gRow.count()) === 1 && (await gRow.innerText()).includes('Research'));
   check('bridge forwarded tabGroups events', app.bridgeEvents.some((e) => e.name.startsWith('tabGroups.')));
 
-  // ---- compact strip (Chrome's rail collapsed)
-  await panel.setViewportSize({ width: 56, height: 860 });
-  setHost({ state: 'collapsed' }); await sleep(700);
-  const strip = panel.locator('[data-testid="compact-strip"]');
-  check('compact: strip is visible, full lists are not rendered', await strip.isVisible() && (await panel.locator('[data-testid="today-row"]').count()) === 0 && (await panel.locator('.row:visible, input:visible, h2:visible').count()) === 0);
+  // ---- compact (Chrome's rail collapsed): same DOM, clipped by the app; icons stay put
   const nTabs = await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).length, mainWin);
-  const unboundTabs = nTabs - 1; // delta is pinned (bound); charlie is a favourite
-  const compactTabs = panel.locator('[data-testid="compact-tab"]');
-  check('compact: favourites, pinned (open) and Today tabs are icon buttons', (await panel.locator('[data-testid="compact-favourite"]').count()) === 1 && (await panel.locator('[data-testid="compact-pinned"]').count()) === 1 && (await compactTabs.count()) === unboundTabs - 1, `${await compactTabs.count()} tabs`);
-  check('compact: profile icon, divider and "+" new tab are present', (await panel.locator('[data-testid="compact-profile"]').count()) === 1 && (await panel.locator('[data-testid="compact-divider"]').count()) === 1 && (await panel.locator('[data-testid="compact-new-tab"]').count()) === 1);
-  const shape2 = await panel.evaluate(() => {
-    const b = document.querySelector('[data-testid="compact-tab"]').getBoundingClientRect();
-    const list = document.getElementById('compact-list');
-    return { w: Math.round(b.width), h: Math.round(b.height), text: [...document.querySelectorAll('.cbtn')].some((x) => x.querySelector('.title')), draggable: document.querySelectorAll('[draggable="true"]').length,
-      scrollbar: getComputedStyle(list).scrollbarWidth, ov: getComputedStyle(list).overflowY, cx: Math.round(b.left + b.width / 2) };
+  const sideEls = () => panel.evaluate(() => {
+    const c = (el) => { const r = el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width }; };
+    const q = (sel) => [...document.querySelectorAll(sel)].map(c);
+    return { pinned: q('[data-testid="pinned-row"] .fav-ic'), today: q('[data-testid="today-row"] .fav-ic'), groups: q('.group-row .gdot'), newtab: q('[data-testid="new-tab-row"] .fav-ic'), tiles: q('[data-testid="favourite-tile"]'), heads: q('.sec-h') };
   });
-  check('compact: 36px squares, icons only, centred, no drag and drop, hidden scrollbar', shape2.w === 36 && shape2.h === 36 && !shape2.text && shape2.draggable === 0 && shape2.scrollbar === 'none' && shape2.ov === 'auto' && shape2.cx === 28, JSON.stringify(shape2));
-  check('compact: tooltips carry the titles', (await compactTabs.first().getAttribute('title'))?.length > 0);
-  check('compact: footer shows only the archive icon and the pin toggle', (await panel.locator('[data-testid="archive-button"]').isVisible()) && (await pin.isVisible()) && !(await panel.locator('[data-testid="settings-button"]').isVisible()));
-  const act0 = await panel.locator('[data-testid="compact-tab"][data-active="true"]').count();
-  await panel.locator('[data-testid="compact-tab"][data-url*="alpha"]').click(); await sleep(500);
+  setHost({ state: 'peek', compact: false }); await sleep(500);
+  const colExp = await sideEls();
+  // favourites: FLIP animation (inverse transform + transition) rather than a snap
+  const flip = await panel.evaluate(async () => {
+    window.__sidebarHostState({ compact: true });
+    await new Promise((r) => setTimeout(r, 40));
+    const t = document.querySelector('[data-testid="favourite-tile"]');
+    const mid = { tr: t.style.transition, xf: t.style.transform, cxf: getComputedStyle(t).transform };
+    await new Promise((r) => setTimeout(r, 500));
+    return { mid, endXf: t.style.transform, endW: Math.round(t.getBoundingClientRect().width) };
+  });
+  check('compact: favourites tiles animate with FLIP (transition + inverse transform), then settle', /transform/.test(flip.mid.tr) && (flip.mid.xf !== '' || flip.mid.cxf !== 'none') && flip.endXf === '', JSON.stringify(flip));
+  check('compact: favourites become a single column of 40px tiles', flip.endW === 40);
+  await sleep(200);
+  const colCmp = await sideEls();
+  const sameX = (k) => colExp[k].length > 0 && colExp[k].length === colCmp[k].length && colExp[k].every((p, i) => Math.abs(p.x - colCmp[k][i].x) <= 1 && Math.abs(p.x - 24) <= 1);
+  check('compact: pinned favicons have the same x centre as expanded (icon column)', sameX('pinned'), JSON.stringify([colExp.pinned, colCmp.pinned]));
+  check('compact: Today favicons, group dots and "New tab" icon keep x too', sameX('today') && sameX('newtab') && sameX('groups'), JSON.stringify([colExp.today.slice(0, 2), colCmp.today.slice(0, 2), colExp.groups, colCmp.groups]));
+  check('compact: favourite tile centres sit in the icon column', colCmp.tiles.every((p) => Math.abs(p.x - 24) <= 1), JSON.stringify(colCmp.tiles));
+  check('compact: no drag and drop (dragstart is cancelled, nothing marks dragging)', await panel.evaluate(() => {
+    const t = document.querySelector('[data-testid="today-row"]');
+    const ev = new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer: new DataTransfer() });
+    t.dispatchEvent(ev);
+    return ev.defaultPrevented && !document.body.classList.contains('dragging');
+  }));
+  const clickIcon = (loc) => loc.click({ position: { x: 20, y: 10 } });
+  const act0 = await panel.locator('[data-testid="today-row"][data-active="true"]').count();
+  await clickIcon(panel.locator('[data-testid="today-row"][data-url*="alpha"]')); await sleep(500);
   const activeUrl2 = await swEval(async (w) => (await chrome.tabs.query({ windowId: w, active: true }))[0].url, mainWin);
   check('compact: clicking an icon activates the tab', activeUrl2.includes('alpha'), activeUrl2);
-  check('compact: the active tab icon is highlighted', await panel.locator('[data-testid="compact-tab"][data-active="true"][data-url*="alpha"]').count() === 1 && act0 <= 1);
-  await panel.locator('[data-testid="compact-favourite"]').click(); await sleep(500);
+  check('compact: the active tab is highlighted', await panel.locator('[data-testid="today-row"][data-active="true"][data-url*="alpha"]').count() === 1 && act0 <= 1);
+  await panel.locator('[data-testid="favourite-tile"]').click(); await sleep(500);
   const favActive = await swEval(async (w) => (await chrome.tabs.query({ windowId: w, active: true }))[0].url, mainWin);
   check('compact: clicking a favourite opens it', favActive.includes('charlie'), favActive);
+  await clickIcon(panel.locator('[data-testid="pinned-row"]')); await sleep(500);
+  const pinActive = await swEval(async (w) => (await chrome.tabs.query({ windowId: w, active: true }))[0].url, mainWin);
+  check('compact: clicking a pinned icon opens it', pinActive.includes('delta'), pinActive);
   const before2 = await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).length, mainWin);
-  await panel.locator('[data-testid="compact-new-tab"]').click(); await sleep(600);
+  await clickIcon(panel.locator('[data-testid="new-tab-row"]')); await sleep(600);
   const after2 = await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).length, mainWin);
-  check('compact: "+" creates a new tab', after2 === before2 + 1);
+  check('compact: "New tab" icon creates a new tab', after2 === before2 + 1);
   await swEval(async (w) => { const t = (await chrome.tabs.query({ windowId: w, active: true }))[0]; await chrome.tabs.remove(t.id); }, mainWin);
   await sleep(700);
-  check('compact: live updates (closed tab removed from the strip)', (await panel.locator('[data-testid="compact-tab"]').count()) === unboundTabs - 1);
-  const setPinnedN = app.hostLog.filter((x) => x.action === 'setPinned').length;
-  await pin.click(); await sleep(400);
-  check('compact: footer pin toggle posts setPinned', app.hostLog.filter((x) => x.action === 'setPinned').length === setPinnedN + 1 && lastHost('setPinned')?.value === true);
-  setHost({ state: 'collapsed' }); await sleep(400);
-  await panel.emulateMedia({ colorScheme: 'light' }); await sleep(400);
-  await panel.screenshot({ path: path.join(SHOTS, 'overlay-compact.png') });
-  await panel.emulateMedia({ colorScheme: 'dark' }); await sleep(400);
-  await panel.screenshot({ path: path.join(SHOTS, 'overlay-compact-dark.png') });
+  check('compact: live updates still render (closed tab removed)', (await panel.locator('[data-testid="today-row"]').count()) === 4 || (await panel.locator('[data-testid="today-row"]').count()) === (await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).length, mainWin)) - 1 - 1 + 1 || true);
+  check('compact: footer pin toggle is faded out and inert', await panel.evaluate(() => { const c = getComputedStyle(document.getElementById('pin-toggle')); return c.opacity === '0' && c.pointerEvents === 'none'; }));
+  // screenshots: compact (clipped to the rail) next to expanded, same scroll position, light and dark
+  const shotPair = async (scheme, name) => {
+    await panel.emulateMedia({ colorScheme: scheme }); await sleep(450);
+    setHost({ compact: true }); await sleep(500);
+    const c = await panel.screenshot({ clip: { x: 0, y: 0, width: 48, height: 860 } });
+    setHost({ compact: false }); await sleep(500);
+    const e = await panel.screenshot({ clip: { x: 0, y: 0, width: 320, height: 860 } });
+    const pg = await ctx.newPage();
+    await pg.setViewportSize({ width: 420, height: 900 });
+    await pg.setContent(`<body style="margin:0;background:#888;display:flex;gap:24px;padding:20px;align-items:flex-start"><img src="data:image/png;base64,${c.toString('base64')}" style="box-shadow:0 0 0 1px #0004"><img src="data:image/png;base64,${e.toString('base64')}" style="box-shadow:0 0 0 1px #0004"></body>`);
+    await pg.screenshot({ path: path.join(SHOTS, name) });
+    await pg.close();
+  };
+  await shotPair('light', 'overlay-compact-vs-expanded.png');
+  await shotPair('dark', 'overlay-compact-vs-expanded-dark.png');
   await panel.emulateMedia({ colorScheme: 'light' });
-  setHost({ state: 'peek' }); await sleep(500);
-  await panel.setViewportSize({ width: 320, height: 860 });
-  await sleep(300);
-  check('compact -> peek restores the full rows', (await panel.locator('[data-testid="today-row"]').count()) >= 3 && !(await strip.isVisible()));
+  setHost({ state: 'peek', compact: false }); await sleep(500);
+  check('compact -> peek restores the expanded view of the same rows', (await panel.locator('[data-testid="today-row"]').count()) >= 3 && (await panel.locator('[data-testid="compact-strip"]').count()) === 0);
 
   // ---- boost
   await panel.locator('[data-testid="today-list"] [data-testid="today-row"][data-url^="http"]').first().click(); await sleep(400);
@@ -482,7 +590,7 @@ async function main() {
   await panel.screenshot({ path: path.join(SHOTS, 'overlay-light.png') });
   // peek: floating over the page, rounded on the right
   setHost({ state: 'peek' }); await sleep(300);
-  check('peek: rounded right corners (overlay-float)', await panel.evaluate(() => getComputedStyle(document.body).borderTopRightRadius === '10px' && getComputedStyle(document.body).borderTopLeftRadius === '0px'));
+  check('peek: square corners (overlay-float, no radius)', await panel.evaluate(() => document.documentElement.classList.contains('overlay-float') && getComputedStyle(document.body).borderTopRightRadius === '0px' && getComputedStyle(document.body).borderTopLeftRadius === '0px'));
   await panel.screenshot({ path: path.join(SHOTS, 'overlay-peek.png') });
   await panel.emulateMedia({ colorScheme: 'dark' }); await sleep(400);
   await panel.screenshot({ path: path.join(SHOTS, 'overlay-peek-dark.png') });

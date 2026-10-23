@@ -39,6 +39,9 @@ final class ChromeTracker {
     private(set) var pid: pid_t = 0
     private(set) var appElement: AXUIElement?
     private(set) var lastGeometryEvent = Date.distantPast
+    /// While true (a live move/resize is being followed from window-server bounds) refresh() does nothing,
+    /// so no AX calls are made. The manager refreshes once when following ends.
+    var paused = false
 
     private var observer: AXObserver?
     private var observedKeys = Set<Int>()
@@ -157,7 +160,7 @@ final class ChromeTracker {
     // MARK: Refresh
 
     func refresh(force: Bool) {
-        guard pid != 0, let app = appElement else { return }
+        guard !paused, pid != 0, let app = appElement else { return }
         if observer == nil { setupObserver() }
 
         let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == pid

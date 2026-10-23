@@ -13,9 +13,9 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     var onResize: ((CGFloat) -> Void)?
     var onResizeEnded: (() -> Void)?
 
-    /// Transparent panel content: holds `container` (clipped, rounded) and the peek shadow strip.
+    /// Transparent panel content: holds `container` (clipped to the panel, bottom-left corner only) and the peek shadow strip.
     let root = NSView(frame: .zero)
-    /// Clips the web view; its width is the sidebar's logical width.
+    /// Holds the web view at the expanded width; the panel's own frame clips it to the visible strip.
     let container = NSView(frame: .zero)
     let shadowStrip = NSView(frame: .zero)
     let webView: WKWebView
@@ -108,27 +108,26 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
-    /// Lay the web view out at a fixed logical width (the panel itself may be narrower while animating).
-    /// `shadow` is the width of the transparent shadow strip to the right of the content (peek only).
-    func fitContent(width: CGFloat, shadow: CGFloat = 0) {
+    /// Lay the content out. `panelWidth` is the visible strip (the panel itself clips anything wider),
+    /// `contentWidth` is the web view's width: the target expanded width, so collapsed is just the same
+    /// layout clipped to the rail. `shadow` is the transparent shadow strip right of the content (peek only).
+    func fitContent(panelWidth: CGFloat, contentWidth: CGFloat, shadow: CGFloat = 0) {
         let h = root.bounds.height
-        container.frame = NSRect(x: 0, y: 0, width: width, height: h)
-        webView.frame = NSRect(x: 0, y: 0, width: width, height: h)
-        handle.frame = NSRect(x: max(0, width - 6), y: 0, width: 6, height: h)
+        let cw = max(contentWidth, panelWidth)
+        container.frame = NSRect(x: 0, y: 0, width: cw, height: h)
+        webView.frame = NSRect(x: 0, y: 0, width: cw, height: h)
+        handle.frame = NSRect(x: max(0, panelWidth - 6), y: 0, width: 6, height: h)
         shadowStrip.isHidden = shadow <= 0
-        shadowStrip.frame = NSRect(x: width, y: 0, width: max(shadow, 0), height: h)
+        shadowStrip.frame = NSRect(x: panelWidth, y: 0, width: max(shadow, 0), height: h)
     }
 
-    /// Square flush corners except: 10 px on the right while floating, and on the bottom-left when the
-    /// panel sits in the corner of Chrome's (rounded) window.
-    func setCorners(right: Bool, bottomLeft: Bool) {
+    /// Square corners everywhere, except the bottom-left one when the panel sits in the corner of
+    /// Chrome's (rounded, 10 pt) window.
+    func setCorners(bottomLeft: Bool) {
         guard let layer = container.layer else { return }
-        var mask: CACornerMask = []
         // On macOS (non-flipped layers) MinY is the bottom edge.
-        if right { mask.insert(.layerMaxXMinYCorner); mask.insert(.layerMaxXMaxYCorner) }
-        if bottomLeft { mask.insert(.layerMinXMinYCorner) }
-        layer.maskedCorners = mask
-        layer.cornerRadius = mask.isEmpty ? 0 : 10
+        layer.maskedCorners = bottomLeft ? [.layerMinXMinYCorner] : []
+        layer.cornerRadius = bottomLeft ? 10 : 0
     }
 
     // MARK: Content
