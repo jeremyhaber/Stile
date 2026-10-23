@@ -34,6 +34,9 @@ function h(tag, props = {}, ...kids) {
   return e;
 }
 
+// One background element per row: the full-width pill when expanded, a centred rounded square in the compact strip (CSS animates between them).
+const rbg = () => h('span', { class: 'rbg', 'aria-hidden': 'true' });
+
 const safe = async (p) => { try { return await p; } catch (e) { console.debug('[sidebar]', e && e.message); return undefined; } };
 
 async function cmd(name, args = {}) {
@@ -656,6 +659,7 @@ function pinnedRow(e, act) {
     // the (empty) chevron slot keeps item icons aligned with folder icons
     row.querySelector('.chev').style.visibility = 'hidden';
   }
+  row.prepend(rbg());
   row.style.setProperty('--depth', String(e.depth));
   if (e.depth > 0) row.append(h('span', { class: 'guide', 'aria-hidden': 'true' }));
   return row;
@@ -694,7 +698,7 @@ function drawToday() {
     class: 'row new-tab-row', role: 'button', tabindex: '0', 'data-testid': 'new-tab-row', 'data-key': 'newtab', 'data-nav': '', 'aria-label': 'New tab',
     onclick: () => safe(chrome.tabs.create({ windowId: S.windowId, active: true })),
     onkeydown: (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); safe(chrome.tabs.create({ windowId: S.windowId, active: true })); } }
-  }, h('span', { class: 'fav-ic' }, icon('plus')), h('span', { class: 'title', text: 'New tab' }));
+  }, rbg(), h('span', { class: 'fav-ic' }, icon('plus')), h('span', { class: 'title', text: 'New tab' }));
   list.replaceChildren(newRow, ...renderUnits(S.ownUnits, false), ...S.sections.map(sectionEl));
 }
 
@@ -710,7 +714,7 @@ function renderUnits(units, other) {
       out.push(groupRow(u, other));
       if (!collapsed) {
         const body = h('div', { class: 'group-body', 'data-gc': g.color || 'grey', 'data-group-id': g.id });
-        body.append(...renderUnits(u.units, other));
+        body.append(...renderUnits(u.units, other), h('span', { class: 'gout', 'data-testid': 'group-outline', 'aria-hidden': 'true' }));
         out.push(body);
       }
     }
@@ -737,6 +741,7 @@ function sectionEl(sec) {
     oncontextmenu: (ev) => { ev.preventDefault(); showWindowMenu(ev, sec.id); },
     onkeydown: (ev) => { if (ev.target === ev.currentTarget && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); toggleWindow(sec.id); } }
   },
+  rbg(),
   h('span', { class: 'chev' }, icon('chevron', 14)),
   h('span', { class: 'wmeta', text: `${isMain ? 'Main window' : 'Window'} · ${plural(sec.visible.length, 'tab')}` }),
   h('span', { class: 'wsub', text: active ? (active.title || '') : '' }),
@@ -758,6 +763,7 @@ function groupRow(u, other) {
   const row = h('div', {
     class: 'row group-row' + (g.title ? '' : ' unnamed'), role: 'listitem', tabindex: '0', draggable: renaming ? null : 'true',
     'aria-expanded': collapsed ? 'false' : 'true', 'data-gc': g.color || 'grey',
+    title: g.title || 'Unnamed group',
     'data-testid': 'group-row', 'data-group-id': g.id, 'data-collapsed': collapsed ? 'true' : 'false', 'data-key': 'g' + g.id, 'data-nav': '',
     'data-title': g.title || 'Unnamed group', 'data-window-id': g.windowId,
     onclick: (ev) => { if (!renaming && !ev.target.closest('.rename-input')) toggle(); },
@@ -770,12 +776,14 @@ function groupRow(u, other) {
       else if (ev.key === 'F2') { ev.preventDefault(); startRename('g' + g.id); }
     }
   },
+  rbg(),
   h('span', { class: 'chev' }, icon('chevron', 14)),
   h('span', { class: 'gdot' }),
   renaming
     ? renameInput(g.title || '', (v) => chrome.tabGroups.update(g.id, { title: v }), true)
     : h('span', { class: 'title', text: g.title || 'Unnamed group' }),
-  collapsed && !renaming ? h('span', { class: 'gcount', 'data-testid': 'group-count', title: plural(count, 'tab'), text: String(count) }) : null);
+  collapsed && !renaming ? h('span', { class: 'gcount', 'data-testid': 'group-count', title: plural(count, 'tab'), text: String(count) }) : null,
+  collapsed && !renaming ? h('span', { class: 'gcbadge', 'aria-hidden': 'true', text: String(count) }) : null);
   return row;
 }
 
@@ -831,6 +839,7 @@ function todayRow(tab, act, other) {
     type: 'button', class: 'icon-btn act close', title: 'Close tab', 'aria-label': 'Close tab', 'data-testid': 'today-close',
     onclick: (ev) => { ev.stopPropagation(); safe(chrome.tabs.remove(tab.id)); }
   }, icon('x', 14)));
+  row.prepend(rbg());
   return row;
 }
 
@@ -864,7 +873,7 @@ function splitRow(u, act, other) {
     }, icon('x', 12)));
   };
   const row = h('div', {
-    class: 'row split-row', role: 'listitem', draggable: 'true', 'data-testid': 'split-row', 'data-split-id': u.splitId,
+    class: 'row split-row' + (!other && act && (act.id === a.id || act.id === b.id) ? ' has-active' : ''), role: 'listitem', draggable: 'true', 'data-testid': 'split-row', 'data-split-id': u.splitId,
     'data-tab-ids': `${a.id},${b.id}`, 'data-window-id': a.windowId, 'data-title': `${a.title || ''} | ${b.title || ''}`,
     oncontextmenu: (ev) => {
       ev.preventDefault();
@@ -875,6 +884,7 @@ function splitRow(u, act, other) {
     ondragstart: (ev) => startDrag(ev, { type: 'split', splitId: u.splitId, tabIds: [a.id, b.id], windowId: a.windowId }, row),
     ondragend: endDrag
   },
+  rbg(),
   h('span', { class: 'split-ic', title: 'Split view' }, icon('split', 14)),
   half(a), h('span', { class: 'divider' }), half(b));
   return row;

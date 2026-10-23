@@ -60,10 +60,12 @@ final class OverlayManager {
         }
         // Follow on input, not on Chrome's late AX notifications: a left-button press or drag while Chrome is
         // frontmost starts the follow loop immediately.
+        // Handled synchronously on the main thread so the panel is placed in the same event, not a hop later.
         if let g = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp],
                                                      handler: { [weak self] event in
             let t = event.type
-            Task { @MainActor in self?.mouseButtonEvent(t) }
+            let loc = NSEvent.mouseLocation
+            runOnMain { self?.mouseButtonEvent(t, at: loc) }
         }) {
             monitors.append(g)
         }
@@ -176,13 +178,22 @@ final class OverlayManager {
 
     // MARK: Follow loop (display link / 120 Hz while a window is moving or resizing)
 
-    private func mouseButtonEvent(_ type: NSEvent.EventType) {
+    private func mouseButtonEvent(_ type: NSEvent.EventType, at loc: NSPoint) {
         switch type {
-        case .leftMouseDown, .leftMouseDragged:
+        case .leftMouseDown:
             if tracker.chromeFrontmost {
                 followLastActivity = Date()
                 startFollowing()
+                for c in controllers.values { c.dragBegan(mouse: loc) }
             }
+        case .leftMouseDragged:
+            if tracker.chromeFrontmost {
+                followLastActivity = Date()
+                startFollowing()
+                for c in controllers.values { c.dragMoved(mouse: loc) }
+            }
+        case .leftMouseUp:
+            for c in controllers.values { c.dragEnded() }
         default:
             break
         }
@@ -221,7 +232,8 @@ final class OverlayManager {
         guard followActive else { return }
         let visible = controllers.values.filter { $0.window.visible && $0.window.cgID != 0 }
         let bounds = CGInfo.boundsMap(ids: visible.map { $0.window.cgID })
-        for c in visible { c.followBounds(bounds[c.window.cgID]) }
+        let mouse = NSEvent.mouseLocation
+        for c in visible { c.followTick(real: bounds[c.window.cgID], mouse: mouse) }
         if NSEvent.pressedMouseButtons & 1 != 0 { followLastActivity = Date() }
         let last = max(followLastActivity, tracker.lastGeometryEvent)
         if Date().timeIntervalSince(last) > 0.3 { stopFollowing() }
@@ -256,5 +268,15 @@ final class OverlayManager {
 
     var isFocusedPinned: Bool {
         focusedController()?.state == .pinned
+    }
+}
+
+/// Runs a block on the main actor right away when already on the main thread (NSEvent monitor callbacks are),
+/// otherwise hops asynchronously.
+func runOnMain(_ body: @escaping @MainActor () -> Void) {
+    if Thread.isMainThread, #available(macOS 14.0, *) {
+        MainActor.assumeIsolated(body)
+    } else {
+        Task { @MainActor in body() }
     }
 }

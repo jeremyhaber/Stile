@@ -62,7 +62,19 @@ const app = {
   fromExt: [], bridgeEvents: [], sse: new Set(), hostLog: [],
   host: { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: false, railFound: true, railControllable: true, launchAtLogin: false, accessibility: true, appVersion: '2.1.0-test' },
 };
-const toSse = (obj) => { const d = `data: ${JSON.stringify(obj)}\n\n`; for (const r of app.sse) r.write(d); };
+// TEST-ONLY split hook: Chromium 141 has no split API, so tabs served to the page through this test transport can be stamped with a
+// splitViewId (app.splitMap: tabId -> splitViewId). Production code paths are untouched.
+app.splitMap = {};
+const stampSplit = (o) => {
+  if (!o || typeof o !== 'object') return;
+  if (Array.isArray(o)) { o.forEach(stampSplit); return; }
+  if (typeof o.id === 'number' && 'windowId' in o && 'index' in o) o.splitViewId = app.splitMap[o.id] ?? -1;
+  else for (const v of Object.values(o)) stampSplit(v);
+};
+const toSse = (obj) => {
+  if (Object.keys(app.splitMap).length && (obj.type === 'bridgeResult' || obj.type === 'bridgeEvent')) { obj = JSON.parse(JSON.stringify(obj)); stampSplit(obj.result); stampSplit(obj.args); }
+  const d = `data: ${JSON.stringify(obj)}\n\n`; for (const r of app.sse) r.write(d);
+};
 const toHelper = (msg) => refApp.sendBridge('Default', msg);
 const hostState = () => toSse({ type: 'hostState', ...app.host });
 const setHost = (patch) => { if (patch.state && !('compact' in patch)) patch = { ...patch, compact: patch.state === 'collapsed' }; Object.assign(app.host, patch); hostState(); };
@@ -294,6 +306,33 @@ async function main() {
   });
   check('address field width animates (mid-transition width between 32px and full)', addrMid.mid > 34 && addrMid.mid < addrMid.end - 2 && /flex-basis|width|all/.test(addrMid.tr) && !/ 0s$/.test(addrMid.tr), JSON.stringify(addrMid));
   setHost({ compact: false }); await sleep(300);
+
+  // ---- v2.4: collapsed strip geometry (railWidth 56): pills, placeholders, dividers, vertical positions
+  const GEO = () => panel.evaluate(() => {
+    const r = (el) => { const b = el.getBoundingClientRect(); return { x: b.left, y: b.top, w: b.width, h: b.height }; };
+    const act = document.querySelector('[data-testid="today-row"][data-active="true"]');
+    const cs = (sel, pseudo) => { const el = document.querySelector(sel); return el ? getComputedStyle(el, pseudo) : null; };
+    return {
+      rows: [...document.querySelectorAll('.row')].map(r), heads: [...document.querySelectorAll('.sec-h')].map(r),
+      pill: act ? r(act.querySelector('.rbg')) : null, pillBg: act ? getComputedStyle(act.querySelector('.rbg')).backgroundColor : null,
+      pinEmpty: cs('[data-testid="pinned-empty"]'), favEmpty: cs('[data-testid="favourites-empty"]'),
+      pinEmptyO: cs('[data-testid="pinned-empty"]')?.opacity, favEmptyO: cs('[data-testid="favourites-empty"]')?.opacity,
+      pinEmptyH: document.querySelector('[data-testid="pinned-empty"]').getBoundingClientRect().height,
+      favEmptyH: document.querySelector('[data-testid="favourites-empty"]').getBoundingClientRect().height,
+      dividerO: cs('.sec-h', '::after').opacity, dividerW: cs('.sec-h', '::after').width, dividerH: cs('.sec-h', '::after').height,
+      h2O: cs('.sec-h h2').opacity,
+    };
+  });
+  setHost({ compact: false, railWidth: 56 }); await sleep(450);
+  const gExp = await GEO();
+  setHost({ compact: true, railWidth: 56 }); await sleep(500);
+  const gCmp = await GEO();
+  check('v2.4 compact: every row keeps its y and height (railWidth 56)', gExp.rows.length === gCmp.rows.length && gExp.rows.every((b, i) => Math.abs(b.y - gCmp.rows[i].y) <= 1 && Math.abs(b.h - gCmp.rows[i].h) <= 1) && gExp.heads.every((b, i) => Math.abs(b.y - gCmp.heads[i].y) <= 1), JSON.stringify([gExp.rows.length, gCmp.rows.length]));
+  check('v2.4 compact: active row background is a rounded square (<=44) centred on the icon column (x=28)', gCmp.pill && gCmp.pill.w <= 44 && gCmp.pill.h <= 44 && Math.abs(gCmp.pill.x + gCmp.pill.w / 2 - 28) <= 1 && gCmp.pillBg !== 'rgba(0, 0, 0, 0)', JSON.stringify(gCmp.pill));
+  check('v2.4 expanded: the same pill element is the full-width row background', gExp.pill && gExp.pill.w > 250, JSON.stringify(gExp.pill));
+  check('v2.4 compact: empty placeholders are invisible (opacity 0) but keep their 32px height; expanded they are 32px and visible', gCmp.pinEmptyO === '0' && gCmp.favEmptyO === '0' && Math.abs(gCmp.pinEmptyH - 32) <= 1 && Math.abs(gCmp.favEmptyH - 32) <= 1 && Math.abs(gExp.pinEmptyH - 32) <= 1 && Math.abs(gExp.favEmptyH - 32) <= 1 && gExp.pinEmptyO === '1', JSON.stringify([gExp.pinEmptyH, gCmp.pinEmptyH, gCmp.pinEmptyO]));
+  check('v2.4 compact: section headers swap their label for a 20x1 divider', gCmp.dividerO === '1' && gCmp.h2O === '0' && gExp.dividerO === '0' && gCmp.dividerW === '20px' && gCmp.dividerH === '1px', JSON.stringify([gExp.dividerO, gCmp.dividerO, gCmp.dividerW, gCmp.dividerH]));
+  setHost({ compact: false, railWidth: 48 }); await sleep(450);
   const posBack = await POS();
   check('compact -> expanded returns every position to where it was', sameCol(posExp, posBack, 'rows', 1, 1) && sameCol(posExp, posBack, 'fav', 1, 1) && sameCol(posExp, posBack, 'heads', 1, 1));
   check('no element on the panel root has a border radius, in compact, peek and pinned', await (async () => {
@@ -318,11 +357,11 @@ async function main() {
   const mixTo = (bg, fg, pct) => bg.map((v, i) => v + (fg[i] - v) * pct);
   const tgt = panel.locator('[data-testid="new-tab-row"]');
   await tgt.hover(); await sleep(300);
-  const hov = await px('[data-testid="new-tab-row"]', 'backgroundColor');
+  const hov = await px('[data-testid="new-tab-row"] .rbg', 'backgroundColor');
   check('chromeColor: hover = bg mixed 6% toward the (light) text colour', near(hov, mixTo([60, 64, 67], [236, 236, 240], 0.06), 2), JSON.stringify(hov));
   await panel.mouse.move(300, 5); await sleep(250);
   const actRow = panel.locator('[data-testid="today-row"][data-active="true"]').first();
-  const act12 = await px('[data-testid="today-row"][data-active="true"]', 'backgroundColor');
+  const act12 = await px('[data-testid="today-row"][data-active="true"] .rbg', 'backgroundColor');
   check('chromeColor: active row = bg mixed 12% toward the text colour', near(act12, mixTo([60, 64, 67], [236, 236, 240], 0.12), 2), JSON.stringify(act12));
   setHost({ chromeColor: '#f1f3f4' }); await sleep(500);
   const cc2 = await panel.evaluate(() => ({ bg: getComputedStyle(document.body).backgroundColor, theme: document.documentElement.dataset.theme, fg: getComputedStyle(document.body).color }));
@@ -490,7 +529,7 @@ async function main() {
     return { mid, endXf: t.style.transform, endW: Math.round(t.getBoundingClientRect().width) };
   });
   check('compact: favourites tiles animate with FLIP (transition + inverse transform), then settle', /transform/.test(flip.mid.tr) && (flip.mid.xf !== '' || flip.mid.cxf !== 'none') && flip.endXf === '', JSON.stringify(flip));
-  check('compact: favourites become a single column of 40px tiles', flip.endW === 40);
+  check('compact: favourites become a single column of 36px tiles', flip.endW === 36);
   await sleep(200);
   const colCmp = await sideEls();
   const sameX = (k) => colExp[k].length > 0 && colExp[k].length === colCmp[k].length && colExp[k].every((p, i) => Math.abs(p.x - colCmp[k][i].x) <= 1 && Math.abs(p.x - 24) <= 1);
@@ -523,11 +562,90 @@ async function main() {
   await sleep(700);
   check('compact: live updates still render (closed tab removed)', (await panel.locator('[data-testid="today-row"]').count()) === 4 || (await panel.locator('[data-testid="today-row"]').count()) === (await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).length, mainWin)) - 1 - 1 + 1 || true);
   check('compact: footer pin toggle is faded out and inert', await panel.evaluate(() => { const c = getComputedStyle(document.getElementById('pin-toggle')); return c.opacity === '0' && c.pointerEvents === 'none'; }));
+  // ---- v2.4: split pair, group outline, everything inside the strip
+  const splitIds = await swEval(async ([w, ua, ub]) => {
+    const a = await chrome.tabs.create({ windowId: w, url: ua, active: false });
+    const b = await chrome.tabs.create({ windowId: w, url: ub, active: false });
+    return [a.id, b.id];
+  }, [mainWin, U('foxtrot'), U('hotel')]);
+  app.splitMap = { [splitIds[0]]: 77, [splitIds[1]]: 77 };
+  await swEval(async (id) => { const t = await chrome.tabs.create({ url: 'about:blank', active: false }); await chrome.tabs.remove(t.id); }, 0);
+  setHost({ compact: false, railWidth: 56 });
+  await until(async () => (await panel.locator('[data-testid="split-row"]').count()) === 1, 6000);
+  const splitRow = panel.locator('[data-testid="split-row"]');
+  check('v2.4: a split pair (stub splitViewId) renders as one split row with two halves', (await splitRow.count()) === 1 && (await splitRow.locator('[data-testid="split-half"]').count()) === 2);
+  const halfA = splitRow.locator('[data-testid="split-half"]').nth(0), halfB = splitRow.locator('[data-testid="split-half"]').nth(1);
+  const activate = async (tid) => { await swEval(async (id) => chrome.tabs.update(id, { active: true }), tid); await sleep(500); };
+  const bgOfEl = (sel) => panel.evaluate((q) => getComputedStyle(document.querySelector(q)).backgroundColor, sel);
+  const SPLIT_BG = '[data-testid="split-row"] .rbg';
+  await activate(splitIds[0]);
+  const expActive = await bgOfEl(SPLIT_BG);
+  const expHalves = await panel.evaluate(() => [...document.querySelectorAll('[data-testid="split-half"]')].map((e) => e.dataset.active));
+  await activate(await swEval(async (w) => (await chrome.tabs.query({ windowId: w, url: 'http://127.0.0.1/*' })).find((t) => /alpha/.test(t.url)).id, mainWin));
+  const expIdle = await bgOfEl(SPLIT_BG);
+  check('v2.4 expanded: the split row background is highlighted when either half is active, and not otherwise', expActive !== 'rgba(0, 0, 0, 0)' && expIdle === 'rgba(0, 0, 0, 0)' && expHalves.join() === 'true,false', JSON.stringify([expActive, expIdle, expHalves]));
+  setHost({ compact: true, railWidth: 56 }); await sleep(550);
+  const splitGeo = () => panel.evaluate(() => {
+    const row = document.querySelector('[data-testid="split-row"]');
+    const bg = row.querySelector('.rbg').getBoundingClientRect();
+    const favs = [...row.querySelectorAll('.half .fav-ic')].map((f) => { const b = f.getBoundingClientRect(); return { x: b.left, r: b.right, w: b.width, o: getComputedStyle(f).opacity }; });
+    const rr = row.getBoundingClientRect();
+    return { bg: { x: bg.left, r: bg.right, w: bg.width, h: bg.height }, favs, rowH: rr.height, bgColor: getComputedStyle(row.querySelector('.rbg')).backgroundColor, bgCx: (bg.left + bg.right) / 2 };
+  });
+  const idleGeo = await splitGeo();
+  await activate(splitIds[1]);
+  const actGeo = await splitGeo();
+  check('v2.4 compact: a split pair is ONE pill (<=44 wide, one row high) centred on the icon column holding both favicons', idleGeo.bg.w <= 44 && idleGeo.bg.h <= idleGeo.rowH + 1 && Math.abs(idleGeo.bgCx - 28) <= 1 && idleGeo.favs.length === 2 && idleGeo.favs.every((f) => f.x >= idleGeo.bg.x - 0.5 && f.r <= idleGeo.bg.r + 0.5) && idleGeo.favs[0].r <= idleGeo.favs[1].x, JSON.stringify(idleGeo));
+  check('v2.4 compact: the pair pill is highlighted when either half is active; idle pair is not', idleGeo.bgColor === 'rgba(0, 0, 0, 0)' && actGeo.bgColor !== 'rgba(0, 0, 0, 0)', JSON.stringify([idleGeo.bgColor, actGeo.bgColor]));
+  check('v2.4 compact: active half favicon full opacity, the other 70%', actGeo.favs[1].o === '1' && Math.abs(Number(actGeo.favs[0].o) - 0.7) < 0.02, JSON.stringify(actGeo.favs));
+  await panel.locator('[data-testid="split-half"]').nth(0).click(); await sleep(500);
+  const clicked = await swEval(async (w) => (await chrome.tabs.query({ windowId: w, active: true }))[0].url, mainWin);
+  check('v2.4 compact: clicking a favicon activates that half', /foxtrot/.test(clicked), clicked);
+  // group outline: spans the group's tabs in the group colour, inset from the strip edges
+  const gout = await panel.evaluate((id) => {
+    const body = document.querySelector(`.group-body[data-group-id="${id}"]`);
+    const o = body.querySelector('.gout'); const ob = o.getBoundingClientRect();
+    const rows = [...body.querySelectorAll('.row')].map((r) => r.getBoundingClientRect());
+    const cs = getComputedStyle(o);
+    const probe = document.createElement('i'); probe.style.color = getComputedStyle(body).getPropertyValue('--gc'); document.body.append(probe);
+    const gc = getComputedStyle(probe).color; probe.remove();
+    return { top: ob.top, bottom: ob.bottom, left: ob.left, right: ob.right, first: rows[0].top, last: rows[rows.length - 1].bottom, n: rows.length, border: cs.borderTopColor, bw: cs.borderTopWidth, rad: cs.borderTopLeftRadius, op: cs.opacity, gc };
+  }, gid);
+  check('v2.4 compact: the group renders a coloured rounded outline spanning its tabs, inset from the strip edges', gout.n >= 1 && gout.op === '1' && gout.border === gout.gc && ['1px', '1.5px'].includes(gout.bw) && gout.rad === '12px' && gout.top <= gout.first + 0.5 && gout.bottom >= gout.last - 0.5 && gout.left >= 3.5 && gout.right <= 56 - 3.5, JSON.stringify(gout));
+  const gbar = await panel.evaluate((id) => { const d = document.querySelector(`.group-row[data-group-id="${id}"] .gdot`).getBoundingClientRect(); return { w: d.width, h: d.height, cx: d.left + d.width / 2 }; }, gid);
+  check('v2.4 compact: the group header is a 16x6 bar centred on the icon column', Math.abs(gbar.w - 16) <= 0.5 && Math.abs(gbar.h - 6) <= 0.5 && Math.abs(gbar.cx - 28) <= 1, JSON.stringify(gbar));
+  // everything that paints lies inside the strip
+  const paintedOutside = () => panel.evaluate((W) => {
+    const bad = [];
+    for (const el of document.querySelectorAll('#app *, #app')) {
+      if (el.closest('[hidden]') || el.closest('.view[hidden]')) continue;
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      let op = 1; for (let n = el; n && n.nodeType === 1; n = n.parentElement) op *= Number(getComputedStyle(n).opacity);
+      if (op < 0.02) continue;
+      const bgA = /rgba?\(([^)]*)\)/.exec(cs.backgroundColor); const bgVis = bgA && (bgA[1].split(',').length < 4 || Number(bgA[1].split(',')[3]) > 0);
+      const bd = parseFloat(cs.borderTopWidth) > 0 && cs.borderTopStyle !== 'none' && !/rgba\(.*, 0\)/.test(cs.borderTopColor);
+      const own = [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim());
+      const painted = bgVis || bd || el.tagName === 'IMG' || el.tagName === 'svg' || own;
+      if (!painted || el.id === 'app' || el.closest('svg') && el.tagName !== 'svg') continue;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      if (r.left < -0.5 || r.right > W + 0.5) bad.push(`${el.tagName}.${(el.className && el.className.baseVal === undefined ? el.className : '') || ''}#${el.id}@${Math.round(r.left)}-${Math.round(r.right)}`);
+    }
+    return bad;
+  }, 56);
+  const outside = await paintedOutside();
+  check('v2.4 compact (railWidth 56): every visible element lies within x in [0, 56]', outside.length === 0, outside.slice(0, 8).join(' | '));
+  const sbw = await panel.evaluate(() => { const sc = document.getElementById('scroll-main'); return sc.offsetWidth - sc.clientWidth; });
+  check('v2.4 compact: no visible scrollbar', sbw === 0, String(sbw));
+  const pillTitles = await panel.evaluate(() => [...document.querySelectorAll('[data-testid="today-row"]')].every((r) => r.title));
+  check('v2.4 compact: rows carry the full title as a native tooltip', pillTitles);
   // screenshots: compact (clipped to the rail) next to expanded, same scroll position, light and dark
   const shotPair = async (scheme, name) => {
+    await panel.mouse.move(200, 700);
     await panel.emulateMedia({ colorScheme: scheme }); await sleep(450);
     setHost({ compact: true }); await sleep(500);
-    const c = await panel.screenshot({ clip: { x: 0, y: 0, width: 48, height: 860 } });
+    const c = await panel.screenshot({ clip: { x: 0, y: 0, width: 56, height: 860 } });
     setHost({ compact: false }); await sleep(500);
     const e = await panel.screenshot({ clip: { x: 0, y: 0, width: 320, height: 860 } });
     const pg = await ctx.newPage();

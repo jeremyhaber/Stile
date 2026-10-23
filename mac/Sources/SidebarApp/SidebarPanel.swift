@@ -12,12 +12,20 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     var onResizeBegan: (() -> Void)?
     var onResize: ((CGFloat) -> Void)?
     var onResizeEnded: (() -> Void)?
+    var onPointerEnter: (() -> Void)?
+    var onPointerExit: (() -> Void)?
+
+    /// True while a left-button press that began inside this panel is held (a tab being dragged out of the sidebar).
+    var pressedHere = false
 
     /// Transparent panel content: holds `container` (clipped to the panel, bottom-left corner only) and the peek shadow strip.
     let root = NSView(frame: .zero)
     /// Holds the web view at the expanded width; the panel's own frame clips it to the visible strip.
     let container = NSView(frame: .zero)
     let shadowStrip = NSView(frame: .zero)
+    /// 1 px line at the panel's right edge while peeking.
+    let hairline = NSView(frame: .zero)
+    private var shadowIsDark: Bool?
     let webView: WKWebView
     let handle = ResizeHandleView(frame: .zero)
 
@@ -72,14 +80,24 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
 
         shadowStrip.wantsLayer = true
         let gradient = CAGradientLayer()
-        gradient.colors = [NSColor.black.withAlphaComponent(0.22).cgColor, NSColor.black.withAlphaComponent(0).cgColor]
+        gradient.colors = [NSColor.black.withAlphaComponent(0.07).cgColor, NSColor.black.withAlphaComponent(0).cgColor]
         gradient.startPoint = CGPoint(x: 0, y: 0.5)
         gradient.endPoint = CGPoint(x: 1, y: 0.5)
         shadowStrip.layer = gradient
         shadowStrip.autoresizingMask = [.height]
         shadowStrip.isHidden = true
         root.addSubview(shadowStrip)
+        hairline.wantsLayer = true
+        hairline.autoresizingMask = [.height]
+        hairline.isHidden = true
+        root.addSubview(hairline)
         contentView = root
+
+        // Enter/exit for hover reveal and hide (replaces most pointer polling).
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        root.addTrackingArea(area)
 
         webView.navigationDelegate = self
         webView.autoresizingMask = [.height, .maxXMargin]
@@ -108,6 +126,15 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
+    override func mouseEntered(with event: NSEvent) { onPointerEnter?() }
+    override func mouseExited(with event: NSEvent) { onPointerExit?() }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown { pressedHere = true }
+        else if event.type == .leftMouseUp { pressedHere = false }
+        super.sendEvent(event)
+    }
+
     /// Lay the content out. `panelWidth` is the visible strip (the panel itself clips anything wider),
     /// `contentWidth` is the web view's width: the target expanded width, so collapsed is just the same
     /// layout clipped to the rail. `shadow` is the transparent shadow strip right of the content (peek only).
@@ -119,6 +146,22 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         handle.frame = NSRect(x: max(0, panelWidth - 6), y: 0, width: 6, height: h)
         shadowStrip.isHidden = shadow <= 0
         shadowStrip.frame = NSRect(x: panelWidth, y: 0, width: max(shadow, 0), height: h)
+        hairline.isHidden = shadow <= 0
+        hairline.frame = NSRect(x: max(0, panelWidth - 1), y: 0, width: 1, height: h)
+        if shadow > 0 { updateShadowColors() }
+    }
+
+    /// Peek shadow: black 7% (light) / 18% (dark) fading to clear over 8 pt, plus a hairline in text colour at 8%.
+    private func updateShadowColors() {
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if shadowIsDark == dark { return }
+        shadowIsDark = dark
+        if let g = shadowStrip.layer as? CAGradientLayer {
+            g.colors = [NSColor.black.withAlphaComponent(dark ? 0.18 : 0.07).cgColor,
+                        NSColor.black.withAlphaComponent(0).cgColor]
+        }
+        let text: NSColor = dark ? .white : .black
+        hairline.layer?.backgroundColor = text.withAlphaComponent(0.08).cgColor
     }
 
     /// Square corners everywhere, except the bottom-left one when the panel sits in the corner of

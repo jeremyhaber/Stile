@@ -49,6 +49,18 @@ final class OverlayController {
     private var following = false
     private var movedWhileFollowing = false
 
+    // Mouse-predicted following during window drags / resizes
+    private struct Edges { var left = false, top = false, right = false, bottom = false }
+    private enum DragKind { case undecided, move, resize(Edges), unmatched }
+    private struct DragState {
+        var startMouse: CGPoint      // top-left global coordinates
+        var startBounds: CGRect      // window-server bounds at mouse down
+        var kind: DragKind = .undecided
+        var diverged = false         // real bounds disagree with the prediction (screen edge / menu bar clamp)
+    }
+    private var drag: DragState?
+    private var lastRealTick: CGRect?
+
     // Exact Chrome colour (needs Screen Recording permission)
     private var chromeColor: String?
     private var lastActive = false
@@ -90,6 +102,8 @@ final class OverlayController {
         sidebar.onBridgeCall = { [weak self] call in self?.pageCalled(call) }
         sidebar.onDidBecomeKey = { [weak self] in self?.reorderSidebar() }
         sidebar.onResizeBegan = { [weak self] in self?.beginResize() }
+        sidebar.onPointerEnter = { [weak self] in self?.pointerEntered() }
+        sidebar.onPointerExit = { [weak self] in self?.pointerExited() }
         sidebar.onResize = { [weak self] w in self?.liveResize(to: w) }
         sidebar.onResizeEnded = { [weak self] in
             guard let self = self else { return }
@@ -443,8 +457,13 @@ final class OverlayController {
             NSAnimationContext.beginGrouping()
             NSAnimationContext.current.duration = 0
             NSAnimationContext.current.allowsImplicitAnimation = false
-            sidebar.setFrame(frame, display: false)
-            sidebar.fitContent(panelWidth: ns.width, contentWidth: contentWidth(for: s, logical: ns.width), shadow: shadow)
+            if abs(frame.width - sidebar.frame.width) < 0.01 && abs(frame.height - sidebar.frame.height) < 0.01 {
+                // Pure move: only the origin changes.
+                sidebar.setFrameOrigin(frame.origin)
+            } else {
+                sidebar.setFrame(frame, display: false)
+                sidebar.fitContent(panelWidth: ns.width, contentWidth: contentWidth(for: s, logical: ns.width), shadow: shadow)
+            }
             NSAnimationContext.endGrouping()
             CATransaction.commit()
             return
@@ -468,14 +487,141 @@ final class OverlayController {
     /// resizes). No AX calls here.
     func followBounds(_ b: CGRect?) {
         guard visible, let b = b else { return }
-        let o = window.frame
-        if abs(b.minX - o.minX) < 0.5 && abs(b.minY - o.minY) < 0.5
-            && abs(b.width - o.width) < 0.5 && abs(b.height - o.height) < 0.5 { return }
+        applyFollowFrame(b, tolerance: 0.5)
+    }
+
+    private func sameRect(_ a: CGRect, _ b: CGRect, _ tol: CGFloat) -> Bool {
+        abs(a.minX - b.minX) <= tol && abs(a.minY - b.minY) <= tol
+            && abs(a.width - b.width) <= tol && abs(a.height - b.height) <= tol
+    }
+
+    private func applyFollowFrame(_ f: CGRect, tolerance: CGFloat) {
+        if sameRect(f, window.frame, tolerance) { return }
         following = true
         movedWhileFollowing = true
-        window.frame = b
+        window.frame = f
         layout(following: true)
         onLocalGeometryChange?()
+    }
+
+    // MARK: Mouse-predicted following
+
+    private func topLeft(_ p: NSPoint) -> CGPoint {
+        CGPoint(x: p.x, y: Geometry.primaryHeight - p.y)
+    }
+
+    private func serverBounds() -> CGRect? {
+        guard window.cgID != 0 else { return nil }
+        return CGInfo.boundsMap(ids: [window.cgID])[window.cgID]
+    }
+
+    /// Global left mouse down while Chrome is frontmost: remember the mouse and the window's bounds.
+    func dragBegan(mouse p: NSPoint) {
+        lastRealTick = nil
+        guard visible, window.cgID != 0 else { drag = nil; return }
+        drag = DragState(startMouse: topLeft(p), startBounds: serverBounds() ?? window.frame)
+    }
+
+    /// Global left mouse drag event: place the panel from the predicted frame right away.
+    func dragMoved(mouse p: NSPoint) {
+        guard visible, drag != nil else { return }
+        advance(mouse: topLeft(p), tick: false, real: nil)
+    }
+
+    /// Mouse up: stop predicting and snap to the real bounds.
+    func dragEnded() {
+        guard drag != nil else { return }
+        drag = nil
+        lastRealTick = nil
+        if visible { followBounds(serverBounds()) }
+    }
+
+    /// Display-link frame: `real` is the window-server bounds, `mouse` is in NSEvent (bottom-left) coordinates.
+    func followTick(real: CGRect?, mouse: NSPoint) {
+        guard visible, let r = real else { return }
+        if drag != nil {
+            advance(mouse: topLeft(mouse), tick: true, real: r)
+        } else {
+            followBounds(r)
+        }
+        lastRealTick = r
+    }
+
+    private func classify(start s: CGRect, real r: CGRect, mouse m: CGPoint, from d: DragState) -> DragKind {
+        let tol: CGFloat = 2
+        let mdx = m.x - d.startMouse.x
+        let mdy = m.y - d.startMouse.y
+        let dMinX = r.minX - s.minX, dMaxX = r.maxX - s.maxX
+        let dMinY = r.minY - s.minY, dMaxY = r.maxY - s.maxY
+        if abs(r.width - s.width) < 0.5 && abs(r.height - s.height) < 0.5 {
+            return (abs(dMinX - mdx) <= tol && abs(dMinY - mdy) <= tol) ? .move : .unmatched
+        }
+        var e = Edges()
+        e.left = abs(dMinX) > 0.5
+        e.right = abs(dMaxX) > 0.5
+        e.top = abs(dMinY) > 0.5
+        e.bottom = abs(dMaxY) > 0.5
+        if e.left && abs(dMinX - mdx) > tol { return .unmatched }
+        if e.right && abs(dMaxX - mdx) > tol { return .unmatched }
+        if e.top && abs(dMinY - mdy) > tol { return .unmatched }
+        if e.bottom && abs(dMaxY - mdy) > tol { return .unmatched }
+        return .resize(e)
+    }
+
+    private func predictedFrame(_ d: DragState, mouse m: CGPoint) -> CGRect {
+        let dx = m.x - d.startMouse.x
+        let dy = m.y - d.startMouse.y
+        let s = d.startBounds
+        switch d.kind {
+        case .move:
+            return s.offsetBy(dx: dx, dy: dy)
+        case .resize(let e):
+            var minX = s.minX, maxX = s.maxX, minY = s.minY, maxY = s.maxY
+            if e.left { minX += dx }
+            if e.right { maxX += dx }
+            if e.top { minY += dy }
+            if e.bottom { maxY += dy }
+            return CGRect(x: minX, y: minY, width: max(1, maxX - minX), height: max(1, maxY - minY))
+        case .undecided, .unmatched:
+            return s
+        }
+    }
+
+    private func advance(mouse m: CGPoint, tick: Bool, real realIn: CGRect?) {
+        guard var d = drag else { return }
+        var real = realIn
+        if case .undecided = d.kind {
+            if real == nil { real = serverBounds() }
+            guard let r = real, !sameRect(r, d.startBounds, 0.5) else { return }   // nothing moved yet
+            d.kind = classify(start: d.startBounds, real: r, mouse: m, from: d)
+            drag = d
+        }
+        switch d.kind {
+        case .undecided:
+            return
+        case .unmatched:
+            if let r = real { followBounds(r) }
+        case .move, .resize:
+            let predicted = predictedFrame(d, mouse: m)
+            if tick, let r = real {
+                let settled = lastRealTick.map { sameRect($0, r, 0.5) } ?? false
+                if sameRect(predicted, r, 2) {
+                    d.diverged = false
+                    applyFollowFrame(predicted, tolerance: 0.25)
+                } else if settled {
+                    // The window server stopped short of the prediction (menu bar / screen edge / min size).
+                    d.diverged = true
+                    followBounds(r)
+                } else if d.diverged {
+                    followBounds(r)
+                } else {
+                    applyFollowFrame(predicted, tolerance: 0.25)
+                }
+            } else if !d.diverged {
+                applyFollowFrame(predicted, tolerance: 0.25)
+            }
+            drag = d
+        }
     }
 
     /// Following is over: one AX rescan (the rail rect is window-relative, so only a resize can change it).
@@ -586,7 +732,7 @@ final class OverlayController {
         applyChrome(ax: ax, state: .peek)
         orderAbove(sidebar)
         pushHostState()
-        animateSidebar(to: target, duration: 0.14) { [weak self] in self?.layout() }
+        animateSidebar(to: target, duration: 0.12, timing: .easeOut) { [weak self] in self?.layout() }
     }
 
     private func hidePeek() {
@@ -599,7 +745,7 @@ final class OverlayController {
         } else {
             end.size.width = 1
         }
-        animateSidebar(to: end, duration: 0.12) { [weak self] in
+        animateSidebar(to: end, duration: 0.10, timing: .easeIn) { [weak self] in
             guard let self = self else { return }
             if self.state == .hidden {
                 self.sidebar.orderOut(nil)
@@ -610,13 +756,13 @@ final class OverlayController {
         }
     }
 
-    private func animateSidebar(to target: NSRect, duration: TimeInterval, completion: @escaping @MainActor () -> Void) {
+    private func animateSidebar(to target: NSRect, duration: TimeInterval, timing: CAMediaTimingFunctionName, completion: @escaping @MainActor () -> Void) {
         animating = true
         animToken += 1
         let token = animToken
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = duration
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            ctx.timingFunction = CAMediaTimingFunction(name: timing)
             self.sidebar.animator().setFrame(target, display: true)
         }, completionHandler: { [weak self] in
             Task { @MainActor in
@@ -694,14 +840,43 @@ final class OverlayController {
 
     private func scheduleDwell() {
         if dwell.isScheduled { return }
-        dwell.schedule(after: 0.12) { [weak self] in
+        if buttonHeldElsewhere { return }
+        dwell.schedule(after: 0.05) { [weak self] in
             self?.dwell.clear()
             self?.dwellFired()
         }
     }
 
-    private func dwellFired() {
+    /// A mouse button is down and the press did not start in our own sidebar (something is being dragged in Chrome).
+    private var buttonHeldElsewhere: Bool {
+        if NSEvent.pressedMouseButtons == 0 {
+            sidebar.pressedHere = false
+            return false
+        }
+        return !sidebar.pressedHere
+    }
+
+    /// NSTrackingArea enter/exit on the panel's content view.
+    private func pointerEntered() {
         guard visible else { return }
+        switch state {
+        case .collapsed: scheduleDwell()
+        case .peek: hideTimer.cancel()
+        default: break
+        }
+    }
+
+    private func pointerExited() {
+        guard visible else { return }
+        switch state {
+        case .collapsed: dwell.cancel()
+        case .peek: scheduleHideIfOutside()
+        default: break
+        }
+    }
+
+    private func dwellFired() {
+        guard visible, !buttonHeldElsewhere else { return }
         let p = NSEvent.mouseLocation
         switch state {
         case .hidden:
@@ -716,7 +891,7 @@ final class OverlayController {
     private func scheduleHideIfOutside() {
         guard state == .peek, !busy, !hideTimer.isScheduled else { return }
         if pointerInsideSidebar(NSEvent.mouseLocation) { return }
-        hideTimer.schedule(after: 0.35) { [weak self] in
+        hideTimer.schedule(after: 0.15) { [weak self] in
             self?.hideTimer.clear()
             self?.evaluatePeekHide()
         }
