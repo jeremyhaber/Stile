@@ -13,7 +13,7 @@ enum ChromeColor {
 
     /// `rect` is in global screen coordinates (top-left origin). Returns "#rrggbb" (median of the pixels) or nil.
     static func sample(windowID: CGWindowID, rect: CGRect) -> String? {
-        guard windowID != 0, Permissions.screenCaptureGranted, let create = createImage else { return nil }
+        guard windowID != 0, CGPreflightScreenCaptureAccess(), let create = createImage else { return nil }
         let opts = CGWindowImageOption([.boundsIgnoreFraming, .nominalResolution])
         guard let img = create(rect, CGWindowListOption.optionIncludingWindow.rawValue, windowID, opts.rawValue)?
             .takeRetainedValue() else { return nil }
