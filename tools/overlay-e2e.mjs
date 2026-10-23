@@ -9,12 +9,17 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import http from 'http';
+import { execFileSync } from 'child_process';
 const require = createRequire(import.meta.url);
 const { chromium } = require('/opt/npm-tools/node_modules/playwright');
 const { HostServer, writeHostManifest } = require('./fake-app/host-server.js');
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const EXT = path.join(ROOT, 'extension');
+// The page is served from the same web root Sidebar.app ships (mac/copy-web.sh), not the raw extension folder,
+// so a file missing from the app bundle fails here too.
+const WEB = fs.mkdtempSync(path.join(os.tmpdir(), 'sbweb-')) + '/web';
+execFileSync('bash', [path.join(ROOT, 'mac/copy-web.sh'), EXT, WEB]);
 const SHOTS = process.env.OVERLAY_SHOTS || '/tmp/claude-0/-home-claude/e0605526-dcdb-5d20-aaac-918c6d6e8268/scratchpad/overlay-shots';
 fs.mkdirSync(SHOTS, { recursive: true });
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbov-'));
@@ -140,8 +145,8 @@ const appSrv = http.createServer((req, res) => {
   }
   if (url.pathname === '/favicon.ico') { res.writeHead(204).end(); return; }
   const rel = url.pathname === '/' ? '/sidepanel.html' : url.pathname;
-  const file = path.join(EXT, path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
-  if (!file.startsWith(EXT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) { res.writeHead(404).end('nope'); return; }
+  const file = path.join(WEB, path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
+  if (!file.startsWith(WEB) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) { res.writeHead(404).end('nope'); return; }
   res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream' });
   fs.createReadStream(file).pipe(res);
 });

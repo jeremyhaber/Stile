@@ -82,7 +82,7 @@ enum Settings {
 extension Settings {
     /// v2.9: Sidebar.app moves/resizes Chrome's window itself during a toolbar drag or edge resize (default on).
     static var lockstepDrag: Bool {
-        get { UserDefaults.standard.object(forKey: "lockstepDrag") == nil ? true : UserDefaults.standard.bool(forKey: "lockstepDrag") }
+        get { UserDefaults.standard.bool(forKey: "lockstepDrag") }   // opt-in (default off) until proven on more setups
         set {
             UserDefaults.standard.set(newValue, forKey: "lockstepDrag")
             post()

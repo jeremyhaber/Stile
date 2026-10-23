@@ -44,13 +44,8 @@ sed -e "s/__VERSION__/$VERSION/g" -e "s/__BUILD__/$BUILD/g" "$HERE/Resources/Inf
 if [ -d "$HERE/Resources/AppIcon.iconset" ]; then
   iconutil -c icns "$HERE/Resources/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
 fi
-# Web UI for the sidebar's web view: every top-level *.js, *.css, *.html, *.png of the extension, plus icons/.
-shopt -s nullglob
-for f in "$EXT"/*.js "$EXT"/*.css "$EXT"/*.html "$EXT"/*.png; do
-  cp "$f" "$APP/Contents/Resources/web/$(basename "$f")"
-done
-shopt -u nullglob
-if [ -d "$EXT/icons" ]; then cp -R "$EXT/icons" "$APP/Contents/Resources/web/icons"; fi
+# Web UI for the sidebar's web view: the whole extension folder (subfolders included), via copy-web.sh.
+bash "$HERE/copy-web.sh" "$EXT" "$APP/Contents/Resources/web"
 # The whole extension folder, so the user can "Load unpacked" a copy that always matches this app.
 rm -rf "$APP/Contents/Resources/extension"
 cp -R "$EXT" "$APP/Contents/Resources/extension"

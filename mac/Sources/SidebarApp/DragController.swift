@@ -20,6 +20,8 @@ final class DragController {
     }
 
     private struct Session {
+        var mismatches = 0
+        var failed = false
         let key: Int
         let window: AXUIElement
         let pid: pid_t
@@ -38,6 +40,8 @@ final class DragController {
 
     private var session: Session?
     private var applyScheduled = false
+    /// Set when Chrome didn't follow a lockstep drag; native dragging is used until the app restarts.
+    static var disabledThisRun = false
     private var swallowUp = false
 
     private static let interactiveRoles: Set<String> = [
@@ -89,7 +93,7 @@ final class DragController {
     // MARK: Mouse down
 
     private func mouseDown(_ event: CGEvent) -> Bool {
-        guard let m = manager, m.overlayEnabled, Settings.lockstepDrag,
+        guard !Self.disabledThisRun, let m = manager, m.overlayEnabled, Settings.lockstepDrag,
               Permissions.isTrusted, m.tracker.chromeFrontmost, m.tracker.pid != 0,
               let app = m.tracker.appElement else { return false }
         let flags = event.flags
@@ -248,7 +252,7 @@ final class DragController {
     }
 
     private func applyLatest() {
-        guard var s = session, s.moved else { return }
+        guard var s = session, s.moved, !s.failed else { return }
         apply(&s)
         session = s
     }
@@ -260,10 +264,25 @@ final class DragController {
         let posChanged = abs(f.minX - last.minX) > 0.01 || abs(f.minY - last.minY) > 0.01
         let sizeChanged = abs(f.width - last.width) > 0.01 || abs(f.height - last.height) > 0.01
         if !posChanged && !sizeChanged { return }
-        if posChanged { AX.setPosition(s.window, f.origin) }
+        var ok = true
+        if posChanged { ok = AX.setPosition(s.window, f.origin) && ok }
         if sizeChanged {
-            AX.setSize(s.window, f.size)
+            ok = AX.setSize(s.window, f.size) && ok
             s.resized = true
+        }
+        // Failsafe: if Chrome refuses the move (or silently ignores it twice), stop taking over drags for the rest
+        // of this run so the user can always move the window natively.
+        if ok, let actual = AX.frame(s.window), abs(actual.minX - f.minX) > 2 || abs(actual.minY - f.minY) > 2 {
+            s.mismatches += 1
+            if s.mismatches >= 2 { ok = false }
+        } else if ok {
+            s.mismatches = 0
+        }
+        if !ok {
+            Log.write("lockstep: Chrome didn't follow the drag; turning lockstep off for this session")
+            Self.disabledThisRun = true
+            s.failed = true
+            return
         }
         s.lastFrame = f
         manager?.controllers[s.key]?.lockstepFrame(f)
@@ -277,7 +296,7 @@ final class DragController {
         guard var s = session else { return }
         session = nil
         if let p = point { s.latest = p }
-        if s.moved { apply(&s) }
+        if s.moved && !s.failed { apply(&s) }
         let m = manager
         m?.tracker.paused = false
         m?.controllers[s.key]?.lockstepFinished(resized: s.resized)
