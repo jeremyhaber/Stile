@@ -9,10 +9,10 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build Sidebar.app
+      - name: Build Stile.app
         run: bash mac/build.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: Sidebar
-          path: mac/dist/Sidebar.zip
+          name: Stile
+          path: mac/dist/Stile.zip
           if-no-files-found: error

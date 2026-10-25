@@ -2,15 +2,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "Sidebar",
+    name: "Stile",
     platforms: [.macOS(.v13)],
     products: [
-        .executable(name: "SidebarApp", targets: ["SidebarApp"])
+        .executable(name: "StileApp", targets: ["StileApp"])
     ],
     targets: [
         .executableTarget(
-            name: "SidebarApp",
-            path: "Sources/SidebarApp",
+            name: "StileApp",
+            path: "Sources/StileApp",
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("WebKit"),
