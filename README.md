@@ -111,7 +111,6 @@ Zap and custom CSS work straight away. To run your own JavaScript on a site, ope
 - `node tools/fake-app/test-host.mjs` — host protocol tests against the Node reference of Stile.app's host.
 - `node tools/overlay-e2e.mjs` — the sidebar UI in overlay mode, driven like Stile.app does.
 - `node tools/demos/build.mjs [scene ...]` — rebuilds the README demo GIFs in `docs/demos/` (headless Chromium, fake data only, needs ffmpeg); see `tools/demos/README.md`.
-- `SPEC*.md` — design notes and the extension ⇄ app protocol.
 
 ## License
 

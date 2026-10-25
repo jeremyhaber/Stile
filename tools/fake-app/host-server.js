@@ -1,6 +1,6 @@
 'use strict';
-// Reference implementation of the Stile app's `HostServer` (SPEC-v2.1-overlay.md, "Merge the helper
-// into the Mac app"). It speaks exactly the protocol the old Perl helper spoke, but over ONE Unix
+// Reference implementation of the Stile app's `HostServer` (the helper merged into the Mac app).
+// It speaks exactly the protocol the old Perl helper spoke, but over ONE Unix
 // socket (`<appDir>/host.sock`) shared by every Chrome profile: each accepted connection is one
 // profile's extension (Chrome starts the connector once per profile; the connector is a byte pipe).
 //

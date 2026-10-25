@@ -1782,7 +1782,7 @@ final class OverlayController {
         }
         var target: CGFloat
         if let b = revealWindowBottom() {
-            // Measured frame by frame (tools/fs-reveal-recorder.swift): Chrome's toolbar edge tracks the reveal window's
+            // Measured frame by frame: Chrome's toolbar edge tracks the reveal window's
             // bottom linearly, within ~2 pt, both ways. So follow the window directly, offset so that fully out lands
             // exactly on the toolbar's edge. AX (a slow round trip to Chrome) is only asked once, when fully out.
             let now = CACurrentMediaTime()

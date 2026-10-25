@@ -4,3 +4,8 @@ mac/dist/
 node_modules/
 .DS_Store
 dev/
+# Internal notes and one-off probes (kept locally, not published)
+HANDOFF.md
+SPEC*.md
+tools/fs-*.swift
+tools/v3-shots.mjs
