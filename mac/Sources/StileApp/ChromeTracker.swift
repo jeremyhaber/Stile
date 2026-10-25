@@ -13,6 +13,9 @@ struct ChromeWindow {
     /// Overlays are shown only for normal, on-screen windows.
     var visible: Bool { !minimized && !fullscreen && onScreen }
 
+    /// On screen, full screen included (the overlay itself decides whether it runs in full screen).
+    var shown: Bool { !minimized && onScreen }
+
     func sameState(as o: ChromeWindow) -> Bool {
         key == o.key && cgID == o.cgID && frame == o.frame && minimized == o.minimized
             && fullscreen == o.fullscreen && onScreen == o.onScreen

@@ -408,7 +408,7 @@ final class DragController {
         return startSession(w, gesture: .move, at: p, flags: [], focused: m.tracker.focusedWindowKey(), fromPanel: true)
     }
 
-    /// Pressing Chrome's zoom button would enter full screen (where Stile doesn't run), so Maximize/Fill
+    /// Pressing Chrome's zoom button would enter full screen (a Space change), so Maximize/Fill
     /// uses the same Fill / restore as Stile's green button.
     private func performTitleBarDoubleClick(_ w: ChromeWindow) {
         let action = UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") ?? "Maximize"

@@ -286,7 +286,17 @@ Log: `~/Library/Logs/Stile.log` (search for `rail[window`).
 - Windows are matched by bounds. Two windows from different profiles at exactly the same position and
   size can be matched the wrong way round until one is moved.
 - Overlays sit directly above their Chrome window, so another app's window raised above Chrome hides them
-  with it. Fullscreen and minimized Chrome windows get no overlay; windows on other Spaces are skipped.
+  with it. Minimized Chrome windows get no overlay, and windows on other Spaces are skipped.
+- macOS full screen: the overlay joins Chrome's full-screen Space only when Chrome's View → "Always Show
+  Toolbar in Full Screen" is ticked. Stile reads that tick from Chrome's English menu bar about once a
+  second. With the auto-hiding toolbar, Stile steps aside, because the toolbar's slide can't be followed
+  without the native rail showing through. Chrome's own side panel still works there.
+- Screen sharing: sharing the entire screen (or a region of it) includes the sidebar, because Stile's
+  windows aren't excluded from capture. Sharing a single Chrome window captures only Chrome's own window,
+  so viewers see Chrome's native vertical tabs. macOS doesn't tell other apps which window is being
+  captured, and Chrome's collapsed rail still shows tab icons, so Stile can't hide them. Sharing a tab
+  shows only the page, with no tabs of either kind. To show the sidebar, share the screen. When sharing a
+  window, Present limits the native rail to the tabs added to the presentation.
 - Clicking the sidebar makes its panel the key window (needed for typing) without activating Stile.app,
   so Chrome's own keyboard shortcuts stop working until you click back into the page.
 - The web view runs on a custom `sidebar://` scheme (not a secure context): no clipboard API, no service workers.

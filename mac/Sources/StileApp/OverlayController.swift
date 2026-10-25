@@ -76,6 +76,8 @@ final class OverlayController {
     private var fsFlipAt = Date.distantPast
     private var fsTransitionUntil = Date.distantPast
     private let fsRecheck = OneShot()
+    /// While full screen and not docked: re-reads Chrome's "Always Show Toolbar in Full Screen" tick every ~1 s.
+    private let fsDockedPoll = OneShot()
     private let fsCheck = OneShot()
     private var fsCheckPending = false
     /// Full screen: Chrome's toolbar element and how far its reveal currently reaches below the window top.
@@ -216,6 +218,8 @@ final class OverlayController {
     var onHostStatePushed: (() -> Void)?
     /// v3.1: panels were laid out (not while following): the manager refreshes the tap snapshots.
     var onLayoutSettled: (() -> Void)?
+    /// Set by OverlayManager: CG ids of all Chrome windows the tracker knows (every profile). Never an address-bar popup.
+    var knownChromeWindowIDs: (() -> Set<CGWindowID>)?
 
     /// The live extension connection this window is mapped to.
     var mappedBridge: ProfileBridge? { liveMapped ? bridge : nil }
@@ -318,6 +322,7 @@ final class OverlayController {
         holdRevealLatency(false)
         captureTimer = nil
         fsRecheck.cancel()
+        fsDockedPoll.cancel()
         fsCheck.cancel()
         noteTimer.cancel()
         topBar.hide()
@@ -438,10 +443,12 @@ final class OverlayController {
 
     /// The sidebar panel may be on screen: Chrome window visible and supported, overlay on, live mapping.
     private func computeVisible() -> Bool {
-        // Not in macOS full screen (decided Oct 2026): Chrome's sliding toolbar can't be followed without its tab rail
-        // showing through, and the address bar's suggestions can't be layered above us there. Stile steps aside; the
-        // extension (Chrome's own side panel) still works. Maximise with the green button (Fill screen) instead.
-        window.visible && !window.fullscreen && Date() >= fsTransitionUntil
+        // Full screen is supported only with Chrome's View -> "Always Show Toolbar in Full Screen" (`dockedToolbar`):
+        // nothing slides, the sidebar sits below the toolbar. With the auto-hiding toolbar (decided Oct 2026) Stile
+        // still steps aside: its slide can't be followed without the tab rail showing through, and the address bar's
+        // suggestions can't be layered above us. The reveal tracking is kept but unreachable. The extension (Chrome's
+        // own side panel) still works either way.
+        window.shown && (!window.fullscreen || dockedToolbar) && Date() >= fsTransitionUntil
             && !unsupported && overlayEnabled && liveMapped && !isLittle
     }
 
@@ -459,7 +466,7 @@ final class OverlayController {
     var isMapped: Bool { bridge != nil }
 
     /// On screen (ignoring `unsupported`) and not matched to an extension window: the mapper should keep trying.
-    var wantsMapping: Bool { window.visible && bridge == nil }
+    var wantsMapping: Bool { window.shown && bridge == nil }
 
     private var looksIncognito: Bool {
         let el = window.element
@@ -482,7 +489,7 @@ final class OverlayController {
         if bridge != nil {
             unmappedVisibleSince = nil
             lackingMatch = []
-        } else if !window.visible {
+        } else if !window.shown {
             unmappedVisibleSince = nil
             new = unsupported   // cannot tell while hidden; keep the last verdict
         } else {
@@ -590,6 +597,20 @@ final class OverlayController {
         window = w
         chromeFrontmost = f
         if restoreFrame != nil, !following, WindowActions.arrangement(of: w.frame) == .none { restoreFrame = nil }
+        // Full screen runs only with the toolbar docked: read that first, even while the overlay is hidden (throttled
+        // to 1/s; the flip reset the check, and the recheck after the transition lands here).
+        if window.fullscreen {
+            if Date() >= fsTransitionUntil { refreshDockedToolbar() }
+            if !fsDockedPoll.isScheduled {
+                fsDockedPoll.schedule(after: 1.05) { [weak self] in
+                    guard let self = self else { return }
+                    self.fsDockedPoll.clear()
+                    self.update(window: self.window, chromeFrontmost: self.chromeFrontmost)
+                }
+            }
+        } else {
+            fsDockedPoll.cancel()
+        }
         visible = computeVisible()
         defer {
             updateNotice()
@@ -1103,7 +1124,8 @@ final class OverlayController {
 
     // MARK: Green button actions
 
-    /// Stile's green button maximises (Fill screen) rather than entering full screen, where Stile doesn't run.
+    /// Stile's green button maximises (Fill screen) rather than entering full screen (its menu has Enter/Exit Full
+    /// Screen; Stile shows in full screen only when Chrome's toolbar is docked).
     private func zoomClicked(option: Bool) {
         fillOrRestore()
     }
@@ -1688,13 +1710,16 @@ final class OverlayController {
         let f = window.frame
         let edge = f.minY + (window.fullscreen ? (revealFull ?? 120) : (contentTopRel ?? 120))
         let infos = CGInfo.onScreenWindowInfo()
+        let known = knownChromeWindowIDs?() ?? []
         for info in infos {
             guard let owner = info["kCGWindowOwnerPID"] as? NSNumber, owner.int32Value == pid,
                   let n = info["kCGWindowNumber"] as? NSNumber,
                   let d = info["kCGWindowBounds"] as? NSDictionary,
                   let b = CGRect(dictionaryRepresentation: d as CFDictionary) else { continue }
             let id = CGWindowID(n.uint32Value)
-            if id == window.cgID || id == revealWinID { continue }
+            // All profiles share Chrome's process, so another real window (e.g. the Stile Settings popup of a
+            // different profile) can pass the geometry test below, be taken for the suggestions list and hole the sidebar.
+            if id == window.cgID || id == revealWinID || known.contains(id) { continue }
             // Measured: the suggestions window starts over the address bar itself (e.g. 99,24 1213×89 growing to
             // ×538 with the toolbar edge at 118) and reaches below the toolbar; Chrome's own full-width windows don't.
             if b.minX > f.minX + 40, b.minX < f.minX + 600, b.width > 200, b.width < f.width - 40,
@@ -1736,6 +1761,15 @@ final class OverlayController {
         if !force, Date().timeIntervalSince(dockedCheckedAt) < 1 { return }
         dockedCheckedAt = Date()
         let docked = Self.chromeAlwaysShowsToolbar(pid: AX.pid(window.element)) ?? dockedToolbar
+        if !visible {
+            // Hidden (e.g. waiting for the tick): just remember it; the rescan on show fits the edge via apply().
+            if docked != dockedToolbar {
+                Log.write("fullscreen[window \(key)]: toolbar \(docked ? "always shown (docked)" : "auto-hides")")
+                dockedToolbar = docked
+                revealInset = 0
+            }
+            return
+        }
         let edge = docked ? toolbarEdgeInset() : 0
         guard docked != dockedToolbar || (docked && abs(edge - revealInset) >= 0.5) else { return }
         if docked != dockedToolbar {

@@ -260,6 +260,7 @@ final class OverlayManager {
                 c.onTopBarClose = { [weak self] key, el in self?.closer.performClose(key: key, window: el) }
                 c.onLayoutSettled = { [weak self] in self?.dragger.updateSnapshot() }
                 c.onHostStatePushed = { [weak self] in self?.scheduleAppState() }
+                c.knownChromeWindowIDs = { [weak self] in Set((self?.tracker.windows ?? []).map(\.cgID).filter { $0 != 0 }) }
                 c.overlayEnabled = overlayEnabled
                 controllers[w.key] = c
                 c.setLittle(closer.isLittle(mapper.map[w.key]))
@@ -424,8 +425,8 @@ final class OverlayManager {
     /// else the first visible one) plus app-wide fields.
     private func appStateObject(for b: ProfileBridge) -> [String: Any] {
         let mine = controllers.values.filter { $0.mappedBridge === b && !$0.isLittle }.sorted { $0.key < $1.key }
-        let c = mine.first(where: { $0.isFocusedChromeWindow && $0.window.visible })
-            ?? mine.first(where: { $0.window.visible }) ?? mine.first
+        let c = mine.first(where: { $0.isFocusedChromeWindow && $0.window.shown })
+            ?? mine.first(where: { $0.window.shown }) ?? mine.first
         var obj: [String: Any] = c?.hostStateObject() ?? [
             "state": "collapsed", "pinned": false, "railFound": false, "railControllable": false,
             "launchAtLogin": LoginItem.enabled, "accessibility": Permissions.isTrusted,
@@ -500,8 +501,8 @@ final class OverlayManager {
             // Same effect as the page's `setPinned` host message: the focused window of this profile, else its
             // first visible one.
             let candidates = mine.filter { !$0.isLittle }
-            if let c = candidates.first(where: { $0.isFocusedChromeWindow && $0.window.visible })
-                ?? candidates.first(where: { $0.window.visible }) {
+            if let c = candidates.first(where: { $0.isFocusedChromeWindow && $0.window.shown })
+                ?? candidates.first(where: { $0.window.shown }) {
                 c.setPinned(on)
             }
         case "setLaunchAtLogin":
@@ -516,7 +517,7 @@ final class OverlayManager {
         case "openAccessibilitySettings":
             Permissions.openSettings()
         case "rescanRail":
-            for c in mine where c.window.visible { c.forceRescan() }
+            for c in mine where c.window.shown { c.forceRescan() }
         case "quitApp":
             quitApp()
         case "reviewPermissions":

@@ -393,6 +393,27 @@ final class HostServer {
             doSwitch(m, c)
         case "setGlobalSettings":
             doSetSettings(m, c)
+        case "seedSharedSettings":
+            let r = HostStore.seedShared((m["values"] as? [String: Any]) ?? [:])
+            if r.seeded { broadcast(except: c, ["type": "settings", "settings": r.settings]) }
+            c.reply(m, ["type": "settings", "seeded": r.seeded, "settings": r.settings])
+        case "setSharedSettings":
+            let v = (m["values"] as? [String: Any]) ?? [:]
+            if let k = HostStore.invalidSharedKey(v) {
+                c.reply(m, ["type": "settings", "settings": HostStore.currentSettings(), "error": "invalid \(k)"])
+            } else {
+                let new = HostStore.mergeShared(v)
+                broadcast(except: c, ["type": "settings", "settings": new])
+                c.reply(m, ["type": "settings", "settings": new])
+            }
+        case "setProfileOverride":
+            let r = HostStore.setProfileOverride(dir: m["dir"], overrides: m["overrides"])
+            if let e = r.error {
+                c.reply(m, ["type": "settings", "settings": r.settings, "error": e])
+            } else {
+                broadcast(except: c, ["type": "settings", "settings": r.settings])
+                c.reply(m, ["type": "settings", "settings": r.settings])
+            }
         case "setOverlayEnabled":
             doSetOverlayEnabled(m, c)
         case "setDefaultBrowser":

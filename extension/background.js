@@ -1,7 +1,7 @@
 // Stile service worker. All listeners are registered synchronously at top level.
 // Nothing here relies on in-memory state surviving a restart (the only module-level
 // state is the live native port and its pending-request table, which die with the worker).
-import { registerBoostListeners, handleBoostCommand } from './boosts-sw.js';
+import { registerBoostListeners, handleBoostCommand, setBoostPush } from './boosts-sw.js';
 import { registerCaptureListeners, handleCaptureCommand, createCaptureMenus, captureMenuIds, receiveNativeCapture, receiveNativeCaptureLink, receiveNativeRecording, startCapture, setCaptureApp, pushCaptureConfig } from './capture/capture-sw.js';
 import { registerBridgeListeners, handleBridgeMessage, emitBridgeEvent } from './bridge-sw.js';
 import { getRoots, isBlankUrl, DEFAULT_ARCHIVE_MINUTES, GROUP_COLORS, hashStr } from './shared.js';
@@ -380,6 +380,111 @@ async function onDuplicateProfile(p, dir, queued = false) {
   if (port === p) await (queued ? setHelper({ currentProfileDir: null }) : enqueue(() => setHelper({ currentProfileDir: null })));
 }
 
+// ---------------------------------------------------------------- global settings (state.json `shared` + `profileOverrides`)
+// storage.local sharedSettings / profileOverrides cache the app's values; the EFFECTIVE values are written into the old
+// keys (storage.sync / local boosts) so every existing reader keeps working. Applied only once this profile migrated.
+const SHARED_DEFAULTS = { sidebarColor: { mode: 'auto' }, archiveGrouped: false, pinnedResetOnRestart: true, mergeOnClose: true, littleStyle: 'minimal', littleMaxOpen: 3, temporaryMinutes: 360, captureAfter: 'editor', captureAnnotate: true, captureAskWhere: false, boosts: {} };
+const SHARED_KEYS = Object.keys(SHARED_DEFAULTS);
+const TAB_OVERRIDE_KEYS = ['archiveMinutes', 'archiveGrouped', 'pinnedResetOnRestart'];
+const isMigrated = () => sget('local', 'sharedMigrated', false);
+let boostPushes = 0;   // boost pushes in flight: an older reply must not overwrite a newer local edit
+let applyQ = Promise.resolve();
+
+// Effective values for this profile (shared, then this profile's override) -> the old storage keys; only changed keys are written.
+async function writeEffective(shared, overrides) {
+  const dir = (await sget('session', 'helper', {})).currentProfileDir;
+  const ov = (dir && overrides && overrides[dir]) || {};
+  const want = {};
+  for (const k of SHARED_KEYS) if (k !== 'boosts' && shared[k] !== undefined) want[k] = shared[k];
+  for (const k of ['archiveGrouped', 'pinnedResetOnRestart']) if (ov[k] !== undefined) want[k] = ov[k];
+  want.archiveMinutes = typeof ov.archiveMinutes === 'number' ? ov.archiveMinutes : null;
+  const cur = await chrome.storage.sync.get(Object.keys(want)).catch(() => ({}));
+  const diff = {};
+  for (const [k, v] of Object.entries(want)) {
+    const c = cur[k] === undefined && v === null ? null : cur[k];
+    if (JSON.stringify(c) !== JSON.stringify(v)) diff[k] = v;
+  }
+  if (Object.keys(diff).length) await chrome.storage.sync.set(diff).catch(() => {});
+  if (shared.boosts && typeof shared.boosts === 'object' && !boostPushes) {
+    const cb = await sget('local', 'boosts', {});
+    if (JSON.stringify(cb) !== JSON.stringify(shared.boosts)) await chrome.storage.local.set({ boosts: shared.boosts }).catch(() => {});   // boosts-sw re-registers the user scripts
+  }
+}
+// A local boost edit goes to the app (when connected and migrated); the reply is applied like any other settings.
+setBoostPush(async (all) => {
+  boostPushes++;
+  try {
+    if (!helperConnected() || !(await isMigrated())) return;
+    const r = await nreq({ type: 'setSharedSettings', values: { boosts: all } });
+    if (r && r.settings) await applySettings(r.settings);
+  } catch { /* offline: the app's boosts win on the next connect */ } finally { boostPushes--; }
+});
+function applyShared(shared, overrides, force = false) {
+  applyQ = applyQ.then(async () => {
+    if (!force && !(await isMigrated())) return;
+    const ov = overrides && typeof overrides === 'object' ? overrides : {};
+    await chrome.storage.local.set({ sharedSettings: shared, profileOverrides: ov }).catch(() => {});
+    await writeEffective(shared, ov);
+  }).catch((e) => console.warn('[sidebar] apply shared settings', e));
+  return applyQ;
+}
+// `settings` from a hello reply, a reply or a broadcast. shared === null: the app was never seeded, keep our values.
+function applySettings(s) {
+  if (!s || typeof s !== 'object') return Promise.resolve();
+  if (typeof s.archiveDefaultMinutes === 'number') chrome.storage.local.set({ globalDefaultMinutes: s.archiveDefaultMinutes }).catch(() => {});
+  if (s.shared && typeof s.shared === 'object') return applyShared(s.shared, s.profileOverrides);
+  return Promise.resolve();
+}
+
+async function collectShared() {
+  const sync = await chrome.storage.sync.get([...SHARED_KEYS, 'archiveMinutes']).catch(() => ({}));
+  const out = {};
+  for (const k of SHARED_KEYS) if (k !== 'boosts') out[k] = sync[k] === undefined ? SHARED_DEFAULTS[k] : sync[k];
+  out.boosts = await sget('local', 'boosts', {});
+  return { values: out, sync };
+}
+// Boosts: sites only here are added; for a site in both, zaps (by selector) only here are added. css/js: the app's win.
+function unionBoosts(mine, theirs) {
+  const out = JSON.parse(JSON.stringify(theirs || {}));
+  let changed = false;
+  for (const [host, b] of Object.entries(mine || {})) {
+    if (!out[host]) { out[host] = b; changed = true; continue; }
+    const zs = Array.isArray(out[host].zaps) ? out[host].zaps : (out[host].zaps = []);
+    for (const z of (b && b.zaps) || []) if (!zs.some((x) => x.selector === z.selector)) { zs.push(z); changed = true; }
+  }
+  return { merged: out, changed };
+}
+// Once per profile, after the profile dir is known. Returns true when done. An app without these ops: nothing changes, no flag.
+async function migrateShared(dir) {
+  if (!dir || !helperConnected()) return false;
+  if (await isMigrated()) return true;
+  try {
+    const { values, sync } = await collectShared();
+    let r = await nreq({ type: 'seedSharedSettings', values });
+    if (!r || r.type !== 'settings' || r.seeded === undefined || !r.settings || !r.settings.shared) return false;
+    let settings = r.settings;
+    if (!r.seeded) {
+      const u = unionBoosts(values.boosts, settings.shared.boosts);
+      if (u.changed) {
+        const w = await nreq({ type: 'setSharedSettings', values: { boosts: u.merged } });
+        if (w && w.settings && w.settings.shared) settings = w.settings;
+      }
+    }
+    const g = settings.shared;
+    const ov = {};
+    if (typeof sync.archiveMinutes === 'number') ov.archiveMinutes = sync.archiveMinutes;
+    for (const k of ['archiveGrouped', 'pinnedResetOnRestart']) if (typeof sync[k] === 'boolean' && sync[k] !== g[k]) ov[k] = sync[k];
+    if (Object.keys(ov).length) {
+      const o = await nreq({ type: 'setProfileOverride', dir, overrides: ov });
+      if (!o || o.type !== 'settings' || o.error || !o.settings) return false;
+      settings = o.settings;
+    }
+    await chrome.storage.local.set({ sharedMigrated: true });
+    await applyShared(settings.shared, settings.profileOverrides);
+    return true;
+  } catch (e) { console.warn('[sidebar] settings migration', e); return false; }
+}
+
 async function handshake(p) {
   try {
     const r = await nreq({ type: 'hello', extVersion: chrome.runtime.getManifest().version });
@@ -393,11 +498,14 @@ async function handshake(p) {
     const dir = await resolveProfileDir(profiles);
     await enqueue(() => setHelper({ status: 'connected', error: undefined, profiles, currentProfileDir: dir }));
     pushCaptureConfig().catch(() => {});   // the app's screenshot editor uses this profile's settings
+    await applySettings(r.settings);   // no-op for the shared values until this profile has migrated
     if (dir) {
+      let dup = false;
       try {
         const ir = await nreq({ type: 'identify', profileDir: dir });
-        if (ir && ir.error === 'duplicate profile') await onDuplicateProfile(p, dir);
+        if (ir && ir.error === 'duplicate profile') { dup = true; await onDuplicateProfile(p, dir); }
       } catch (e) { console.warn('identify failed', e); }
+      if (!dup && port === p) await migrateShared(dir);
     }
   } catch (e) {
     if (port === p) await enqueue(() => setHelper({ status: 'error', error: String(e && e.message || e) }));
@@ -449,11 +557,10 @@ function onHelperMessage(m) {
   }
   else if (m.type === 'overlayEnabled' && !m.requestId) storeOverlayEnabled(m.enabled).catch(() => {});
   else if (m.type === 'appState' && m.state && typeof m.state === 'object') chrome.storage.session.set({ appState: m.state }).catch(() => {});
-  else if (m.type === 'clearArchiveOverride') chrome.storage.sync.remove('archiveMinutes').catch(() => {});   // "Apply to all profiles" from another profile's settings
   else if (m.type === 'defaultBrowser' && typeof m.enabled === 'boolean') chrome.storage.local.set({ defaultBrowser: m.enabled }).catch(() => {});
-  else if (m.type === 'settings' && m.settings && typeof m.settings.archiveDefaultMinutes === 'number') {
-    chrome.storage.local.set({ globalDefaultMinutes: m.settings.archiveDefaultMinutes }).catch(() => {});
+  else if (m.type === 'settings' && m.settings && typeof m.settings === 'object') {
     if (typeof m.settings.defaultBrowser === 'boolean') chrome.storage.local.set({ defaultBrowser: m.settings.defaultBrowser }).catch(() => {});
+    applySettings(m.settings);   // archive default + the shared values / overrides
   }
 }
 
@@ -1120,7 +1227,7 @@ async function restoreBoundTabs(final) {
 }
 
 // ---------------------------------------------------------------- commands
-const unqueued = new Set(['recordTab', 'openSettings', 'appSetting', 'appState', 'isLittleTab', 'switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle', 'setOverlayEnabled', 'setDefaultBrowser', 'setGreenButtonAction', 'clearArchiveOverrides']);
+const unqueued = new Set(['recordTab', 'openSettings', 'appSetting', 'appState', 'isLittleTab', 'switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle', 'setOverlayEnabled', 'setDefaultBrowser', 'setGreenButtonAction', 'setShared', 'setProfileOverride']);
 
 const APP_SETTINGS = new Set(['setPinned', 'setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'reviewPermissions', 'setShowMenuBarIcon', 'setOverlayEnabled', 'setDefaultBrowser', 'setGreenButtonAction', 'setCaptureSettings', 'chooseCaptureFolder', 'setUseChrome']);
 
@@ -1360,9 +1467,38 @@ const commands = {
     return { ok: !!(r && r.ok), method: r && r.method, error: r && r.error };
   },
 
-  async setProfileArchive({ minutes }) {
-    await chrome.storage.sync.set({ archiveMinutes: minutes === undefined ? null : minutes });
-    return { ok: true };
+  // Settings window writes. Connected + migrated: the app owns the value (its reply is applied to the cache).
+  // Otherwise (no app / older app) the effective values are written locally; the app's value wins on the next connect.
+  async setShared({ values }) {
+    const v = {};
+    for (const k of SHARED_KEYS) if (values && values[k] !== undefined) v[k] = values[k];
+    if (!Object.keys(v).length) return { ok: true };
+    if (helperConnected() && await isMigrated()) {
+      try {
+        if ('boosts' in v) boostPushes++;
+        const r = await nreq({ type: 'setSharedSettings', values: v });
+        if (r && r.error) return { ok: false, error: r.error };
+        if (r && r.settings) await applySettings(r.settings);
+        return { ok: true };
+      } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+      finally { if ('boosts' in v) boostPushes--; }
+    }
+    const l = await chrome.storage.local.get(['sharedSettings', 'profileOverrides']).catch(() => ({}));
+    await applyShared({ ...(l.sharedSettings || {}), ...v }, l.profileOverrides, true);
+    return { ok: true, local: true };
+  },
+
+  async setProfileOverride({ dir, overrides }) {
+    if (!dir || !overrides || typeof overrides !== 'object') return { ok: false, error: 'bad request' };
+    if (!helperConnected() || !(await isMigrated())) return { ok: false, error: 'helper unavailable' };
+    const o = {};
+    for (const k of TAB_OVERRIDE_KEYS) if (overrides[k] !== undefined) o[k] = overrides[k];
+    try {
+      const r = await nreq({ type: 'setProfileOverride', dir, overrides: o });
+      if (r && r.error) return { ok: false, error: r.error };
+      if (r && r.settings) await applySettings(r.settings);
+      return { ok: true };
+    } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
   },
 
   async setGlobalArchive({ minutes }) {
@@ -1375,17 +1511,6 @@ const commands = {
     } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
   },
 
-  // "Apply to all profiles": the app tells every connected profile (this one included) to drop its own archive time.
-  async clearArchiveOverrides() {
-    if (!helperConnected()) return { ok: false, error: 'helper unavailable' };
-    try {
-      const r = await nreq({ type: 'clearArchiveOverrides' });
-      if (!r || r.ok === false) return { ok: false, error: (r && r.error) || 'helper refused' };
-      await chrome.storage.sync.remove('archiveMinutes');   // don't wait for the app's broadcast to reach us
-      return { ok: true, count: r.count };
-    } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
-  },
-
   async setProfileDir({ dir }) {
     if (dir) await chrome.storage.local.set({ profileDir: dir });
     else await chrome.storage.local.remove('profileDir');
@@ -1394,6 +1519,10 @@ const commands = {
       try {
         const ir = await nreq({ type: 'identify', profileDir: dir });
         if (ir && ir.error === 'duplicate profile') await onDuplicateProfile(port, dir, true);
+        else if (await migrateShared(dir)) {   // (older app: keep local values) the new dir may have other overrides
+          const l = await chrome.storage.local.get(['sharedSettings', 'profileOverrides']).catch(() => ({}));
+          if (l.sharedSettings) await applyShared(l.sharedSettings, l.profileOverrides);
+        }
       } catch { /* ignore */ }
     }
     return { ok: true };
@@ -2092,6 +2221,10 @@ const commands = {
         appEverConnected: !!(await sget('local', 'appEverConnected', false)),
         defaultBrowser: !!(await sget('local', 'defaultBrowser', false)),
         pinnedResetOnRestart: (await sget('sync', 'pinnedResetOnRestart', true)) !== false,
+        archiveGrouped: !!(await sget('sync', 'archiveGrouped', false)),
+        sharedMigrated: !!(await isMigrated()),
+        sharedSettings: await sget('local', 'sharedSettings', null),
+        profileOverrides: await sget('local', 'profileOverrides', null),
         ...(await littleSettings())
       },
       contextMenus: Object.values(menuItems),

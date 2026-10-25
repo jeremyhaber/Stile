@@ -241,9 +241,11 @@ ${ctx.appHost ? '<h2 class="group-h">Screenshots</h2>' : ''}
   const afterHint = () => {
     $('cap-after-hint').textContent = { editor: 'Opens in a window where you can annotate, copy, save or upload.', thumbnail: 'A small card appears bottom-right with Copy, Save, Edit and Upload. It hides after 6 seconds.', copy: 'The picture goes straight to the clipboard.' }[$('cap-after').value];
   };
-  $('cap-after').onchange = () => { chrome.storage.sync.set({ captureAfter: $('cap-after').value }); afterHint(); };
-  $('cap-annotate').onchange = () => (api ? api.set({ annotate: $('cap-annotate').checked }) : chrome.storage.sync.set({ captureAnnotate: $('cap-annotate').checked }));
-  $('cap-ask').onchange = () => (api ? api.set({ askWhere: $('cap-ask').checked }) : chrome.storage.sync.set({ captureAskWhere: $('cap-ask').checked }));
+  // Global settings: through the service worker's setShared (the app keeps them) when this page has a command channel.
+  const putShared = (v) => (hasChrome && ctx && ctx.cmd ? ctx.cmd('setShared', { values: v }) : chrome.storage.sync.set(v));
+  $('cap-after').onchange = () => { putShared({ captureAfter: $('cap-after').value }); afterHint(); };
+  $('cap-annotate').onchange = () => (api ? api.set({ annotate: $('cap-annotate').checked }) : putShared({ captureAnnotate: $('cap-annotate').checked }));
+  $('cap-ask').onchange = () => (api ? api.set({ askWhere: $('cap-ask').checked }) : putShared({ captureAskWhere: $('cap-ask').checked }));
   $('cap-folder-choose').onclick = () => api && api.choose('screenshots');
   $('cap-pattern').addEventListener('input', () => api && api.set({ filenamePattern: $('cap-pattern').value }));
   $('cap-shadow').onchange = () => api && api.set({ windowShadow: $('cap-shadow').checked });

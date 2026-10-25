@@ -26,6 +26,16 @@ async function readAll() {
   return b && typeof b === 'object' ? b : {};
 }
 
+// Boosts are a global setting: a local edit is also pushed to Stile.app (background.js sets the hook). Boosts applied FROM
+// the app are written to storage directly by background.js, so they never echo back; the storage.onChanged listener below
+// re-registers the user scripts for both.
+let pushHook = null;
+export function setBoostPush(fn) { pushHook = fn; }
+async function writeAll(all) {
+  await chrome.storage.local.set({ [KEY]: all });
+  if (pushHook) { try { pushHook(all); } catch { /* ignore */ } }
+}
+
 // Serialized read-modify-write of one hostname's boost. fn(boost) mutates and returns a result.
 function mutate(hostname, fn) {
   return enqueue(async () => {
@@ -34,7 +44,7 @@ function mutate(hostname, fn) {
     const result = fn(b);
     b.updatedAt = Date.now();
     if (isEmpty(b) && b.enabled) delete all[hostname]; else all[hostname] = b;
-    await chrome.storage.local.set({ [KEY]: all });
+    await writeAll(all);
     return result;
   });
 }
@@ -144,7 +154,7 @@ export async function handleBoostCommand(msg, sender) {
         await enqueue(async () => {
           const all = await readAll();
           delete all[h];
-          await chrome.storage.local.set({ [KEY]: all });
+          await writeAll(all);
         });
         return { ok: true };
       }

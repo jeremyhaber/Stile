@@ -91,7 +91,10 @@ async function main() {
   const extId = new URL(sw.url()).host;
   check('extension id is the fixed one', extId === 'ffblekellgdmlecjablfojaaadpkmdgg', extId);
   let panel;
-  const cmd = (msg) => panel.evaluate((m) => new Promise((res) => chrome.runtime.sendMessage(m, res)), msg).catch((e) => ({ error: String(e) }));
+  // 'setProfileArchive' (the old SW command) is a test shortcut now: set this profile's effective archive time directly in storage.sync
+  const cmd = (msg) => (msg.cmd === 'setProfileArchive'
+    ? swEval(async (x) => { await chrome.storage.sync.set({ archiveMinutes: x === undefined ? null : x }); return { ok: true }; }, msg.minutes)
+    : panel.evaluate((m) => new Promise((res) => chrome.runtime.sendMessage(m, res)), msg).catch((e) => ({ error: String(e) })));
   const swEval = (fn, arg) => sw.evaluate(fn, arg);
   // v3.0: settings live in their own window (settings.html), opened by the gear.
   let sp = null;
@@ -271,35 +274,57 @@ async function main() {
   await g.selectOption(day[0]); await sleep(700);
   const stateJson = JSON.parse(fs.readFileSync(path.join(helperDir, 'state.json'), 'utf8'));
   check('global default saved to helper state', stateJson.archiveDefaultMinutes === 1440, JSON.stringify(stateJson));
-  await sp.locator('[data-testid="settings-archive-profile"]').selectOption({ index: 0 }); await sleep(400);
   const st4 = await cmd({ cmd: 'debugState' });
-  check('profile setting "use default" follows global', st4.settings.archiveMinutes == null && st4.settings.effectiveMinutes === 1440, JSON.stringify(st4.settings));
+  check('a profile without an override follows the global default', st4.settings.archiveMinutes == null && st4.settings.effectiveMinutes === 1440, JSON.stringify(st4.settings));
   // v3.7: scope + layout
   check('settings: there is no General section', (await sp.locator('[data-testid="settings-nav-general"]').count()) === 0 && (await sp.locator('[data-testid="settings-section-general"]').count()) === 0);
   const scopeSel = sp.locator('[data-testid="settings-scope"]');
-  check('settings: a per-profile / mixed section (Tabs) shows the "Settings for" profile picker, disabled in the Chrome page', (await scopeSel.isVisible()) && (await scopeSel.isDisabled()) && (await sp.locator('[data-testid="settings-scope-global"]').count()) === 0 && /Settings for/.test(await sp.locator('#pane-scope').innerText()) && (await scopeSel.locator('option').count()) === 1, await sp.locator('#pane-scope').innerText());
+  const stateShared = () => JSON.parse(fs.readFileSync(path.join(helperDir, 'state.json'), 'utf8'));
+  const chips = {};
+  for (const id of ['appearance', 'tabs', 'windows', 'little', 'screenshots', 'boosts', 'profiles', 'app']) {
+    await sp.locator(`[data-testid="settings-nav-${id}"]`).click(); await sleep(150);
+    chips[id] = (await sp.locator('[data-testid="settings-scope-global"]').isVisible()) && (await sp.locator('[data-testid="settings-scope-global"]').innerText()) === 'All profiles' && (await scopeSel.count()) === 0;
+  }
+  check('settings: every section shows the "All profiles" chip and none has a profile picker', Object.values(chips).every(Boolean), JSON.stringify(chips));
+  await sp.locator('[data-testid="settings-nav-tabs"]').click(); await sleep(200);
   const headsTxt = await sp.locator('[data-testid="settings-section-tabs"] .group-h:visible').allInnerTexts();
-  check('settings: Tabs shows "All profiles" first, then a heading with this profile\'s name', headsTxt[0] === 'All profiles' && headsTxt[1] && headsTxt[1] !== 'This profile', JSON.stringify(headsTxt));
-  const profSel = sp.locator('[data-testid="settings-archive-profile"]');
-  const firstOpt = () => profSel.locator('option').first().innerText();
-  check('settings: the profile override\'s first option is "Use default (24 hours)"', (await firstOpt()) === 'Use default (24 hours)', await firstOpt());
-  await g.selectOption(opts.find(([, t]) => /12 hours/.test(t))[0]); await sleep(700);
-  check('settings: "Use default (…)" follows a global change live', (await firstOpt()) === 'Use default (12 hours)', await firstOpt());
-  await g.selectOption(day[0]); await sleep(500);
-  await profSel.selectOption(String(60)); await sleep(500);
-  check('settings: a profile override is stored in sync storage', (await swEval(async () => (await chrome.storage.sync.get('archiveMinutes')).archiveMinutes)) === 60);
-  await sp.locator('[data-testid="archive-apply-all"]').click(); await sleep(900);
-  check('settings: "Apply to all profiles" clears the profile override (sync storage) and the select shows the default again', (await swEval(async () => (await chrome.storage.sync.get('archiveMinutes')).archiveMinutes)) == null && (await profSel.inputValue()) === '');
-  check('settings: "Apply to all profiles" toasts the shared value', /All profiles now use 24 hours/.test(await sp.locator('[data-testid="toast"]').first().innerText()));
+  check('settings: Tabs has no "This profile" group, no per-profile archive select and no "Apply to all profiles"', !headsTxt.includes('This profile') && (await sp.locator('[data-testid="settings-archive-profile"]').count()) === 0 && (await sp.locator('[data-testid="archive-apply-all"]').count()) === 0, JSON.stringify(headsTxt));
+  check('settings: Little windows has no "This profile" heading', (await sp.locator('[data-testid="settings-little"] .group-h').allInnerTexts()).every((t) => t !== 'This profile'));
+  const gDir = await swEval(async () => (await chrome.storage.session.get('helper')).helper?.currentProfileDir ?? null);
+  // a global write reaches the app's `shared` and comes back as the effective value
+  const grp = sp.locator('[data-testid="settings-archive-grouped"]');
+  await grp.check(); await sleep(800);
+  check('settings: "Also archive tabs in groups" is a global write (state.json shared + effective sync value)', stateShared().shared?.archiveGrouped === true && (await swEval(async () => (await chrome.storage.sync.get('archiveGrouped')).archiveGrouped)) === true, JSON.stringify(stateShared().shared));
+  await grp.uncheck(); await sleep(800);
+  check('settings: unchecking it writes false to shared', stateShared().shared?.archiveGrouped === false);
+  await sp.locator('[data-testid="settings-nav-windows"]').click(); await sleep(200);
+  await sp.locator('[data-testid="settings-merge-on-close"]').uncheck(); await sleep(800);
+  check('settings: a Windows write goes to shared.mergeOnClose', stateShared().shared?.mergeOnClose === false);
+  await sp.locator('[data-testid="settings-merge-on-close"]').check(); await sleep(800);
+  check('settings: ...and back on', stateShared().shared?.mergeOnClose === true);
+  // Profiles: per-profile overrides for the three tab settings; "Use global" clears
+  await sp.locator('[data-testid="settings-nav-profiles"]').click(); await sleep(200);
+  if (gDir) {
+    const ovSel = (t) => sp.locator(`[data-testid="profile-overrides"][data-dir="${gDir}"] [data-testid="${t}"]`);
+    await sp.locator(`[data-testid="profile-style-row"][data-dir="${gDir}"]`).click(); await sleep(300);
+    check('settings: an expanded profile has a Tabs & Archive override block with three selects', (await sp.locator(`[data-testid="profile-overrides"][data-dir="${gDir}"] select`).count()) === 3);
+    const first = (t) => ovSel(t).locator('option').first().innerText();
+    check('settings: override selects start at "Use global (<value>)"', (await first('profile-override-archive')) === 'Use global (24 hours)' && (await first('profile-override-grouped')) === 'Use global (Off)' && (await first('profile-override-pinned')) === 'Use global (On)', JSON.stringify([await first('profile-override-archive'), await first('profile-override-grouped'), await first('profile-override-pinned')]));
+    await ovSel('profile-override-archive').selectOption('60'); await sleep(900);
+    check('settings: choosing an archive time sets profileOverrides[dir].archiveMinutes on the app and the effective sync value', stateShared().profileOverrides?.[gDir]?.archiveMinutes === 60 && (await swEval(async () => (await chrome.storage.sync.get('archiveMinutes')).archiveMinutes)) === 60, JSON.stringify(stateShared().profileOverrides));
+    check('settings: the select shows the override', (await ovSel('profile-override-archive').inputValue()) === '60');
+    await ovSel('profile-override-grouped').selectOption('true'); await sleep(800);
+    check('settings: the groups override is a boolean on the app, the global value stays', stateShared().profileOverrides?.[gDir]?.archiveGrouped === true && (await swEval(async () => (await chrome.storage.sync.get('archiveGrouped')).archiveGrouped)) === true && stateShared().shared.archiveGrouped === false);
+    await ovSel('profile-override-archive').selectOption(''); await sleep(800);
+    await ovSel('profile-override-grouped').selectOption(''); await sleep(800);
+    const eff = await swEval(async () => chrome.storage.sync.get(['archiveMinutes', 'archiveGrouped']));
+    check('settings: "Use global" clears the overrides (the profile entry disappears) and the effective values follow the global', stateShared().profileOverrides?.[gDir] === undefined && eff.archiveMinutes == null && eff.archiveGrouped === false, JSON.stringify([stateShared().profileOverrides, eff]));
+    await sp.locator(`[data-testid="profile-style-row"][data-dir="${gDir}"]`).click(); await sleep(200);
+  } else check('settings: the test profile has a known dir (needed for the override checks)', false);
   await sp.locator('[data-testid="settings-nav-app"]').click(); await sleep(200);
-  check('settings: a global section (App) shows the "All profiles" chip instead of the picker', (await sp.locator('[data-testid="settings-scope-global"]').isVisible()) && !(await scopeSel.isVisible()));
   check('settings: Troubleshooting has the Chrome profile picker (relocated from General)', (await sp.locator('[data-testid="settings-profile-picker"]').isVisible()) && (await sp.locator('[data-testid="settings-current-profile"]').count()) === 1);
   await sp.locator('[data-testid="settings-nav-profiles"]').click(); await sleep(200);
   check('settings: Profiles is a global section too', await sp.locator('[data-testid="settings-scope-global"]').isVisible());
-  await sp.locator('[data-testid="settings-nav-windows"]').click(); await sleep(200);
-  check('settings: Windows is per profile (picker)', await scopeSel.isVisible());
-  await sp.locator('[data-testid="settings-nav-little"]').click(); await sleep(200);
-  check('settings: Little windows is mixed (picker, with an "All profiles" group)', (await scopeSel.isVisible()) && (await sp.locator('[data-testid="settings-section-little"], [data-testid="settings-little"]').locator('.group-h:visible').first().innerText()) === 'All profiles');
   // the gear asks Stile.app for its settings window first; this fake app has none, so it fell back to the page above
   check('settings: the gear asked the app (showSettings) before opening the Chrome page', host.showSettingsCalls.length >= 1 && host.showSettingsCalls[0].profileDir != null, JSON.stringify(host.showSettingsCalls));
   await closeSettings();
@@ -313,6 +338,36 @@ async function main() {
     check('settings: when the app has no window, openSettings falls back to the Chrome page', r2?.ok === true && !r2.app && ctx.pages().some((p) => !p.isClosed() && p.url().includes('settings.html')), JSON.stringify(r2));
     sp = ctx.pages().find((p) => !p.isClosed() && p.url().includes('settings.html')) || null;   // opened outside openSettings()
     await closeSettings();
+  }
+
+  // Global settings migration: once per profile, after the profile dir is known. The first profile seeds the app's `shared`
+  // from its own values; a later one defers to the global (except the tab settings, which become overrides when they differ).
+  if (gDir) {
+    const flagOf = () => swEval(async () => (await chrome.storage.local.get('sharedMigrated')).sharedMigrated === true);
+    const reset = (vals) => swEval(async (v) => { await chrome.storage.local.remove(['sharedMigrated', 'sharedSettings', 'profileOverrides']); await chrome.storage.sync.set(v); }, vals);
+    check('migration: the test profile has migrated on connect (flag set, app seeded)', (await flagOf()) && !!stateShared().shared);
+    host.updateState((s) => { delete s.shared; delete s.profileOverrides; });   // the app has never been seeded
+    await reset({ archiveMinutes: 60, archiveGrouped: true, littleStyle: 'regular', pinnedResetOnRestart: true });
+    await cmd({ cmd: 'setProfileDir', dir: gDir }); await sleep(1500);
+    let s1 = stateShared();
+    check('migration (first profile): its values seed the global settings', s1.shared?.archiveGrouped === true && s1.shared?.littleStyle === 'regular' && s1.shared?.pinnedResetOnRestart === true, JSON.stringify(s1.shared));
+    check('migration (first profile): archiveMinutes becomes this profile\'s override; values equal to the global are not overrides', JSON.stringify(s1.profileOverrides?.[gDir]) === JSON.stringify({ archiveMinutes: 60 }), JSON.stringify(s1.profileOverrides));
+    check('migration (first profile): the flag is set and the effective archive time is the override', (await flagOf()) && (await swEval(async () => (await chrome.storage.sync.get('archiveMinutes')).archiveMinutes)) === 60);
+    // a second profile (the same extension identifying as Profile 1) with different tab/Little settings
+    await reset({ archiveMinutes: null, archiveGrouped: false, littleStyle: 'minimal', pinnedResetOnRestart: true });
+    await cmd({ cmd: 'setProfileDir', dir: 'Profile 1' }); await sleep(1500);
+    s1 = stateShared();
+    check('migration (second profile): a differing archiveGrouped becomes an override, a differing littleStyle does not (global wins)', JSON.stringify(s1.profileOverrides?.['Profile 1']) === JSON.stringify({ archiveGrouped: false }) && s1.shared.littleStyle === 'regular' && s1.shared.archiveGrouped === true, JSON.stringify([s1.shared, s1.profileOverrides]));
+    const eff2 = await swEval(async () => chrome.storage.sync.get(['archiveGrouped', 'littleStyle', 'archiveMinutes']));
+    check('migration (second profile): the effective values are override ?? global', eff2.archiveGrouped === false && eff2.littleStyle === 'regular' && eff2.archiveMinutes == null, JSON.stringify(eff2));
+    // put everything back
+    await cmd({ cmd: 'setProfileDir', dir: gDir }); await sleep(800);
+    await cmd({ cmd: 'setProfileOverride', dir: 'Profile 1', overrides: { archiveGrouped: null } });
+    await cmd({ cmd: 'setProfileOverride', dir: gDir, overrides: { archiveMinutes: null } });
+    await cmd({ cmd: 'setShared', values: { archiveGrouped: false, littleStyle: 'minimal' } }); await sleep(800);
+    const s2 = stateShared(), eff3 = await swEval(async () => chrome.storage.sync.get(['archiveGrouped', 'littleStyle', 'archiveMinutes']));
+    check('migration: cleanup leaves no overrides and the defaults', !s2.profileOverrides || Object.keys(s2.profileOverrides).length === 0, JSON.stringify([s2.shared, s2.profileOverrides, eff3]));
+    check('migration: an invalid global write is refused and changes nothing', await (async () => { const r = await cmd({ cmd: 'setShared', values: { littleMaxOpen: 99 } }); return r.ok === false && stateShared().shared.littleMaxOpen !== 99; })());
   }
 
   // Profile switch → helper launches Chrome for the other profile

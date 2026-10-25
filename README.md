@@ -2,6 +2,8 @@
 
 A vertical side panel for Chrome on Mac: favourites, pinned folders, today's tabs, auto-archive, and profile switching.
 
+> **Beta:** Stile is still in beta. Expect rough edges, and please [open an issue](https://github.com/jeremyhaber/Stile/issues) if something breaks. Download Stile.app from [Releases](https://github.com/jeremyhaber/Stile/releases).
+
 ## What it does
 
 **Favourites and pinned folders**
@@ -103,6 +105,8 @@ Zap and custom CSS work straight away. To run your own JavaScript on a site, ope
 - Typed searches open in Chrome's last-focused window.
 - Boosts can't run on Chrome's own pages or the Chrome Web Store.
 - Custom JavaScript runs from the next page load after you save.
+- Stile.app shows its sidebar in macOS full screen only when Chrome's View → "Always Show Toolbar in Full Screen" is ticked. Otherwise Chrome's own side panel is used there.
+- When you share a single Chrome window in Meet or Zoom, viewers see Chrome's native vertical tabs, not Stile's sidebar, because Stile.app draws the sidebar in its own windows. To show the sidebar, share your entire screen. Sharing a tab shows only the page.
 
 ## Development
 

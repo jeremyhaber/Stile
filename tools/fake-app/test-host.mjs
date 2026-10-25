@@ -773,6 +773,104 @@ check('SIGTERM: connection removed from host', await wait(() => !host.isConnecte
   await kh.close();
 }
 
+// ------------------------------------------------------------ 13b. global settings: shared + per-profile overrides
+{
+  const gdir = path.join(tmp, 'app-global');
+  const gh = new HostServer({ appDir: gdir, localState, chromeBin: fakeChrome });
+  await gh.listen();
+  const gstate = () => readJson(path.join(gdir, 'state.json'));
+  const G1 = spawnClient({ SIDEBAR_APP_DIR: gdir });
+  const G2 = spawnClient({ SIDEBAR_APP_DIR: gdir });
+  let g = await G1.request({ type: 'hello' });
+  await G2.request({ type: 'hello' });
+  check('global: fresh hello has shared:null and profileOverrides:{}', g?.settings?.shared === null && j(g.settings.profileOverrides) === '{}', j(g?.settings));
+  const S = (c, m) => c.request(m, 'settings');
+
+  // seed: invalid values dropped, unknown keys ignored, defaults filled in
+  g = await S(G1, { type: 'seedSharedSettings', requestId: 90, values: { littleStyle: 'regular', littleMaxOpen: 9, mergeOnClose: false, bogus: 1, sidebarColor: { mode: 'custom', color: '#12ab34' }, boosts: { 'a.com': { x: 1 } }, captureAfter: 'nope' } });
+  check('seed: first caller wins (seeded:true, requestId echoed)', g?.type === 'settings' && g.seeded === true && g.requestId === 90, j(g));
+  const sh = g?.settings?.shared ?? {};
+  check('seed: valid values kept, invalid dropped to defaults', sh.littleStyle === 'regular' && sh.mergeOnClose === false && sh.littleMaxOpen === 3 && sh.captureAfter === 'editor' && sh.sidebarColor?.color === '#12ab34' && j(sh.boosts) === j({ 'a.com': { x: 1 } }) && sh.temporaryMinutes === 360 && sh.pinnedResetOnRestart === true && sh.archiveGrouped === false && sh.captureAnnotate === true && sh.captureAskWhere === false, j(sh));
+  check('seed: unknown key not stored', !('bogus' in (gstate().shared ?? {})) && !('littleMaxOpen' in gstate().shared) && !('captureAfter' in gstate().shared), j(gstate()));
+  let m = await G2.recv('settings');
+  check('seed: broadcast to the other connection', m?.settings?.shared?.littleStyle === 'regular', j(m));
+  check('seed: sender gets no unsolicited settings', await G1.quiet(250));
+  g = await S(G2, { type: 'seedSharedSettings', values: { littleStyle: 'minimal' } });
+  check('seed: second call seeded:false and changes nothing', g?.seeded === false && g.settings.shared.littleStyle === 'regular' && gstate().shared.littleStyle === 'regular', j(g));
+  check('seed: second call does not broadcast', await G1.quiet(250));
+
+  // setSharedSettings
+  g = await S(G1, { type: 'setSharedSettings', requestId: 91, values: { littleMaxOpen: 5, archiveGrouped: true, nonsense: 'x' } });
+  check('setShared: merged, unknown ignored', g?.type === 'settings' && !g.error && g.requestId === 91 && g.settings.shared.littleMaxOpen === 5 && g.settings.shared.archiveGrouped === true && g.settings.shared.littleStyle === 'regular' && !('nonsense' in g.settings.shared), j(g));
+  check('setShared: unknown key not persisted', !('nonsense' in gstate().shared));
+  m = await G2.recv('settings');
+  check('setShared: broadcast to the other connection', m?.settings?.shared?.littleMaxOpen === 5, j(m));
+  check('setShared: sender gets no unsolicited settings', await G1.quiet(250));
+  const before = j(gstate());
+  for (const [k, v] of [['littleMaxOpen', 6], ['littleStyle', 'huge'], ['sidebarColor', { mode: 'custom', color: 'red' }], ['mergeOnClose', 'yes'], ['temporaryMinutes', -1], ['boosts', []], ['captureAfter', 1]]) {
+    g = await S(G1, { type: 'setSharedSettings', values: { captureAnnotate: false, [k]: v } });
+    check(`setShared: invalid ${k} -> error, state unchanged`, g?.error === `invalid ${k}` && g.settings.shared.captureAnnotate === true && j(gstate()) === before, j(g));
+  }
+  check('setShared: invalid write is not broadcast', await G2.quiet(250));
+  g = await S(G1, { type: 'setSharedSettings', values: { sidebarColor: { mode: 'auto' }, temporaryMinutes: 0, boosts: {}, captureAfter: 'copy' } });
+  check('setShared: other valid shapes accepted', !g?.error && g.settings.shared.temporaryMinutes === 0 && g.settings.shared.captureAfter === 'copy' && g.settings.shared.sidebarColor.mode === 'auto', j(g));
+  await G2.recv('settings');
+
+  // setProfileOverride
+  g = await S(G1, { type: 'setProfileOverride', requestId: 92, dir: 'Profile 1', overrides: { archiveMinutes: 60, archiveGrouped: false, junk: 1 } });
+  check('override: set', g?.type === 'settings' && !g.error && g.requestId === 92 && j(g.settings.profileOverrides) === j({ 'Profile 1': { archiveMinutes: 60, archiveGrouped: false } }), j(g));
+  m = await G2.recv('settings');
+  check('override: broadcast to the other connection', m?.settings?.profileOverrides?.['Profile 1']?.archiveMinutes === 60, j(m));
+  check('override: sender gets no unsolicited settings', await G1.quiet(250));
+  g = await S(G1, { type: 'setProfileOverride', dir: 'Profile 1', overrides: { archiveMinutes: 0, pinnedResetOnRestart: true } });
+  check('override: merge keeps other keys, 0 = never', j(g?.settings?.profileOverrides?.['Profile 1']) === j({ archiveMinutes: 0, archiveGrouped: false, pinnedResetOnRestart: true }), j(g));
+  await G2.recv('settings');
+  g = await S(G1, { type: 'setProfileOverride', dir: 'Default', overrides: { archiveGrouped: true } });
+  await G2.recv('settings');
+  g = await S(G1, { type: 'setProfileOverride', dir: 'Profile 1', overrides: { archiveGrouped: null } });
+  check('override: null removes the key', j(g?.settings?.profileOverrides?.['Profile 1']) === j({ archiveMinutes: 0, pinnedResetOnRestart: true }), j(g));
+  await G2.recv('settings');
+  g = await S(G1, { type: 'setProfileOverride', dir: 'Profile 1', overrides: { archiveMinutes: null, pinnedResetOnRestart: null } });
+  check('override: empty dict removes the dir (others stay)', j(Object.keys(g?.settings?.profileOverrides ?? {})) === j(['Default']) && !('Profile 1' in gstate().profileOverrides), j(g));
+  await G2.recv('settings');
+  const ob = j(gstate());
+  for (const [label, msg, err] of [
+    ['missing dir', { overrides: { archiveGrouped: true } }, 'invalid dir'],
+    ['empty dir', { dir: '', overrides: { archiveGrouped: true } }, 'invalid dir'],
+    ['invalid archiveMinutes', { dir: 'Default', overrides: { archiveMinutes: -5 } }, 'invalid archiveMinutes'],
+    ['non-numeric archiveMinutes', { dir: 'Default', overrides: { archiveMinutes: 'abc' } }, 'invalid archiveMinutes'],
+    ['invalid archiveGrouped', { dir: 'Default', overrides: { archiveGrouped: 'yes' } }, 'invalid archiveGrouped'],
+    ['invalid pinnedResetOnRestart', { dir: 'Default', overrides: { pinnedResetOnRestart: 1 } }, 'invalid pinnedResetOnRestart'],
+    ['missing overrides', { dir: 'Default' }, 'invalid overrides'],
+  ]) {
+    g = await S(G1, { type: 'setProfileOverride', ...msg });
+    check(`override: ${label} -> error, state unchanged`, g?.type === 'settings' && g.error === err && j(gstate()) === ob, j(g));
+  }
+  check('override: errors are not broadcast', await G2.quiet(250));
+
+  // other state.json keys are preserved
+  await S(G1, { type: 'setGlobalSettings', settings: { archiveDefaultMinutes: 99 } });
+  await G2.recv('settings');
+  gh.updateState((st) => { st.profileStyles = { Default: { icon: 'star', color: '#ff0000' } }; st.futureKey = { a: 1 }; });
+  await S(G1, { type: 'setSharedSettings', values: { littleMaxOpen: 2 } });
+  await S(G1, { type: 'setProfileOverride', dir: 'Default', overrides: { archiveMinutes: 5 } });
+  const gs = gstate();
+  check('state.json: other keys preserved through global writes', gs.archiveDefaultMinutes === 99 && gs.futureKey?.a === 1 && gs.profileStyles?.Default?.icon === 'star' && gs.shared?.littleMaxOpen === 2 && gs.profileOverrides?.Default?.archiveMinutes === 5, j(gs));
+
+  // hello after a restart reads the persisted values
+  G1.closeStdin(); G2.closeStdin();
+  await wait(() => G1.exited && G2.exited, 3000);
+  await gh.close();
+  const gh2 = new HostServer({ appDir: gdir, localState, chromeBin: fakeChrome });
+  await gh2.listen();
+  const G3 = spawnClient({ SIDEBAR_APP_DIR: gdir });
+  g = await G3.request({ type: 'hello' });
+  check('hello after restart: persisted shared + overrides', g?.settings?.shared?.littleMaxOpen === 2 && g.settings.shared.littleStyle === 'regular' && g.settings.profileOverrides?.Default?.archiveMinutes === 5 && g.settings.archiveDefaultMinutes === 99, j(g?.settings));
+  G3.closeStdin();
+  await wait(() => G3.exited, 3000);
+  await gh2.close();
+}
+
 // ------------------------------------------------------------ 14. manifest
 {
   const f = writeHostManifest(path.join(tmp, 'nmh'), CONNECTOR);

@@ -34,6 +34,7 @@ const S = {
   archiveMinutes: null, globalMinutes: DEFAULT_ARCHIVE_MINUTES, archiveGrouped: false, mergeOnClose: true, pinnedReset: true,
   sidebarColor: { mode: 'auto' }, ownStyle: null, overlayEnabled: true, defaultBrowser: false,
   littleStyle: 'minimal', littleMaxOpen: 3, temporaryMinutes: 360, styleEditing: null,
+  overrides: {}, migrated: false,   // per-profile tab overrides (all profiles) from the app; whether this profile moved to the global settings
   connectedProfiles: null, scopeProfile: null   // app-hosted only: which profiles have a live extension, and the one this page is scoped to
 };
 // Stile.app's own window loads this page with a bridge to one profile's extension (`host=app&profile=<dir>`).
@@ -46,7 +47,7 @@ const normSidebarColor = (v) => (v && v.mode === 'custom' && typeof v.color === 
 async function load() {
   const [ses, loc, syn] = await Promise.all([
     chrome.storage.session.get(['helper', 'appState']).catch(() => ({})),
-    chrome.storage.local.get(['globalDefaultMinutes', 'overlayEnabled', 'defaultBrowser', 'appEverConnected']).catch(() => ({})),
+    chrome.storage.local.get(['globalDefaultMinutes', 'overlayEnabled', 'defaultBrowser', 'appEverConnected', 'sharedSettings', 'profileOverrides', 'sharedMigrated']).catch(() => ({})),
     chrome.storage.sync.get(['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor', 'littleStyle', 'littleMaxOpen', 'temporaryMinutes', 'pinnedResetOnRestart']).catch(() => ({}))
   ]);
   S.helper = ses.helper || null;
@@ -55,15 +56,25 @@ async function load() {
   S.appEverConnected = !!loc.appEverConnected;
   S.overlayEnabled = loc.overlayEnabled !== false;
   S.defaultBrowser = !!loc.defaultBrowser;
-  S.archiveMinutes = syn.archiveMinutes === undefined ? null : syn.archiveMinutes;
-  S.archiveGrouped = !!syn.archiveGrouped;
-  S.mergeOnClose = syn.mergeOnClose !== false;
-  S.pinnedReset = syn.pinnedResetOnRestart !== false;
-  S.sidebarColor = normSidebarColor(syn.sidebarColor);
+  // Every value here is the GLOBAL one: the app's cached copy (storage.local sharedSettings), else this profile's synced value.
+  const sh = loc.sharedSettings && typeof loc.sharedSettings === 'object' ? loc.sharedSettings : {};
+  const g = (k) => (sh[k] !== undefined ? sh[k] : syn[k]);
+  S.overrides = loc.profileOverrides && typeof loc.profileOverrides === 'object' ? loc.profileOverrides : {};
+  S.migrated = !!loc.sharedMigrated;
+  S.archiveGrouped = !!g('archiveGrouped');
+  S.mergeOnClose = g('mergeOnClose') !== false;
+  S.pinnedReset = g('pinnedResetOnRestart') !== false;
+  S.sidebarColor = normSidebarColor(g('sidebarColor'));
   S.ownStyle = syn.ownStyle || null;
-  S.littleStyle = syn.littleStyle === 'regular' ? 'regular' : 'minimal';
-  S.littleMaxOpen = Number.isFinite(Number(syn.littleMaxOpen)) && syn.littleMaxOpen !== undefined ? Math.min(5, Math.max(1, Math.round(Number(syn.littleMaxOpen)))) : 3;
-  S.temporaryMinutes = typeof syn.temporaryMinutes === 'number' && syn.temporaryMinutes >= 0 ? syn.temporaryMinutes : 360;
+  S.littleStyle = g('littleStyle') === 'regular' ? 'regular' : 'minimal';
+  S.littleMaxOpen = Number.isFinite(Number(g('littleMaxOpen'))) && g('littleMaxOpen') !== undefined ? Math.min(5, Math.max(1, Math.round(Number(g('littleMaxOpen'))))) : 3;
+  S.temporaryMinutes = typeof g('temporaryMinutes') === 'number' && g('temporaryMinutes') >= 0 ? g('temporaryMinutes') : 360;
+}
+// Every settings write is global: through the service worker to Stile.app (or straight to storage while it is away).
+async function setShared(values) {
+  const r = await cmd('setShared', { values });
+  if (!r || !r.ok) { toast((r && r.error) || 'Could not save the setting'); refresh(); }
+  return r;
 }
 const connected = () => !!(S.helper && S.helper.status === 'connected');
 const profiles = () => (connected() && S.helper.profiles) || [];
@@ -87,10 +98,10 @@ const NAV = [
   ['profiles', 'Profiles', '#5e5ce6', 'M12 4a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM4 20c0-4 3.6-6 8-6s8 2 8 6'],
   ['app', 'App', '#32d74b', 'M5 4h14a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zM4 9h16M8 6.5h.01']
 ];
-// What a section's settings apply to: every profile, one profile, or both (an app-wide row among per-profile ones).
-// Screenshots are app-owned (global) while Stile.app is connected, and per-profile storage otherwise.
-const SCOPE = { appearance: 'profile', tabs: 'mixed', windows: 'profile', little: 'mixed', screenshots: 'profile', boosts: 'profile', profiles: 'global', app: 'global' };
-const scopeOf = (id) => (id === 'screenshots' && connected() ? 'global' : SCOPE[id] || 'profile');
+// Every setting is global (one value for all profiles; Stile.app keeps it). The only per-profile values are the three tab
+// overrides, edited per profile on the Profiles page. So every pane shows the "All profiles" chip.
+const SCOPE = { appearance: 'global', tabs: 'global', windows: 'global', little: 'global', screenshots: 'global', boosts: 'global', profiles: 'global', app: 'global' };
+const scopeOf = (id) => SCOPE[id] || 'global';
 const svgOf = (d) => { const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); s.setAttribute('viewBox', '0 0 24 24'); s.setAttribute('fill', 'none'); s.setAttribute('stroke', 'currentColor'); s.setAttribute('stroke-width', '2'); s.setAttribute('stroke-linecap', 'round'); s.setAttribute('stroke-linejoin', 'round'); const p = document.createElementNS('http://www.w3.org/2000/svg', 'path'); p.setAttribute('d', d); s.append(p); return s; };
 
 const R = {};   // element refs by key
@@ -112,7 +123,6 @@ const seg = (testid, pairs, attr, onpick) => {
   return el;
 };
 const setSegPressed = (el, attr, v) => { for (const b of el.querySelectorAll('.seg-b')) b.setAttribute('aria-pressed', String(b.dataset[attr] === v)); };
-const syncSet = (obj) => chrome.storage.sync.set(obj).catch(() => {});
 function fillOptions(s, opts, cur) {
   const sig = JSON.stringify(opts);
   if (s.dataset.sig !== sig) { s.replaceChildren(...opts.map(([v, l]) => h('option', { value: v, text: l }))); s.dataset.sig = sig; }
@@ -152,27 +162,13 @@ sections.appearance = () => {
 
 sections.tabs = () => {
   const root = h('section', { 'data-testid': 'settings-section-tabs' });
-  const [pw, ps] = sel('settings-archive-profile', (v) => cmd('setProfileArchive', { minutes: v === '' ? null : Number(v) }));
   const [gw, gs] = sel('settings-archive-global', async (v) => { const r = await cmd('setGlobalArchive', { minutes: Number(v) }); if (!r || !r.ok) refresh(); });
-  R.archProfile = ps; R.archGlobal = gs;
-  R.archGrouped = sw('settings-archive-grouped', (v) => { S.archiveGrouped = v; syncSet({ archiveGrouped: v }); });
-  R.pinnedReset = sw('pinned-reset-on-restart', (v) => { S.pinnedReset = v; syncSet({ pinnedResetOnRestart: v }); });
-  R.applyAll = h('button', { type: 'button', class: 'btn', 'data-testid': 'archive-apply-all', text: 'Apply to all profiles', onclick: async () => {
-    const r = await cmd('clearArchiveOverrides');
-    if (!r || !r.ok) { toast((r && r.error) || 'Stile.app didn’t respond'); return; }
-    toast(`All profiles now use ${fmtMinutes(S.globalMinutes)}`);
-    refresh();
-  } });
-  R.profHead = groupHead('This profile');
+  R.archGlobal = gs;
+  R.archGrouped = sw('settings-archive-grouped', (v) => { S.archiveGrouped = v; setShared({ archiveGrouped: v }); });
+  R.pinnedReset = sw('pinned-reset-on-restart', (v) => { S.pinnedReset = v; setShared({ pinnedResetOnRestart: v }); });
   root.append(
-    groupHead('All profiles'),
     group(
-      setRow('Archive tabs after', 'Unused tabs move to the archive. Tabs in Favourites and Pinned are never archived.', gw, { key: 'globalRow' }),
-      setRow('Apply to all profiles', 'Clears every profile’s own setting so they all use this one.', R.applyAll, { key: 'applyRow' })
-    ),
-    R.profHead,
-    group(
-      setRow('Archive tabs after', 'Overrides the default for this profile only.', pw),
+      setRow('Archive tabs after', 'Unused tabs move to the archive. Tabs in Favourites and Pinned are never archived. A profile can use its own time: Profiles > pick a profile.', gw, { key: 'globalRow' }),
       setRow('Also archive tabs in groups', 'Tabs inside tab groups are kept by default, including when you press Clear.', R.archGrouped)
     ),
     groupHead('Pinned tabs'),
@@ -183,7 +179,7 @@ sections.tabs = () => {
 
 sections.windows = () => {
   const root = h('section', { 'data-testid': 'settings-section-windows' });
-  R.mergeOnClose = sw('settings-merge-on-close', (v) => { S.mergeOnClose = v; syncSet({ mergeOnClose: v }); });
+  R.mergeOnClose = sw('settings-merge-on-close', (v) => { S.mergeOnClose = v; setShared({ mergeOnClose: v }); });
   const [gbWrap, gbSel] = sel('green-button-action', (v) => appSetting('setGreenButtonAction', v));
   fillOptions(gbSel, [['full', 'Full screen'], ['fill', 'Fill screen']], 'full');
   R.greenSel = gbSel;
@@ -201,15 +197,12 @@ sections.little = () => {
     if (!r || !r.ok) toast((r && r.error) || 'Could not change the default browser');
     refresh();
   });
-  R.littleStyle = seg('little-style', [['minimal', 'Minimal'], ['regular', 'Regular']], 'style', (v) => { S.littleStyle = v; syncSet({ littleStyle: v }); drawLittle(); });
-  const [mw, ms] = sel('little-max-open', (v) => { S.littleMaxOpen = Number(v); syncSet({ littleMaxOpen: S.littleMaxOpen }); });
-  const [ew, es] = sel('temporary-expiry', (v) => { S.temporaryMinutes = Number(v); syncSet({ temporaryMinutes: S.temporaryMinutes }); });
+  R.littleStyle = seg('little-style', [['minimal', 'Minimal'], ['regular', 'Regular']], 'style', (v) => { S.littleStyle = v; setShared({ littleStyle: v }); drawLittle(); });
+  const [mw, ms] = sel('little-max-open', (v) => { S.littleMaxOpen = Number(v); setShared({ littleMaxOpen: S.littleMaxOpen }); });
+  const [ew, es] = sel('temporary-expiry', (v) => { S.temporaryMinutes = Number(v); setShared({ temporaryMinutes: S.temporaryMinutes }); });
   R.littleMax = ms; R.littleExpiry = es;
-  R.littleProfHead = groupHead('This profile');
   root.append(
-    groupHead('All profiles'),
     group(setRow('Open links from other apps in little windows', '', R.littleDefault, { descKey: 'littleDefaultHint', descTestid: 'little-default-hint', key: 'littleDefaultRow' })),
-    R.littleProfHead,
     group(
       setRow('Window style', '', R.littleStyle, { descKey: 'littleStyleHint' }),
       setRow('Keep open at most', 'Older little windows close, and their links stay in Temporary.', mw),
@@ -238,7 +231,7 @@ sections.boosts = () => {
 sections.profiles = () => {
   const root = h('section', { 'data-testid': 'settings-section-profiles' });
   R.pstyles = h('div', { class: 'group', 'data-testid': 'settings-profiles' });
-  root.append(h('p', { class: 'note', style: 'margin:6px 4px 10px', text: 'Pick an icon and colour for each Chrome profile. They show in the sidebar’s profile switcher.' }), R.pstyles);
+  root.append(h('p', { class: 'note', style: 'margin:6px 4px 10px', text: 'Pick an icon and colour for each Chrome profile. They show in the sidebar’s profile switcher. A profile can also use its own archive time and tab settings; everything else is shared.' }), R.pstyles);
   return root;
 };
 
@@ -314,7 +307,7 @@ function setSidebarColor(v, save = true) {
   S.sidebarColor = normSidebarColor(v);
   drawColour();
   clearTimeout(sbSaveTimer);
-  const persist = () => syncSet({ sidebarColor: S.sidebarColor });
+  const persist = () => setShared({ sidebarColor: S.sidebarColor });
   if (save) persist(); else sbSaveTimer = setTimeout(persist, 250);
 }
 function colourSource() {
@@ -339,8 +332,6 @@ function drawLittle() {
   const c = connected();
   R.littleDefault.checked = c && S.defaultBrowser;
   R.littleDefaultRow.hidden = !c;   // app-only: hidden until Stile.app is connected
-  const cp = currentProfile();
-  R.littleProfHead.textContent = cp && !cp.own ? cp.p.name || cp.dir : 'This profile';
   R.littleHotkey.hidden = !c;
   R.littleDefaultHint.textContent = 'Stile.app asks macOS to make it your default browser; links it can’t show go to Chrome as usual.';
   setSegPressed(R.littleStyle, 'style', S.littleStyle);
@@ -393,7 +384,36 @@ function styleEditor(en) {
   });
   return h('div', { class: 'style-editor', 'data-testid': 'style-editor', 'data-dir': en.dir },
     h('div', {}, h('p', { class: 'cap', text: 'Icon' }), h('div', { class: 'icon-grid' }, ...iconBtns)),
-    h('div', {}, h('p', { class: 'cap', text: 'Colour' }), h('div', { class: 'color-grid' }, ...colorBtns)));
+    h('div', {}, h('p', { class: 'cap', text: 'Colour' }), h('div', { class: 'color-grid' }, ...colorBtns)),
+    overrideBlock(en));
+}
+// The only per-profile settings: the three tab settings. Each is "Use global (<value>)" or an explicit value for this profile.
+const onOff = (v) => (v ? 'On' : 'Off');
+function overrideBlock(en) {
+  if (en.own || !connected() || !S.migrated) return null;
+  const ov = S.overrides[en.dir] || {};
+  const set = async (key, val) => {
+    const r = await cmd('setProfileOverride', { dir: en.dir, overrides: { [key]: val } });
+    if (!r || !r.ok) toast((r && r.error) || 'Could not save the override');
+    refresh();
+  };
+  const rowFor = (key, label, desc, testid, opts, globalLabel, parse) => {
+    const [w, s] = sel(testid, (v) => set(key, v === '' ? null : parse(v)));
+    s.dataset.dir = en.dir;
+    const cur = ov[key];
+    const all = [['', `Use global (${globalLabel})`], ...opts];
+    if (cur !== undefined && !all.some((o) => o[0] === String(cur))) all.push([String(cur), key === 'archiveMinutes' ? fmtMinutes(cur) : onOff(cur)]);
+    fillOptions(s, all, cur === undefined ? '' : String(cur));
+    return setRow(label, desc, w);
+  };
+  const bool = [['true', 'On'], ['false', 'Off']];
+  return h('div', { 'data-testid': 'profile-overrides', 'data-dir': en.dir },
+    h('p', { class: 'cap', text: 'Tabs & Archive for this profile' }),
+    group(
+      rowFor('archiveMinutes', 'Archive tabs after', '', 'profile-override-archive', ARCHIVE_CHOICES.map((v) => [String(v), fmtMinutes(v)]), fmtMinutes(S.globalMinutes), Number),
+      rowFor('archiveGrouped', 'Also archive tabs in groups', '', 'profile-override-grouped', bool, onOff(S.archiveGrouped), (v) => v === 'true'),
+      rowFor('pinnedResetOnRestart', 'Reset pinned tabs when Chrome restarts', '', 'profile-override-pinned', bool, onOff(S.pinnedReset), (v) => v === 'true')
+    ));
 }
 function drawProfiles() {
   const hs = S.helper;
@@ -465,45 +485,18 @@ function drawTroubleshoot() {
   R.curProfile.replaceChildren(cur && !cur.own ? avatarEl('span', cur.p, cur.style, { 'aria-hidden': 'true' }) : '');
 }
 
-// Pane header: which profile the section's settings apply to (a picker), or an "All profiles" chip.
+// Pane header: the "All profiles" chip (every section is global).
 function drawScope() {
   const box = $('pane-scope');
   const kind = scopeOf(current);
   box.dataset.kind = kind;
-  if (kind === 'global') { box.replaceChildren(h('span', { class: 'scope-chip', 'data-testid': 'settings-scope-global', text: 'All profiles' })); return; }
-  const ps = profiles();
-  const cur = currentProfile();
-  const dir = APP_HOST ? (S.scopeProfile || (S.helper && S.helper.currentProfileDir) || '') : (cur && !cur.own ? cur.dir : '');
-  if (!R.scopeSel) {
-    const [wrap, s] = sel('settings-scope', async (v) => {
-      if (!APP_HOST || !v || v === S.scopeProfile) return;
-      try { await native({ op: 'selectProfile', dir: v, section: current }); }
-      catch (e) { toast(String((e && e.message) || e)); drawScope(); }
-    });
-    s.setAttribute('aria-label', 'Settings for profile');
-    R.scopeSel = s; R.scopeAv = h('span', { class: 'scope-av' });
-    R.scopeBox = h('span', { class: 'scope-pick' }, h('span', { class: 'scope-lbl', text: 'Settings for' }), R.scopeAv, wrap);
-  }
-  const off = (p) => APP_HOST && !!S.connectedProfiles && !S.connectedProfiles.includes(p.dir) && p.dir !== dir;   // not open in Chrome (never the scoped one)
-  const list = APP_HOST ? ps : ps.filter((p) => p.dir === dir);
-  const opts = list.length ? list.map((p) => [p.dir, p.name + (p.email ? ` (${p.email})` : '') + (off(p) ? ' — not open in Chrome' : '')]) : [['', cur && !cur.own ? cur.p.name || cur.dir : 'This profile']];
-  fillOptions(R.scopeSel, opts, opts.some((o) => o[0] === dir) ? dir : opts[0][0]);
-  list.forEach((p, i) => { R.scopeSel.options[i].disabled = off(p); });
-  R.scopeSel.disabled = !APP_HOST;
-  R.scopeSel.title = APP_HOST ? '' : 'Open settings from Stile.app’s menu to switch profiles';
-  const sp = ps.find((p) => p.dir === dir);
-  R.scopeAv.replaceChildren(sp ? avatarEl('span', sp, resolveStyle(sp), { 'aria-hidden': 'true' }) : '');
-  box.replaceChildren(R.scopeBox);
+  box.replaceChildren(h('span', { class: 'scope-chip', 'data-testid': 'settings-scope-global', text: 'All profiles' }));
 }
 
 function drawTabs() {
   const c = connected();
-  fillOptions(R.archProfile, [['', `Use default (${fmtMinutes(S.globalMinutes)})`], ...ARCHIVE_CHOICES.map((v) => [String(v), fmtMinutes(v)])].concat(
-    S.archiveMinutes !== null && !ARCHIVE_CHOICES.includes(S.archiveMinutes) ? [[String(S.archiveMinutes), fmtMinutes(S.archiveMinutes)]] : []), S.archiveMinutes === null ? '' : S.archiveMinutes);
   fillOptions(R.archGlobal, ARCHIVE_CHOICES.map((v) => [String(v), fmtMinutes(v)]).concat(ARCHIVE_CHOICES.includes(S.globalMinutes) ? [] : [[String(S.globalMinutes), fmtMinutes(S.globalMinutes)]]), S.globalMinutes);
-  R.globalRow.hidden = !c; R.applyRow.hidden = !c;   // app-only: the shared default lives in Stile.app
-  const cur = currentProfile();
-  R.profHead.textContent = cur && !cur.own ? cur.p.name || cur.dir : 'This profile';
+  R.globalRow.hidden = !c;   // app-only: the archive default lives in Stile.app
   R.archGrouped.checked = S.archiveGrouped;
   R.pinnedReset.checked = S.pinnedReset;
   R.mergeOnClose.checked = S.mergeOnClose;
@@ -592,7 +585,7 @@ async function init() {
     const keys = Object.keys(ch);
     const rel = {
       session: ['helper', 'appState'],
-      local: ['globalDefaultMinutes', 'overlayEnabled', 'defaultBrowser', 'appEverConnected'],
+      local: ['globalDefaultMinutes', 'overlayEnabled', 'defaultBrowser', 'appEverConnected', 'sharedSettings', 'profileOverrides', 'sharedMigrated'],
       sync: ['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'littleStyle', 'littleMaxOpen', 'temporaryMinutes', 'pinnedResetOnRestart', 'sidebarColor']
     }[area];
     if (rel && keys.some((k) => rel.includes(k))) refresh();

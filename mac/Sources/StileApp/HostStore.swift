@@ -309,7 +309,104 @@ enum HostStore {
         ["archiveDefaultMinutes": validMinutes(st["archiveDefaultMinutes"]) ?? 720,
          "overlayEnabled": overlayEnabled(from: st),
          // v2.8: little links are on AND this app really is the default http(s) handler.
-         "defaultBrowser": LittleLinks.enabled(in: st) && LittleLinks.isDefaultHandler()]
+         "defaultBrowser": LittleLinks.enabled(in: st) && LittleLinks.isDefaultHandler(),
+         // global settings: NSNull = never seeded (the extension must not overwrite its own values then)
+         "shared": sharedFrom(st) ?? NSNull(),
+         "profileOverrides": (st["profileOverrides"] as? [String: Any]) ?? [:]]
+    }
+
+    // MARK: global settings (state.json `shared`, `profileOverrides`)
+
+    private static func number(_ v: Any?) -> Double? {
+        guard let n = v as? NSNumber, !isBool(n) else { return nil }
+        return n.doubleValue
+    }
+
+    /// Allow-listed shared keys: validator and default. Unknown keys are dropped.
+    static let sharedKeys: [String: (ok: (Any?) -> Bool, def: () -> Any)] = [
+        "sidebarColor": ({ v in
+            guard let d = v as? [String: Any], let mode = d["mode"] as? String else { return false }
+            if mode == "auto" { return true }
+            if mode == "custom", let c = d["color"] as? String { return validHexColor(c) }
+            return false
+        }, { ["mode": "auto"] as [String: Any] }),
+        "archiveGrouped": ({ isBool($0) }, { false }),
+        "pinnedResetOnRestart": ({ isBool($0) }, { true }),
+        "mergeOnClose": ({ isBool($0) }, { true }),
+        "littleStyle": ({ ($0 as? String).map { $0 == "minimal" || $0 == "regular" } ?? false }, { "minimal" }),
+        "littleMaxOpen": ({ v in number(v).map { $0 == $0.rounded() && $0 >= 1 && $0 <= 5 } ?? false }, { 3 }),
+        "temporaryMinutes": ({ v in number(v).map { $0.isFinite && $0 >= 0 } ?? false }, { 360 }),
+        "captureAfter": ({ ($0 as? String).map { ["editor", "thumbnail", "copy"].contains($0) } ?? false }, { "editor" }),
+        "captureAnnotate": ({ isBool($0) }, { true }),
+        "captureAskWhere": ({ isBool($0) }, { false }),
+        "boosts": ({ $0 is [String: Any] }, { [String: Any]() }),
+    ]
+
+    /// The shared dict with defaults filled in, or nil when state.json was never seeded.
+    static func sharedFrom(_ st: [String: Any]) -> [String: Any]? {
+        guard let raw = st["shared"] as? [String: Any] else { return nil }
+        var out: [String: Any] = [:]
+        for (k, d) in sharedKeys { out[k] = (raw[k] != nil && d.ok(raw[k])) ? raw[k]! : d.def() }
+        return out
+    }
+
+    /// First key whose value is invalid, or nil. `values` may carry unknown keys (ignored).
+    static func invalidSharedKey(_ values: [String: Any]) -> String? {
+        for (k, d) in sharedKeys.sorted(by: { $0.key < $1.key }) {
+            if let v = values[k], !d.ok(v) { return k }
+        }
+        return nil
+    }
+
+    /// Migration: the first caller seeds `shared` from its own values (invalid ones dropped); later callers change nothing.
+    static func seedShared(_ values: [String: Any]) -> (seeded: Bool, settings: [String: Any]) {
+        var st = readState()
+        if st["shared"] is [String: Any] { return (false, settings(from: st)) }
+        var sh: [String: Any] = [:]
+        for (k, d) in sharedKeys { if let v = values[k], d.ok(v) { sh[k] = v } }
+        st["shared"] = sh
+        writeState(st)
+        return (true, settings(from: st))
+    }
+
+    /// Merge allow-listed keys into `shared` (creating it); the caller validated with invalidSharedKey.
+    static func mergeShared(_ values: [String: Any]) -> [String: Any] {
+        var st = readState()
+        var sh = (st["shared"] as? [String: Any]) ?? [:]
+        for k in sharedKeys.keys { if let v = values[k] { sh[k] = v } }
+        st["shared"] = sh
+        writeState(st)
+        return settings(from: st)
+    }
+
+    /// Per-profile override keys (the three tab settings). Returns an error text, or nil after storing.
+    /// A null value removes the key ("Use global"); a profile left empty is removed.
+    static func setProfileOverride(dir: Any?, overrides: Any?) -> (error: String?, settings: [String: Any]) {
+        func bad(_ e: String) -> (error: String?, settings: [String: Any]) { (e, currentSettings()) }
+        guard let dir = dir as? String, !dir.isEmpty, dir != "__proto__" else { return bad("invalid dir") }
+        guard let ov = overrides as? [String: Any] else { return bad("invalid overrides") }
+        var set: [String: Any] = [:]
+        var remove: [String] = []
+        for k in ["archiveMinutes", "archiveGrouped", "pinnedResetOnRestart"] {
+            guard let v = ov[k] else { continue }
+            if v is NSNull { remove.append(k); continue }
+            if k == "archiveMinutes" {
+                guard let n = validMinutes(v) else { return bad("invalid \(k)") }
+                set[k] = n
+            } else {
+                guard isBool(v) else { return bad("invalid \(k)") }
+                set[k] = v
+            }
+        }
+        var st = readState()
+        var all = (st["profileOverrides"] as? [String: Any]) ?? [:]
+        var cur = (all[dir] as? [String: Any]) ?? [:]
+        for k in remove { cur.removeValue(forKey: k) }
+        for (k, v) in set { cur[k] = v }
+        if cur.isEmpty { all.removeValue(forKey: dir) } else { all[dir] = cur }
+        st["profileOverrides"] = all
+        writeState(st)
+        return (nil, settings(from: st))
     }
 
     /// Global on/off for the overlay (v2.7); anything but an explicit `false` means on.

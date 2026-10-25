@@ -50,6 +50,29 @@ function validMinutes(v) {
   return (typeof v === 'number' && Number.isInteger(v) && v >= 0) || (typeof v === 'string' && /^\d+$/.test(v));
 }
 
+// Global settings (state.json `shared`): allow-listed keys, their validators and defaults. Unknown keys are dropped.
+const isBool = (v) => typeof v === 'boolean';
+const isOneOf = (...a) => (v) => a.includes(v);
+const SHARED_KEYS = {
+  sidebarColor: { ok: (v) => isObject(v) && (v.mode === 'auto' || (v.mode === 'custom' && typeof v.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(v.color))), def: () => ({ mode: 'auto' }) },
+  archiveGrouped: { ok: isBool, def: () => false },
+  pinnedResetOnRestart: { ok: isBool, def: () => true },
+  mergeOnClose: { ok: isBool, def: () => true },
+  littleStyle: { ok: isOneOf('minimal', 'regular'), def: () => 'minimal' },
+  littleMaxOpen: { ok: (v) => Number.isInteger(v) && v >= 1 && v <= 5, def: () => 3 },
+  temporaryMinutes: { ok: (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0, def: () => 360 },
+  captureAfter: { ok: isOneOf('editor', 'thumbnail', 'copy'), def: () => 'editor' },
+  captureAnnotate: { ok: isBool, def: () => true },
+  captureAskWhere: { ok: isBool, def: () => false },
+  boosts: { ok: isObject, def: () => ({}) },
+};
+// Per-profile overrides (state.json `profileOverrides[dir]`): only the three tab settings; null removes a key.
+const OVERRIDE_KEYS = {
+  archiveMinutes: { ok: validMinutes, norm: Number },
+  archiveGrouped: { ok: isBool },
+  pinnedResetOnRestart: { ok: isBool },
+};
+
 function cleanStyle(s) {
   if (!isObject(s)) return null;
   if (typeof s.icon !== 'string' || !ICONS.has(s.icon)) return null;
@@ -235,6 +258,7 @@ class HostServer extends EventEmitter {
     const handlers = {
       hello: this.doHello, identify: this.doIdentify, getProfiles: this.doGetProfiles,
       setProfileStyle: this.doSetStyle, switchProfile: this.doSwitch, setGlobalSettings: this.doSetSettings, setOverlayEnabled: this.doSetOverlayEnabled, setDefaultBrowser: this.doSetDefaultBrowser,
+      seedSharedSettings: this.doSeedShared, setSharedSettings: this.doSetShared, setProfileOverride: this.doSetProfileOverride,
       showSettings: this.doShowSettings, clearArchiveOverrides: this.doClearArchiveOverrides,
       appSetting: this.doAppSetting, getAppState: this.doGetAppState, getCaptureSettings: this.doGetCaptureSettings,
       captureConfig: this.doCaptureConfig, openCaptureEditor: this.doOpenCaptureEditor,
@@ -293,7 +317,17 @@ class HostServer extends EventEmitter {
       overlayEnabled: st.overlayEnabled !== false,
       // v2.8: the app's view of "little links on AND we are the default http handler" (the reference host has no OS to ask: just the stored flag)
       defaultBrowser: st.littleLinksEnabled === true,
+      // global settings: null = never seeded (the extension must not overwrite its own values then)
+      shared: this.sharedFrom(st),
+      profileOverrides: isObject(st.profileOverrides) ? st.profileOverrides : {},
     };
+  }
+
+  sharedFrom(st) {
+    if (!isObject(st.shared)) return null;
+    const out = {};
+    for (const [k, d] of Object.entries(SHARED_KEYS)) out[k] = Object.hasOwn(st.shared, k) && d.ok(st.shared[k]) ? st.shared[k] : d.def();
+    return out;
   }
 
   /** First launch: take over the Perl helper's state.json (settings and profile styles). */
@@ -444,6 +478,56 @@ class HostServer extends EventEmitter {
     }
     const st = this.updateState((state) => {
       if ('archiveDefaultMinutes' in s) state.archiveDefaultMinutes = Number(s.archiveDefaultMinutes);
+    });
+    const settings = this.settingsFrom(st);
+    this.broadcast({ type: 'settings', settings }, conn);
+    this.reply(conn, m, { type: 'settings', settings });
+  }
+
+  // Migration: the first extension to arrive seeds the global settings from its own values (invalid ones are dropped); later callers change nothing.
+  doSeedShared(conn, m) {
+    const v = isObject(m.values) ? m.values : {};
+    let seeded = false;
+    const st = this.updateState((state) => {
+      if (isObject(state.shared)) return;
+      seeded = true;
+      state.shared = {};
+      for (const [k, d] of Object.entries(SHARED_KEYS)) if (Object.hasOwn(v, k) && d.ok(v[k])) state.shared[k] = v[k];
+    });
+    const settings = this.settingsFrom(st);
+    if (seeded) this.broadcast({ type: 'settings', settings }, conn);
+    this.reply(conn, m, { type: 'settings', seeded, settings });
+  }
+
+  doSetShared(conn, m) {
+    const v = isObject(m.values) ? m.values : {};
+    for (const [k, d] of Object.entries(SHARED_KEYS)) {
+      if (Object.hasOwn(v, k) && !d.ok(v[k])) return this.reply(conn, m, { type: 'settings', settings: this.settingsFrom(this.readState()), error: `invalid ${k}` });
+    }
+    const st = this.updateState((state) => {
+      if (!isObject(state.shared)) state.shared = {};
+      for (const k of Object.keys(SHARED_KEYS)) if (Object.hasOwn(v, k)) state.shared[k] = v[k];
+    });
+    const settings = this.settingsFrom(st);
+    this.broadcast({ type: 'settings', settings }, conn);
+    this.reply(conn, m, { type: 'settings', settings });
+  }
+
+  doSetProfileOverride(conn, m) {
+    const bad = (error) => this.reply(conn, m, { type: 'settings', settings: this.settingsFrom(this.readState()), error });
+    if (typeof m.dir !== 'string' || !m.dir || m.dir === '__proto__') return bad('invalid dir');
+    if (!isObject(m.overrides)) return bad('invalid overrides');
+    for (const [k, d] of Object.entries(OVERRIDE_KEYS)) {
+      if (Object.hasOwn(m.overrides, k) && m.overrides[k] !== null && !d.ok(m.overrides[k])) return bad(`invalid ${k}`);
+    }
+    const st = this.updateState((state) => {
+      if (!isObject(state.profileOverrides)) state.profileOverrides = {};
+      const cur = isObject(state.profileOverrides[m.dir]) ? state.profileOverrides[m.dir] : {};
+      for (const [k, d] of Object.entries(OVERRIDE_KEYS)) {
+        if (!Object.hasOwn(m.overrides, k)) continue;
+        if (m.overrides[k] === null) delete cur[k]; else cur[k] = d.norm ? d.norm(m.overrides[k]) : m.overrides[k];
+      }
+      if (Object.keys(cur).length) state.profileOverrides[m.dir] = cur; else delete state.profileOverrides[m.dir];
     });
     const settings = this.settingsFrom(st);
     this.broadcast({ type: 'settings', settings }, conn);
