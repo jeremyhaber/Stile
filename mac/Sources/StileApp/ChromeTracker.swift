@@ -33,6 +33,8 @@ final class ChromeTracker {
     static let bundleID = "com.google.Chrome"
 
     var onUpdate: (() -> Void)?
+    /// Chrome's keyboard focus moved (e.g. ⌘L into the address field). No window refresh: it fires on every click.
+    var onFocusedElementChanged: (() -> Void)?
 
     private(set) var windows: [ChromeWindow] = []
     private(set) var chromeFrontmost = false
@@ -108,7 +110,10 @@ final class ChromeTracker {
     private func attach(_ newPid: pid_t) {
         detach()
         pid = newPid
-        appElement = AXUIElementCreateApplication(newPid)
+        let app = AXUIElementCreateApplication(newPid)
+        // A busy Chrome must not block the main thread for the default 6 s per AX call.
+        AXUIElementSetMessagingTimeout(app, 0.25)
+        appElement = app
         setupObserver()
         Log.write("tracker: attached to Chrome pid \(newPid)")
     }
@@ -132,7 +137,7 @@ final class ChromeTracker {
         let err = AXObserverCreate(pid, axObserverCallback, &obs)
         guard err == .success, let created = obs else { return }
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        for n in [AXName.windowCreated, AXName.focusedWindowChanged] {
+        for n in [AXName.windowCreated, AXName.focusedWindowChanged, AXName.focusedUIElementChanged] {
             _ = AXObserverAddNotification(created, app, n as CFString, refcon)
         }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
@@ -151,6 +156,10 @@ final class ChromeTracker {
     }
 
     fileprivate func axNotification(_ name: String) {
+        if name == AXName.focusedUIElementChanged {
+            onFocusedElementChanged?()
+            return
+        }
         if name == AXName.moved || name == AXName.resized {
             lastGeometryEvent = Date()
         }
@@ -170,12 +179,17 @@ final class ChromeTracker {
             if let n = info["kCGWindowNumber"] as? NSNumber { onScreenIDs.insert(CGWindowID(n.uint32Value)) }
         }
 
+        // Chrome can miss the 0.25 s AX timeout mid-animation (full screen above all). A failed read keeps the
+        // last known windows: dropping them tears the overlays down and rebuilds them from scratch.
+        guard let elements = AX.children(app, AXName.windows) else { return }
         var list: [ChromeWindow] = []
-        let elements = AX.children(app, AXName.windows) ?? []
         for el in elements {
             if let sub = AX.string(el, AXName.subrole), sub != "AXStandardWindow" { continue }
-            guard let frame = AX.frame(el) else { continue }
             let key = AX.windowKey(el)
+            guard let frame = AX.frame(el) else {
+                if let old = windows.first(where: { $0.key == key }) { list.append(old) }
+                continue
+            }
             var cg = AX.cgWindowID(el)
             let minimized = AX.bool(el, AXName.minimized) ?? false
             let fullscreen = AX.bool(el, AXName.fullScreen) ?? false

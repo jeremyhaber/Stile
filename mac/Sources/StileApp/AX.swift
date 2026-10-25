@@ -17,6 +17,8 @@ enum AXName {
     static let fullScreen = "AXFullScreen"
     static let closeButton = "AXCloseButton"
     static let zoomButton = "AXZoomButton"
+    static let minimizeButton = "AXMinimizeButton"
+    static let fullScreenButton = "AXFullScreenButton"
     static let main = "AXMain"
     static let focusedWindow = "AXFocusedWindow"
     static let axTitle = "AXTitle"
@@ -31,14 +33,33 @@ enum AXName {
     static let moved = "AXMoved"
     static let resized = "AXResized"
     static let focusedWindowChanged = "AXFocusedWindowChanged"
+    static let focusedUIElementChanged = "AXFocusedUIElementChanged"
     static let windowMiniaturized = "AXWindowMiniaturized"
     static let windowDeminiaturized = "AXWindowDeminiaturized"
 }
 
 enum AX {
+    private static let timeoutLock = NSLock()
+    private static var timeoutCount = 0
+    private static var timeoutLogged = 0
+
+    /// Counts calls that failed with `cannotComplete` (typically the messaging timeout on a busy Chrome); logs
+    /// when they repeat, at most every 50 occurrences.
+    private static func noteFailure(_ err: AXError, _ attr: String) {
+        guard err == .cannotComplete else { return }
+        timeoutLock.lock()
+        timeoutCount += 1
+        let n = timeoutCount
+        let shouldLog = n >= 5 && n - timeoutLogged >= 50 || (n == 5 && timeoutLogged == 0)
+        if shouldLog { timeoutLogged = n }
+        timeoutLock.unlock()
+        if shouldLog { Log.write("ax: \(n) calls failed with cannotComplete so far (Chrome busy / 0.25 s timeout?), last '\(attr)'") }
+    }
+
     static func copy(_ el: AXUIElement, _ attr: String) -> CFTypeRef? {
         var value: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(el, attr as CFString, &value)
+        if err != .success { noteFailure(err, attr) }
         return err == .success ? value : nil
     }
 

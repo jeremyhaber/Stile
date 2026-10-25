@@ -3,20 +3,22 @@ import Foundation
 import ServiceManagement
 
 extension Notification.Name {
-    static let sidebarSettingsChanged = Notification.Name("ca.simplistics.sidebar.settingsChanged")
-    static let sidebarBridgesChanged = Notification.Name("ca.simplistics.sidebar.bridgesChanged")
+    static let sidebarSettingsChanged = Notification.Name("ca.simplistics.stile.settingsChanged")
+    static let sidebarBridgesChanged = Notification.Name("ca.simplistics.stile.bridgesChanged")
     /// v3.0: open the permissions window (page host message or `appSetting` `reviewPermissions`).
-    static let sidebarReviewPermissions = Notification.Name("ca.simplistics.sidebar.reviewPermissions")
+    static let sidebarReviewPermissions = Notification.Name("ca.simplistics.stile.reviewPermissions")
+    /// Turn on Chrome's vertical tabs (page host message `setUpChrome`).
+    static let sidebarSetUpChrome = Notification.Name("ca.simplistics.stile.setUpChrome")
 }
 
-// MARK: - Logging (~/Library/Logs/Sidebar.log, rotated at 1 MB)
+// MARK: - Logging (~/Library/Logs/Stile.log, rotated at 1 MB)
 
 enum Log {
-    private static let queue = DispatchQueue(label: "ca.simplistics.sidebar.log")
+    private static let queue = DispatchQueue(label: "ca.simplistics.stile.log")
     private static let maxBytes = 1_000_000
 
     private static var fileURL: URL {
-        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Logs/Sidebar.log")
+        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Logs/Stile.log")
     }
 
     static func write(_ message: String) {
@@ -91,7 +93,22 @@ extension Settings {
         }
     }
 
-    /// v2.9: Sidebar.app moves/resizes Chrome's window itself during a toolbar drag or edge resize (default on).
+    /// v3.1: what the header's green button does on a plain click: "full" (macOS full screen) or "fill".
+    static var greenButtonAction: String {
+        get { UserDefaults.standard.string(forKey: "greenButtonAction") == "fill" ? "fill" : "full" }
+        set {
+            UserDefaults.standard.set(newValue == "fill" ? "fill" : "full", forKey: "greenButtonAction")
+            post()
+        }
+    }
+
+    /// v3.1: the one-time "green button now fills" note has not been shown yet (set by the full-screen fallback).
+    static var greenButtonNotePending: Bool {
+        get { UserDefaults.standard.bool(forKey: "greenButtonNotePending") }
+        set { UserDefaults.standard.set(newValue, forKey: "greenButtonNotePending") }
+    }
+
+    /// v2.9: Stile.app moves/resizes Chrome's window itself during a toolbar drag or edge resize (default on).
     static var lockstepDrag: Bool {
         get { UserDefaults.standard.bool(forKey: "lockstepDrag") }   // opt-in (default off) until proven on more setups
         set {

@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Build Stile.app (release), bundle the web UI and the extension folder, ad-hoc sign, zip to mac/dist/Stile.zip.
+# Build Stile.app (release), bundle the web UI and the extension folder, sign, zip to mac/dist/Stile.zip.
 # Set UNIVERSAL=1 for an arm64+x86_64 binary. Set VERSION=x.y.z to override the version string.
+# Signing: SIGN_IDENTITY="<name>" picks a code-signing certificate; unset, the first valid one in the keychain is used,
+# else ad-hoc. A certificate keeps the app's identity stable across rebuilds, so macOS keeps its Accessibility grant.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXT="$(cd "$HERE/../extension" && pwd)"
 DIST="$HERE/dist"
 APP="$DIST/Stile.app"
-VERSION="${VERSION:-2.1.0}"
+VERSION="${VERSION:-3.3.0}"
 BUILD="${GITHUB_RUN_NUMBER:-1}"
 
 # Files that must exist in extension/ (the web UI copied to Contents/Resources/web is every top-level
@@ -51,8 +53,22 @@ rm -rf "$APP/Contents/Resources/extension"
 cp -R "$EXT" "$APP/Contents/Resources/extension"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-codesign --force --deep -s - "$APP"
+IDENTITY="${SIGN_IDENTITY:-}"
+if [ -z "$IDENTITY" ]; then
+  IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/^ *[0-9]+\)/ { print $2; exit }')"
+fi
+if [ -n "$IDENTITY" ]; then
+  echo "Signing with: $IDENTITY"
+  codesign --force --deep -s "$IDENTITY" "$APP"
+else
+  echo "Signing ad-hoc (no code-signing certificate found; Accessibility must be re-granted after each build)"
+  codesign --force --deep -s - "$APP"
+fi
 codesign --verify --deep --strict "$APP"
+# The bundle was replaced in place: have Launch Services re-read it (icon shown in System Settings, Finder).
+touch "$APP"
+LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+[ -x "$LSREG" ] && "$LSREG" -f "$APP" || true
 
 (cd "$DIST" && ditto -c -k --keepParent Stile.app Stile.zip)
 echo "Built $APP"

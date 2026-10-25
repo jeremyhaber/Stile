@@ -12,16 +12,16 @@ import os from 'os';
 import http from 'http';
 import { execFileSync } from 'child_process';
 const require = createRequire(import.meta.url);
-const { chromium } = require('/opt/npm-tools/node_modules/playwright');
+const { chromium } = require(process.env.PLAYWRIGHT_PATH || 'playwright');
 const { HostServer, writeHostManifest } = require('./fake-app/host-server.js');
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const EXT = path.join(ROOT, 'extension');
-// The page is served from the same web root Sidebar.app ships (mac/copy-web.sh), not the raw extension folder,
+// The page is served from the same web root Stile.app ships (mac/copy-web.sh), not the raw extension folder,
 // so a file missing from the app bundle fails here too.
 const WEB = fs.mkdtempSync(path.join(os.tmpdir(), 'sbweb-')) + '/web';
 execFileSync('bash', [path.join(ROOT, 'mac/copy-web.sh'), EXT, WEB]);
-const SHOTS = process.env.V3_SHOTS || '/tmp/claude-0/-home-claude/e0605526-dcdb-5d20-aaac-918c6d6e8268/scratchpad/v3-shots';
+const SHOTS = process.env.V3_SHOTS || path.join(os.tmpdir(), 'v3-shots');
 fs.mkdirSync(SHOTS, { recursive: true });
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbov-'));
 const udd = path.join(tmp, 'udd');

@@ -51,6 +51,12 @@ final class WindowMapper {
             && abs(w - Double(f.width)) <= tolerance && abs(h - Double(f.height)) <= tolerance
     }
 
+    private func center(_ dict: [String: Any]) -> CGPoint? {
+        guard let l = JSONUtil.double(dict["left"]), let t = JSONUtil.double(dict["top"]),
+              let w = JSONUtil.double(dict["width"]), let h = JSONUtil.double(dict["height"]) else { return nil }
+        return CGPoint(x: l + w / 2, y: t + h / 2)
+    }
+
     private func finish(generation gen: Int, windows wins: [ChromeWindow],
                         lists: [(ProfileBridge, [[String: Any]])]) {
         guard gen == generation else { return }
@@ -74,7 +80,7 @@ final class WindowMapper {
         }
 
         // 2. Match the rest by bounds.
-        for w in wins.sorted(by: { $0.key < $1.key }) where newMap[w.key] == nil && !w.minimized && !w.fullscreen {
+        for w in wins.sorted(by: { $0.key < $1.key }) where newMap[w.key] == nil && !w.minimized {
             var found: Mapping?
             outer: for (bridge, arr) in lists {
                 for d in arr {
@@ -84,6 +90,19 @@ final class WindowMapper {
                         break outer
                     }
                 }
+            }
+            // Full screen: Chrome's reported bounds can lag the AX frame, so accept the one unused
+            // full-screen window centred on the same screen area.
+            if found == nil, w.fullscreen {
+                var cands: [Mapping] = []
+                for (bridge, arr) in lists {
+                    for d in arr where (d["state"] as? String) == "fullscreen" {
+                        guard let wid = JSONUtil.int(d["id"]), !used.contains(tag(bridge, wid)),
+                              let c = center(d), w.frame.contains(c) else { continue }
+                        cands.append(Mapping(bridge: bridge, windowId: wid))
+                    }
+                }
+                if cands.count == 1 { found = cands[0] }
             }
             if let f = found {
                 newMap[w.key] = f

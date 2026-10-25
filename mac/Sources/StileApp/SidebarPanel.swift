@@ -34,6 +34,9 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     /// Holds the web view at the expanded width; the panel's own frame clips it to the visible strip.
     let container = NSView(frame: .zero)
     let shadowStrip = NSView(frame: .zero)
+    /// Full screen: a strip above the content (`topInset` tall) painted in Chrome's toolbar colour while its toolbar is
+    /// out, so the first frame of a slide up never shows Chrome's rail; clear otherwise.
+    let topStrip = NSView(frame: .zero)
     /// 1 px line at the panel's right edge while peeking.
     let hairline = NSView(frame: .zero)
     private var shadowIsDark: Bool?
@@ -57,7 +60,7 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         config.userContentController = ucc
         userContent = ucc
         config.setURLSchemeHandler(SidebarPanel.schemeHandler, forURLScheme: "sidebar")
-        webView = WKWebView(frame: .zero, configuration: config)
+        webView = FirstMouseWebView(frame: .zero, configuration: config)
 
         super.init(contentRect: NSRect(x: 0, y: 0, width: 280, height: 600),
                    styleMask: [.borderless, .nonactivatingPanel],
@@ -67,7 +70,7 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         hidesOnDeactivate = false
         isFloatingPanel = false
         level = .normal
-        collectionBehavior = [.managed, .ignoresCycle]
+        collectionBehavior = [.managed, .fullScreenAuxiliary, .ignoresCycle]
         isOpaque = false
         backgroundColor = .clear
         hasShadow = false
@@ -88,6 +91,8 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         container.layer?.masksToBounds = true
         container.autoresizingMask = [.height]
         root.addSubview(container)
+        topStrip.wantsLayer = true
+        root.addSubview(topStrip)
 
         shadowStrip.wantsLayer = true
         let gradient = CAGradientLayer()
@@ -146,14 +151,16 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
             pressedHere = true
             onPanelMouseDown?()
             super.sendEvent(event)
-            // The page reports `editing` asynchronously after focus moves; check once it settled.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                guard let self = self, !self.isEditing else { return }
-                self.onNonEditingClick?()
-            }
             return
         case .leftMouseUp:
             pressedHere = false
+            super.sendEvent(event)
+            // The page reports `editing` asynchronously after focus moves; check once it settled.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                guard let self = self, !self.isEditing, !self.pressedHere else { return }
+                self.onNonEditingClick?()
+            }
+            return
         case .keyDown, .keyUp, .flagsChanged:
             if forwardKey(event) { return }
         default:
@@ -204,16 +211,64 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     /// Lay the content out. `panelWidth` is the visible strip (the panel itself clips anything wider),
     /// `contentWidth` is the web view's width: the target expanded width, so collapsed is just the same
     /// layout clipped to the rail. `shadow` is the transparent shadow strip right of the content (peek only).
+    /// How far the panel runs off the bottom of the screen (full screen, toolbar out: the panel keeps its height so a
+    /// toolbar slide only ever moves it). The web view and its edges stop above it; the container's fill covers it.
+    var bottomOverflow: CGFloat = 0
+    /// Height of `topStrip` at the top of the panel (full screen only).
+    var topInset: CGFloat = 0
+    private var topStripColor: NSColor?
+
+    private var hole: NSRect?
+    private var holeBounds: NSRect = .zero
+
+    /// Makes `rect` (panel coordinates) transparent, which also lets clicks through to the window under it; nil clears.
+    func setHole(_ rect: NSRect?) {
+        let r = rect.map { $0.intersection(root.bounds) }.flatMap { $0.isEmpty ? nil : $0 }
+        if r == hole, r == nil || root.bounds == holeBounds { return }
+        hole = r
+        holeBounds = root.bounds
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if let r {
+            let mask = CAShapeLayer()
+            mask.frame = root.bounds
+            let path = CGMutablePath()
+            path.addRect(root.bounds)
+            path.addRect(r)
+            mask.path = path
+            mask.fillRule = .evenOdd
+            root.layer?.mask = mask
+        } else {
+            root.layer?.mask = nil
+        }
+        CATransaction.commit()
+    }
+
+    func setTopStrip(_ color: NSColor?) {
+        if color == topStripColor { return }
+        topStripColor = color
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        topStrip.layer?.backgroundColor = color?.cgColor
+        CATransaction.commit()
+    }
+
     func fitContent(panelWidth: CGFloat, contentWidth: CGFloat, shadow: CGFloat = 0) {
-        let h = root.bounds.height
+        let total = root.bounds.height
+        let top = min(max(0, topInset), total)
+        let full = total - top
+        let y = min(max(0, bottomOverflow), full)
+        let h = full - y
         let cw = max(contentWidth, panelWidth)
-        container.frame = NSRect(x: 0, y: 0, width: cw, height: h)
-        webView.frame = NSRect(x: 0, y: 0, width: cw, height: h)
-        handle.frame = NSRect(x: max(0, panelWidth - 6), y: 0, width: 6, height: h)
+        topStrip.isHidden = top <= 0
+        topStrip.frame = NSRect(x: 0, y: full, width: panelWidth, height: top)
+        container.frame = NSRect(x: 0, y: 0, width: cw, height: full)
+        webView.frame = NSRect(x: 0, y: y, width: cw, height: h)
+        handle.frame = NSRect(x: max(0, panelWidth - 6), y: y, width: 6, height: h)
         shadowStrip.isHidden = shadow <= 0
-        shadowStrip.frame = NSRect(x: panelWidth, y: 0, width: max(shadow, 0), height: h)
+        shadowStrip.frame = NSRect(x: panelWidth, y: y, width: max(shadow, 0), height: h)
         hairline.isHidden = shadow <= 0
-        hairline.frame = NSRect(x: max(0, panelWidth - 1), y: 0, width: 1, height: h)
+        hairline.frame = NSRect(x: max(0, panelWidth - 1), y: y, width: 1, height: h)
         if shadow > 0 { updateShadowColors() }
     }
 
@@ -228,6 +283,12 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         }
         let text: NSColor = dark ? .white : .black
         hairline.layer?.backgroundColor = text.withAlphaComponent(0.08).cgColor
+    }
+
+    /// Painted behind the (transparent) web view. When the panel grows, WebKit paints the new strip a few frames
+    /// late; without a fill, whatever is under the panel shows through until then.
+    var fill: NSColor? {
+        didSet { container.layer?.backgroundColor = fill?.cgColor }
     }
 
     /// Square corners everywhere, except the bottom-left one when the panel sits in the corner of
@@ -253,7 +314,7 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         webView.loadHTMLString(html, baseURL: nil)
     }
 
-    /// The "Add the Sidebar extension to this profile" card.
+    /// The "Add the Stile extension to this profile" card.
     func showSetup(candidates: [(dir: String, name: String)]) {
         let key = "setup:" + candidates.map { $0.dir }.joined(separator: ",")
         if loadedKey == key { return }
@@ -308,7 +369,7 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
             let rawId = obj["id"] ?? NSNull()
             guard let b = bridge, !b.closed else {
                 let reply: [String: Any] = ["type": "bridgeResult", "id": rawId, "ok": false,
-                                            "error": "Sidebar extension not connected"]
+                                            "error": "Stile extension not connected"]
                 deliver(reply)
                 return
             }

@@ -4,7 +4,7 @@
 // host. A plain byte pipe between stdio and the app's `host.sock` (framing is passed through unchanged).
 // It writes nothing to stdout except bytes from the socket.
 //
-//   SIDEBAR_APP_DIR              directory holding host.sock (default ~/Library/Application Support/Sidebar)
+//   SIDEBAR_APP_DIR              directory holding host.sock (default ~/Library/Application Support/Stile)
 //   SIDEBAR_APP_LAUNCH           optional shell command that starts the app when the socket is missing
 //   SIDEBAR_CONNECT_TIMEOUT_MS   how long to wait for the socket (default 10000)
 
@@ -12,10 +12,10 @@ const fs = require('fs');
 const net = require('net');
 const os = require('os');
 const path = require('path');
-const APP_DIR_FOR_FLAG = () => process.env.SIDEBAR_APP_DIR || path.join(os.homedir(), 'Library', 'Application Support', 'Sidebar');
+const APP_DIR_FOR_FLAG = () => process.env.SIDEBAR_APP_DIR || path.join(os.homedir(), 'Library', 'Application Support', 'Stile');
 const { spawn } = require('child_process');
 
-const appDir = process.env.SIDEBAR_APP_DIR || path.join(os.homedir(), 'Library/Application Support/Sidebar');
+const appDir = process.env.SIDEBAR_APP_DIR || path.join(os.homedir(), 'Library/Application Support/Stile');
 const sockPath = path.join(appDir, 'host.sock');
 const timeoutMs = Number(process.env.SIDEBAR_CONNECT_TIMEOUT_MS) || 10000;
 const logFile = path.join(appDir, 'connector.log');
@@ -38,7 +38,7 @@ async function connect() {
   for (;;) {
     const s = await tryConnect();
     if (s) return s;
-    // Mirrors the Swift connector: after "Quit Sidebar" (quit-by-user flag) don't relaunch the app.
+    // Mirrors the Swift connector: after "Quit Stile" (quit-by-user flag) don't relaunch the app.
     if (fs.existsSync(path.join(APP_DIR_FOR_FLAG(), 'quit-by-user'))) return null;
     if (!launched && process.env.SIDEBAR_APP_LAUNCH) {
       launched = true;

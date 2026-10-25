@@ -3,7 +3,7 @@ import Foundation
 
 /// Launch-time housekeeping: native messaging manifest, import of the old helper's state, clean-up.
 enum HostSetup {
-    static let hostName = "com.sidebar.helper"
+    static let hostName = "com.stile.helper"
     static let extensionOrigin = "chrome-extension://ffblekellgdmlecjablfojaaadpkmdgg/"
 
     static func runAtLaunch() {
@@ -12,10 +12,32 @@ enum HostSetup {
                                 attributes: [.posixPermissions: 0o700])
         importLegacyState()
         removeLegacyHelper()
-        registerManifest()
+        // v3.5c: capture-only mode (or an undecided first run) doesn't register the native host
+        if Settings.modeDecided && Settings.useChrome {
+            registerManifest()
+            removeOldManifest()
+        }
     }
 
-    /// Writes ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.sidebar.helper.json
+    /// The pre-rename host name; its manifest is deleted once the new one is in place.
+    static let oldHostName = "com.sidebar.helper"
+
+    /// Deletes .../NativeMessagingHosts/com.sidebar.helper.json (Chrome's directory, the only one the app registers in)
+    /// once the new manifest exists, so Chrome no longer finds the old host.
+    static func removeOldManifest() {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: HostPaths.nativeMessagingDir + "/" + hostName + ".json") else { return }
+        let old = HostPaths.nativeMessagingDir + "/" + oldHostName + ".json"
+        guard fm.fileExists(atPath: old) else { return }
+        do {
+            try fm.removeItem(atPath: old)
+            Log.write("setup: removed old manifest \(old)")
+        } catch {
+            Log.write("setup: cannot remove \(old): \(error.localizedDescription)")
+        }
+    }
+
+    /// Writes ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.stile.helper.json
     /// pointing at this executable (rewritten when the path changed; replaces an old Perl helper manifest).
     static func registerManifest() {
         guard let exe = Bundle.main.executablePath else {
@@ -24,7 +46,7 @@ enum HostSetup {
         }
         let manifest: [String: Any] = [
             "name": hostName,
-            "description": "Sidebar",
+            "description": "Stile",
             "path": exe,
             "type": "stdio",
             "allowed_origins": [extensionOrigin],
@@ -129,7 +151,7 @@ enum HostActions {
     }
 }
 
-/// The "Add the Sidebar extension to this profile" card, shown instead of the UI for Chrome windows
+/// The "Add the Stile extension to this profile" card, shown instead of the UI for Chrome windows
 /// whose profile has no connected extension.
 enum SetupCard {
     private static func esc(_ s: String) -> String {
@@ -163,8 +185,8 @@ enum SetupCard {
         p{opacity:.65;line-height:1.4}
         @media (max-width:120px){.card{display:none}.mini{display:flex}}
         </style>
-        <div class="mini" title="Add the Sidebar extension to this profile">+</div>
-        <div class="card"><h1>Add the Sidebar extension to this profile</h1>
+        <div class="mini" title="Add the Stile extension to this profile">+</div>
+        <div class="card"><h1>Add the Stile extension to this profile</h1>
         <ol>
         <li>Open the extensions page<span>chrome://extensions</span>
         \(buttons)</li>

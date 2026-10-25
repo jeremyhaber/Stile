@@ -12,7 +12,7 @@ enum Connector {
     private static func log(_ message: String) {
         let stamp = ISO8601DateFormatter().string(from: Date())
         let line = "\(stamp) [\(getpid())] \(message)\n"
-        let path = NSHomeDirectory() + "/Library/Logs/Sidebar-connector.log"
+        let path = NSHomeDirectory() + "/Library/Logs/Stile-connector.log"
         let fm = FileManager.default
         try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         if let attrs = try? fm.attributesOfItem(atPath: path), let size = attrs[.size] as? NSNumber, size.intValue > 1_000_000 {
@@ -109,7 +109,7 @@ enum Connector {
 
         var fd = connectOnce(path)
         if fd < 0 && FileManager.default.fileExists(atPath: HostPaths.quitFlagPath) {
-            // The user quit Sidebar from its settings: don't relaunch it behind their back.
+            // The user quit Stile from its settings: don't relaunch it behind their back.
             log("app was quit by the user; not launching it")
             exit(1)
         }

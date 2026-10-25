@@ -1,10 +1,10 @@
-# Sidebar
+# Stile
 
 An Arc-style side panel for Chrome on Mac: favourites, pinned folders, today's tabs, auto-archive, and profile switching.
 
 ## 1. Install the extension (in each Chrome profile)
 
-1. Move this `Sidebar` folder somewhere permanent, e.g. `~/Applications/Sidebar`. Chrome loads it from there, so don't delete it.
+1. Move this `Stile` folder somewhere permanent, e.g. `~/Applications/Stile`. Chrome loads it from there, so don't delete it.
 2. Open `chrome://extensions`, turn on **Developer mode** (top right).
 3. Click **Load unpacked** and choose the `extension` folder.
 4. Repeat in every profile you want it in (switch profile, then steps 2–3).
@@ -13,15 +13,17 @@ Open the panel with the toolbar button or **Option+S** (change it at `chrome://e
 
 **Put the panel on the left:** Chrome Settings → Appearance → Side panel position → Left.
 
-## 2. Install Sidebar.app (Mac)
+## 2. Install Stile.app (Mac)
 
-Sidebar.app draws the sidebar over Chrome's vertical tabs and also handles profile switching and settings shared across profiles. See `mac/README.md` for building and setup. In short: open Sidebar.app, allow Accessibility, then in Chrome right-click the tab bar → **Show tabs vertically** and collapse them.
+Stile.app draws the sidebar over Chrome's vertical tabs and also handles profile switching and settings shared across profiles. See `mac/README.md` for building and setup. In short: open Stile.app, allow Accessibility, then click **Set up** next to "Chrome vertical tabs" in the welcome window. It turns on vertical tabs in every profile and turns off Chrome's own expand-on-hover (it would fight the sidebar's peek). Chrome restarts and reopens your tabs.
 
-Without Sidebar.app the extension still works as a normal Chrome side panel, minus profile switching and the shared archive default.
+To do it by hand instead, in each profile: right-click Chrome's tab bar → **Show tabs vertically**. If you turned on "Expand on hover" for the tabs, turn it off.
+
+Without Stile.app the extension still works as a normal Chrome side panel, minus profile switching and the shared archive default.
 
 ## 3. Optional: allow custom JavaScript in Boosts
 
-Zap and custom CSS work straight away. To run your own JavaScript on a site, open `chrome://extensions`, click **Details** on Sidebar, and turn on **Allow User Scripts** (do this in each profile). The Boost view shows a button that takes you there.
+Zap and custom CSS work straight away. To run your own JavaScript on a site, open `chrome://extensions`, click **Details** on Stile, and turn on **Allow User Scripts** (do this in each profile). The Boost view shows a button that takes you there.
 
 ## How it works
 
@@ -43,7 +45,7 @@ Zap and custom CSS work straight away. To run your own JavaScript on a site, ope
 
 ## Known limits
 
-- Without Sidebar.app, Chrome's own tab strip stays visible (an extension alone can't hide it).
+- Without Stile.app, Chrome's own tab strip stays visible (an extension alone can't hide it).
 - Profile switching is two windows trading places, so there's a brief flicker.
 - Typed searches open in Chrome's last-focused window.
 - Boosts can't run on Chrome's own pages or the Chrome Web Store.
@@ -53,6 +55,6 @@ Zap and custom CSS work straight away. To run your own JavaScript on a site, ope
 
 - `node tools/e2e.mjs` — end-to-end test in Chromium (extension + real helper with a fake Chrome profile list).
 - `node tools/boost-e2e.mjs` — Boost (Zap/Code) tests.
-- `node tools/fake-app/test-host.mjs` — host protocol tests against the Node reference of Sidebar.app's host.
-- `node tools/overlay-e2e.mjs` — the sidebar UI in overlay mode, driven like Sidebar.app does.
+- `node tools/fake-app/test-host.mjs` — host protocol tests against the Node reference of Stile.app's host.
+- `node tools/overlay-e2e.mjs` — the sidebar UI in overlay mode, driven like Stile.app does.
 - `SPEC*.md` — design notes and the extension ⇄ app protocol.

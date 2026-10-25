@@ -30,7 +30,7 @@ final class SetupNoticePanel: NSPanel {
     private var candidates: [(dir: String, name: String)] = []
 
     private let pill = NoticePillView(frame: .zero)
-    private let label = NSTextField(labelWithString: "Sidebar isn\u{2019}t set up for this profile")
+    private let label = NSTextField(labelWithString: "Stile isn\u{2019}t set up for this profile")
     private let chevron = NSImageView(frame: .zero)
     private let closeButton = NSButton(frame: .zero)
 
@@ -77,7 +77,7 @@ final class SetupNoticePanel: NSPanel {
         closeButton.imagePosition = .imageOnly
         closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Dismiss")
         closeButton.contentTintColor = .secondaryLabelColor
-        closeButton.toolTip = "Dismiss for this profile until Sidebar restarts"
+        closeButton.toolTip = "Dismiss for this profile until Stile restarts"
         closeButton.target = self
         closeButton.action = #selector(dismissTapped)
         pill.addSubview(closeButton)
@@ -139,7 +139,7 @@ final class SetupNoticePanel: NSPanel {
         let config = WKWebViewConfiguration()
         config.userContentController = ucc
         let size = NSSize(width: 320, height: 260)
-        let web = WKWebView(frame: NSRect(origin: .zero, size: size), configuration: config)
+        let web = FirstMouseWebView(frame: NSRect(origin: .zero, size: size), configuration: config)
         web.loadHTMLString(SetupCard.html(candidates: candidates), baseURL: nil)
         let vc = NSViewController()
         vc.view = web

@@ -32,6 +32,16 @@ final class WebSchemeHandler: NSObject, WKURLSchemeHandler {
         }
         var path = url.path
         if path.isEmpty || path == "/" { path = "/sidepanel.html" }
+        // v3.4: the picture of an open screenshot editor window
+        if path.hasPrefix("/__capture/"), path.hasSuffix(".png") {
+            let id = String(path.dropFirst("/__capture/".count).dropLast(4))
+            if let png = CaptureEditors.shared.png(for: id) {
+                respond(urlSchemeTask, url: url, status: 200, mime: "image/png", data: png)
+            } else {
+                respond(urlSchemeTask, url: url, status: 404, mime: "text/plain", data: Data("Not found".utf8))
+            }
+            return
+        }
         let relative = String(path.drop(while: { $0 == "/" }))
         if relative.contains("..") {
             respond(urlSchemeTask, url: url, status: 403, mime: "text/plain", data: Data("Forbidden".utf8))
@@ -113,4 +123,10 @@ final class ResizeHandleView: NSView {
     override func mouseUp(with event: NSEvent) {
         onResizeEnded?()
     }
+}
+
+/// WKWebView that handles the click that also makes its (non-activating) panel key, so buttons work on
+/// the first click instead of needing a second one.
+final class FirstMouseWebView: WKWebView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }

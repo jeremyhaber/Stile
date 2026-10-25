@@ -13,9 +13,9 @@ enum HostPaths {
         return nil
     }
 
-    /// ~/Library/Application Support/Sidebar (override: SIDEBAR_APP_DIR).
+    /// ~/Library/Application Support/Stile (override: SIDEBAR_APP_DIR).
     static var appDir: String {
-        env("SIDEBAR_APP_DIR") ?? (NSHomeDirectory() + "/Library/Application Support/Sidebar")
+        env("SIDEBAR_APP_DIR") ?? (NSHomeDirectory() + "/Library/Application Support/Stile")
     }
 
     /// Old Perl helper directory (override: SIDEBAR_HELPER_DIR).

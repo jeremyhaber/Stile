@@ -209,7 +209,7 @@ export async function renderBoostView(rootEl, ctx) {
     w.append(tabs);
     if (k === 'js' && !st.us) {
       const m = document.createElement('div'); m.className = 'bx-warn'; m.setAttribute('data-testid', 'userscripts-help');
-      m.innerHTML = '<p>To run custom JavaScript, turn on <b>Allow User Scripts</b> for Sidebar.</p>';
+      m.innerHTML = '<p>To run custom JavaScript, turn on <b>Allow User Scripts</b> for Stile.</p>';
       const b = document.createElement('button'); b.className = 'btn small'; b.setAttribute('data-testid', 'userscripts-open');
       b.textContent = 'Open extension settings';
       b.onclick = () => { try { chrome.tabs.create({ url: `chrome://extensions/?id=${chrome.runtime.id}` }); } catch {} };

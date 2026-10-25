@@ -2,16 +2,83 @@ import AppKit
 import ApplicationServices
 
 /// Intercepts the red close button and Cmd+Shift+W on Chrome pop-out windows and asks the extension to
-/// `mergeWindow` (live tab move) instead of closing. Everything here runs on the main thread: the event tap
-/// is attached to the main run loop and the bridge replies are delivered there too.
+/// `mergeWindow` (live tab move) instead of closing. The event tap runs on its own thread (TapThread) and decides
+/// from a lock-protected snapshot; the merge and everything else it triggers runs on the main thread.
 private let closeTapCallback: CGEventTapCallBack = { _, type, event, refcon in
     guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
-    let me = Unmanaged<CloseInterceptor>.fromOpaque(refcon).takeUnretainedValue()
-    var swallow = false
-    if #available(macOS 14.0, *) {
-        swallow = MainActor.assumeIsolated { me.handle(type, event) }
-    }
+    let state = Unmanaged<CloseTapState>.fromOpaque(refcon).takeUnretainedValue()
+    let t0 = TapMetrics.now()
+    let swallow = state.handle(type, event)
+    TapMetrics.finish("close", event: event, started: t0)
     return swallow ? nil : Unmanaged.passUnretained(event)
+}
+
+/// What the tap thread knows (no AX, no main-actor state).
+final class CloseTapState: @unchecked Sendable {
+    struct Snapshot {
+        var frontmost = false
+        /// Close button frames (AX coords) of windows whose close is merged.
+        var targets: [(key: Int, frame: CGRect)] = []
+        var focusedMergeKey: Int?
+        var focusedLittle = false
+    }
+
+    private let lock = NSLock()
+    private var snap = Snapshot()
+    private var swallowUp = false
+    var tap: CFMachPort?
+    var onMerge: ((Int) -> Void)?
+    var onPromote: (() -> Void)?
+
+    func set(_ s: Snapshot) { lock.lock(); snap = s; lock.unlock() }
+    private func get() -> Snapshot { lock.lock(); defer { lock.unlock() }; return snap }
+
+    /// Returns true to swallow the event.
+    func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
+        switch type {
+        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
+            Log.write("close-interceptor: tap was disabled, re-enabled")
+            return false
+        case .leftMouseDown:
+            swallowUp = false
+            let s = get()
+            if !s.frontmost || s.targets.isEmpty { return false }
+            let p = event.location
+            for t in s.targets where t.frame.insetBy(dx: -1, dy: -1).contains(p) {
+                swallowUp = true
+                let key = t.key
+                DispatchQueue.main.async { [weak self] in self?.onMerge?(key) }
+                return true
+            }
+            return false
+        case .leftMouseUp:
+            if swallowUp {
+                swallowUp = false
+                return true
+            }
+            return false
+        case .keyDown:
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            guard code == 31 || code == 13 else { return false }
+            let relevant: CGEventFlags = [.maskCommand, .maskShift, .maskControl, .maskAlternate]
+            let flags = event.flags.intersection(relevant)
+            let repeated = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            let s = get()
+            if !s.frontmost { return false }
+            if code == 31 {
+                // Command+O in a little window: "Open as tab" (swallowed; key repeat promotes only once).
+                guard flags == [.maskCommand], s.focusedLittle else { return false }
+                if !repeated { DispatchQueue.main.async { [weak self] in self?.onPromote?() } }
+                return true
+            }
+            guard flags == [.maskCommand, .maskShift], let key = s.focusedMergeKey else { return false }
+            if !repeated { DispatchQueue.main.async { [weak self] in self?.onMerge?(key) } }
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 @MainActor
@@ -38,6 +105,7 @@ final class CloseInterceptor {
     /// Called after a bridge's cached roles changed (the manager re-evaluates which windows are little).
     var onRolesChanged: (() -> Void)?
 
+    private let tapState = CloseTapState()
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var lastTapAttempt = Date.distantPast
@@ -46,43 +114,79 @@ final class CloseInterceptor {
     private var roles: [UUID: Roles] = [:]
     private var subscriptions: [UUID: (ProfileBridge, UUID)] = [:]
     private var targets: [Int: Target] = [:]
-    private var swallowNextMouseUp = false
     private var inFlight = Set<String>()
 
     // MARK: Tap lifecycle
 
-    /// Creates the tap when Accessibility is granted; cheap to call repeatedly (retries at most every 5 s).
+    /// The tap matters only when some profile has merge-on-close with a main window (pop-outs to merge) or little
+    /// windows exist (Command+O). Otherwise no tap is installed at all.
+    private var tapNeeded: Bool {
+        roles.values.contains { ($0.mergeOnClose && $0.mainWindowId != nil) || !$0.littleWindowIds.isEmpty }
+    }
+
+    /// Installs or removes the tap to match `tapNeeded`; cheap to call repeatedly (install retries at most every 5 s).
     func ensureTap() {
+        if !tapNeeded || !Permissions.isTrusted {
+            if tap != nil { stop(); Log.write("close-interceptor: event tap removed (nothing to intercept)") }
+            return
+        }
         if tap != nil { return }
-        guard Permissions.isTrusted, Date().timeIntervalSince(lastTapAttempt) > 5 else { return }
+        guard Date().timeIntervalSince(lastTapAttempt) > 5 else { return }
         lastTapAttempt = Date()
-        // No drag events here: every event in this mask waits for our main thread, and mouse-drags are hot.
+        // No drag events here, and the callback runs on the tap thread, never on the main thread.
         let types: [CGEventType] = [.leftMouseDown, .leftMouseUp, .keyDown]
         var mask: CGEventMask = 0
         for t in types { mask |= (CGEventMask(1) << CGEventMask(t.rawValue)) }
-        let refcon = Unmanaged.passUnretained(self).toOpaque()
-        guard let port = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                           options: .defaultTap, eventsOfInterest: mask,
-                                           callback: closeTapCallback, userInfo: refcon) else {
+        tapState.onMerge = { [weak self] key in
+            runOnMain { self?.mergeFromTap(key) }
+        }
+        tapState.onPromote = { [weak self] in
+            runOnMain { self?.promoteFromTap() }
+        }
+        let refcon = Unmanaged.passUnretained(tapState).toOpaque()
+        guard let made = TapThread.shared.install(mask: mask, callback: closeTapCallback, refcon: refcon) else {
             if !loggedTapFailure {
                 loggedTapFailure = true
                 Log.write("close-interceptor: could not create event tap (Accessibility / Input Monitoring?)")
             }
             return
         }
-        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
-        CGEvent.tapEnable(tap: port, enable: true)
-        tap = port
-        runLoopSource = src
-        Log.write("close-interceptor: event tap installed")
+        tap = made.tap
+        runLoopSource = made.source
+        tapState.tap = made.tap
+        publishSnapshot()
+        Log.write("close-interceptor: event tap installed (tap thread)")
     }
 
     func stop() {
-        if let src = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
-        if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
+        if let t = tap, let src = runLoopSource { TapThread.shared.remove(tap: t, source: src) }
         runLoopSource = nil
         tap = nil
+        tapState.tap = nil
+    }
+
+    /// Copies what the tap thread needs into its lock-protected snapshot.
+    private func publishSnapshot() {
+        guard tap != nil else { return }
+        var s = CloseTapState.Snapshot()
+        s.frontmost = chromeIsFrontmost()
+        for t in targets.values where qualifying(t.key) != nil { s.targets.append((t.key, t.frame)) }
+        if let k = focusedWindowKey?() {
+            if targets[k] != nil, qualifying(k) != nil { s.focusedMergeKey = k }
+            s.focusedLittle = littleWindow(k) != nil
+        }
+        tapState.set(s)
+    }
+
+    private func mergeFromTap(_ key: Int) {
+        guard let t = targets[key], let q = qualifying(key) else { return }
+        merge(bridge: q.bridge, windowId: q.windowId, target: t)
+    }
+
+    private func promoteFromTap() {
+        guard let key = focusedWindowKey?(), let l = littleWindow(key) else { return }
+        Log.write("cmd-o: intercepted in little window \(l.windowId); promoting to a tab")
+        LittleLinks.promote(bridge: l.bridge, windowId: l.windowId)
     }
 
     // MARK: Cached state
@@ -146,17 +250,22 @@ final class CloseInterceptor {
         }
     }
 
-    /// Re-reads the close button frame of every visible window (after tracker updates / following ends).
+    /// Re-reads the close button frame of every visible window whose close would be merged (after tracker updates /
+    /// following ends) and publishes the tap snapshot. The tap trusts this cache; it makes no AX calls.
     func refreshTargets(_ windows: [ChromeWindow]) {
         var out: [Int: Target] = [:]
-        for w in windows where w.visible {
-            guard let button = AX.element(w.element, AXName.closeButton), let f = AX.frame(button) else { continue }
-            out[w.key] = Target(key: w.key, window: w.element, button: button, frame: f)
+        if tapNeeded {
+            for w in windows where w.visible && qualifying(w.key) != nil {
+                guard let button = AX.element(w.element, AXName.closeButton), let f = AX.frame(button) else { continue }
+                out[w.key] = Target(key: w.key, window: w.element, button: button, frame: f)
+            }
         }
         targets = out
+        ensureTap()
+        publishSnapshot()
     }
 
-    // MARK: Decision (runs inside the tap callback; keep it fast)
+    // MARK: Decision
 
     /// The (bridge, windowId) to merge when the window with this key is an interceptable pop-out.
     private func qualifying(_ key: Int) -> (bridge: ProfileBridge, windowId: Int)? {
@@ -171,86 +280,19 @@ final class CloseInterceptor {
         return NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
     }
 
-    /// The pop-out to merge when this mouse-down hits the close button of an interceptable window.
-    private func closeHit(_ event: CGEvent) -> (bridge: ProfileBridge, windowId: Int, target: Target)? {
-        if targets.isEmpty || !chromeIsFrontmost() { return nil }
-        let p = event.location
-        for t in targets.values where t.frame.insetBy(dx: -1, dy: -1).contains(p) {
-            // The cache may be stale (window moved without a refresh yet): confirm against the live frame.
-            guard let live = AX.frame(t.button), live.insetBy(dx: -1, dy: -1).contains(p) else { return nil }
-            guard let q = qualifying(t.key) else { return nil }
-            return (q.bridge, q.windowId, t)
-        }
-        return nil
-    }
-
-    /// Returns true to swallow the event.
-    func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
-        switch type {
-        case .tapDisabledByTimeout, .tapDisabledByUserInput:
-            if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
-            Log.write("close-interceptor: tap was disabled, re-enabled")
-            return false
-
-        case .leftMouseDown:
-            swallowNextMouseUp = false
-            if let q = closeHit(event) {
-                swallowNextMouseUp = true
-                merge(bridge: q.bridge, windowId: q.windowId, target: q.target)
-                return true
-            }
-            return false
-
-        case .leftMouseUp:
-            if swallowNextMouseUp {
-                swallowNextMouseUp = false
-                return true
-            }
-            return false
-
-        case .keyDown:
-            let code = event.getIntegerValueField(.keyboardEventKeycode)
-            let relevant: CGEventFlags = [.maskCommand, .maskShift, .maskControl, .maskAlternate]
-            if code == 31 {
-                // Command+O in a little window: "Open as tab" (swallowed; key repeat promotes only once).
-                // Only a bare Command+O is considered (and logged); plain 'o' presses are never logged, and
-                // nothing is logged for other apps.
-                guard event.flags.intersection(relevant) == [.maskCommand], chromeIsFrontmost() else { return false }
-                let repeated = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
-                guard let key = focusedWindowKey?() else {
-                    if !repeated { Log.write("cmd-o: skipped (no focused Chrome window)") }
-                    return false
-                }
-                guard let mapping = mappingProvider?(key) else {
-                    if !repeated { Log.write("cmd-o: skipped (window \(key) is not mapped to an extension window)") }
-                    return false
-                }
-                guard isLittle(mapping), let l = littleWindow(key) else {
-                    if !repeated { Log.write("cmd-o: skipped (window \(key) is not a little window)") }
-                    return false
-                }
-                if !repeated {
-                    Log.write("cmd-o: intercepted in little window \(l.windowId); promoting to a tab")
-                    LittleLinks.promote(bridge: l.bridge, windowId: l.windowId)
-                }
-                return true
-            }
-            guard code == 13 else { return false }
-            guard event.flags.intersection(relevant) == [.maskCommand, .maskShift] else { return false }
-            if targets.isEmpty || !chromeIsFrontmost() { return false }
-            guard let key = focusedWindowKey?(), let t = targets[key], let q = qualifying(key) else { return false }
-            // Key repeat: keep swallowing, but only merge once.
-            if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
-                merge(bridge: q.bridge, windowId: q.windowId, target: t)
-            }
-            return true
-
-        default:
-            return false
-        }
-    }
-
     // MARK: Action
+
+    /// The header's red light: the same decision as a click on Chrome's own close button (merge an interceptable
+    /// pop-out, else press the real AXCloseButton so Chrome's own close flow, including its prompts, runs).
+    func performClose(key: Int, window: AXUIElement) {
+        guard let button = AX.element(window, AXName.closeButton) else { return }
+        if let q = qualifying(key) {
+            merge(bridge: q.bridge, windowId: q.windowId,
+                  target: Target(key: key, window: window, button: button, frame: AX.frame(button) ?? .zero))
+        } else {
+            AX.perform(button, AXName.actionPress)
+        }
+    }
 
     /// Asks the extension to merge the window. A single-tab window (or any failure) is closed normally via the
     /// close button instead, so the extension's single-tab archive rule / snapshot fallback still applies.
