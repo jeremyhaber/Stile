@@ -1,4 +1,4 @@
-// Overlay shim: when the side panel UI runs outside the extension (Sidebar.app WKWebView, or a test page),
+// Overlay shim: when the side panel UI runs outside the extension (Stile.app WKWebView, or a test page),
 // install a `chrome` object whose calls travel over the bridge to the extension's service worker.
 // In the real extension (chrome.tabs exists) this file does nothing.
 (function () {
@@ -125,6 +125,7 @@
       ['onCreated', 'onRemoved', 'onChanged', 'onMoved', 'onChildrenReordered', 'onImportBegan', 'onImportEnded']),
     tabGroups: Object.assign(ns('tabGroups', ['query', 'get', 'update', 'move'], ['onCreated', 'onUpdated', 'onRemoved', 'onMoved']), { TAB_GROUP_ID_NONE: -1 }),
     search: ns('search', ['query']),
+    downloads: ns('downloads', ['search', 'open', 'show', 'showDefaultFolder', 'getFileIcon'], ['onCreated', 'onChanged', 'onErased']),
     storage: {
       local: ns('storage.local', ['get', 'set', 'remove', 'clear']),
       sync: ns('storage.sync', ['get', 'set', 'remove', 'clear']),
@@ -156,9 +157,9 @@
     for (let i = 0; i < 20 && !hello; i++) {
       try { hello = await call('sidebar.hello', [], 4000); } catch (e) { lastErr = e; await new Promise((r) => setTimeout(r, 500)); }
     }
-    if (!hello) throw lastErr || new Error('Sidebar extension not reachable');
+    if (!hello) throw lastErr || new Error('Stile extension not reachable');
     extId = hello.extensionId || '';
-    manifest = { version: hello.version, name: 'Sidebar', manifest_version: 3 };
+    manifest = { version: hello.version, name: 'Stile', manifest_version: 3 };
     try { const full = await call('runtime.getManifest', []); if (full) manifest = full; } catch (e) { /* ignore */ }
     let caps = { split: false, tabGroups: false, userScripts: false };
     try { caps = await call('sidebar.capabilities', []); } catch (e) { /* ignore */ }

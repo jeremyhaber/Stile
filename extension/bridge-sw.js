@@ -11,13 +11,16 @@ const faviconCache = new Map();
 const NS_TWO = new Set(['tabs', 'windows', 'bookmarks', 'tabGroups']);
 const STORAGE_FNS = new Set(['get', 'set', 'remove', 'clear']);
 const STORAGE_AREAS = new Set(['local', 'sync', 'session']);
+// v3.2: the downloads popover. `drag` is deliberately absent: it only works inside a dragstart handler of an extension page.
+const DOWNLOAD_FNS = new Set(['search', 'open', 'show', 'showDefaultFolder', 'getFileIcon']);
 
 const EVENTS = {
   tabs: ['onCreated', 'onUpdated', 'onRemoved', 'onActivated', 'onMoved', 'onAttached', 'onDetached', 'onHighlighted', 'onReplaced'],
   windows: ['onCreated', 'onRemoved', 'onFocusChanged', 'onBoundsChanged'],
   bookmarks: ['onCreated', 'onRemoved', 'onChanged', 'onMoved', 'onChildrenReordered'],
   tabGroups: ['onCreated', 'onUpdated', 'onRemoved', 'onMoved'],
-  storage: ['onChanged']
+  storage: ['onChanged'],
+  downloads: ['onCreated', 'onChanged', 'onErased']
 };
 
 function safeJson(v) {
@@ -72,7 +75,7 @@ function resolveCall(call) {
   }
   if (parts.length !== 2) return null;
   const [ns, fn] = parts;
-  const ok = NS_TWO.has(ns) || (ns === 'search' && fn === 'query') || (ns === 'runtime' && fn === 'getManifest');
+  const ok = NS_TWO.has(ns) || (ns === 'downloads' && DOWNLOAD_FNS.has(fn)) || (ns === 'search' && fn === 'query') || (ns === 'runtime' && fn === 'getManifest');
   if (!ok || !chrome[ns] || typeof chrome[ns][fn] !== 'function') return null;
   return (...a) => chrome[ns][fn](...a);
 }
