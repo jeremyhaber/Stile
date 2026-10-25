@@ -1,21 +1,29 @@
 /**
- * Flatten an annotated image onto a canvas at its natural resolution (after the crop) and encode it.
- * Blur boxes are really pixelated here (the stage only previews them). The canvas is injectable for tests.
+ * Flatten an annotated image onto a canvas (the crop plus any padding, at the export scale) and encode it.
+ * Blur boxes are blurred here exactly like the stage's live preview; magnifiers show the blurred picture too.
+ * The canvas is injectable for tests.
  */
 import {
   FONT_STACK,
   HIGHLIGHT_ALPHA,
   LINE_HEIGHT,
   arrowParts,
-  blockSizeFor,
+  blurRadiusFor,
   cropOutput,
+  docScale,
   highlightWidth,
+  lensParts,
+  measureParts,
+  padRect,
+  padSize,
   readableOn,
   smoothCommands,
   textLines,
   type AnnotDoc,
+  type MagnifyShape,
   type Rect,
   type Shape,
+  badgeFontSize,
 } from './model'
 
 /** the part of a canvas this module uses (a real HTMLCanvasElement fits; tests pass a stub) */
@@ -57,49 +65,51 @@ export interface PixelData {
   height: number
 }
 
-/** replace every `block` x `block` cell by its average color (in place) */
-export function pixelateImageData(img: PixelData, block: number): void {
+/**
+ * Gaussian-like blur of the whole buffer in place: three box-blur passes per axis (a box of radius r three times has a
+ * standard deviation of about r), edges clamped.
+ */
+export function blurImageData(img: PixelData, radius: number): void {
   const { data, width, height } = img
-  const b = Math.max(1, Math.round(block))
-  for (let by = 0; by < height; by += b) {
-    for (let bx = 0; bx < width; bx += b) {
-      const x2 = Math.min(width, bx + b)
-      const y2 = Math.min(height, by + b)
-      let r = 0
-      let g = 0
-      let bl = 0
-      let a = 0
-      let n = 0
-      for (let y = by; y < y2; y++)
-        for (let x = bx; x < x2; x++) {
-          const i = (y * width + x) * 4
-          r += data[i]!
-          g += data[i + 1]!
-          bl += data[i + 2]!
-          a += data[i + 3]!
-          n++
-        }
-      if (!n) continue
-      const ar = Math.round(r / n)
-      const ag = Math.round(g / n)
-      const ab = Math.round(bl / n)
-      const aa = Math.round(a / n)
-      for (let y = by; y < y2; y++)
-        for (let x = bx; x < x2; x++) {
-          const i = (y * width + x) * 4
-          data[i] = ar
-          data[i + 1] = ag
-          data[i + 2] = ab
-          data[i + 3] = aa
-        }
+  const r = Math.max(1, Math.round(radius))
+  const tmp = new Float32Array(data.length)
+  for (let pass = 0; pass < 3; pass++) {
+    boxBlur(data, tmp, width, height, r, 4, width * 4) // horizontal
+    boxBlur(tmp, data, height, width, r, width * 4, 4) // vertical (rows and columns swapped)
+  }
+}
+
+/** one running-sum box blur along lines of `len` pixels (`step` bytes apart); `lines` lines, `lineStep` bytes apart */
+function boxBlur(
+  src: ArrayLike<number>,
+  dst: { [i: number]: number },
+  len: number,
+  lines: number,
+  r: number,
+  step: number,
+  lineStep: number,
+) {
+  const n = 2 * r + 1
+  const last = len - 1
+  for (let line = 0; line < lines; line++) {
+    const o = line * lineStep
+    for (let c = 0; c < 4; c++) {
+      const at = (x: number) => src[o + Math.min(last, Math.max(0, x)) * step + c]!
+      let sum = 0
+      for (let x = -r; x <= r; x++) sum += at(x)
+      for (let x = 0; x < len; x++) {
+        dst[o + x * step + c] = sum / n
+        sum += at(x + r + 1) - at(x - r)
+      }
     }
   }
 }
 
-/** pixelate the device-pixel rectangle `r` of what is on the canvas now */
-function pixelateRegion(
+/** blur the device-pixel rectangle `r` of what is on the canvas now (its surroundings feed the edges, like a lens) */
+function blurRegion(
   ctx: CanvasRenderingContext2D,
   r: Rect,
+  radius: number,
   canvas: { width: number; height: number },
 ) {
   const x = Math.max(0, Math.floor(r.x))
@@ -107,13 +117,29 @@ function pixelateRegion(
   const w = Math.min(canvas.width, Math.ceil(r.x + r.w)) - x
   const h = Math.min(canvas.height, Math.ceil(r.y + r.h)) - y
   if (w < 1 || h < 1) return
-  const img = ctx.getImageData(x, y, w, h)
-  pixelateImageData(img, blockSizeFor(w, h))
-  ctx.putImageData(img, x, y)
+  const pad = Math.ceil(radius * 3)
+  const px = Math.max(0, x - pad)
+  const py = Math.max(0, y - pad)
+  const pw = Math.min(canvas.width, x + w + pad) - px
+  const ph = Math.min(canvas.height, y + h + pad) - py
+  const img = ctx.getImageData(px, py, pw, ph)
+  blurImageData(img, radius)
+  // only the box itself is written back
+  ctx.putImageData(img, px, py, x - px, y - py, w, h)
 }
 
-/** draw one (non-blur) shape; the context is already in image coordinates */
-export function drawShape(ctx: CanvasRenderingContext2D, s: Shape): void {
+/** the picture (with its blur boxes applied) around a magnifier's source, 1:1 in image px from (x, y) */
+export interface LensSource {
+  canvas: CanvasImageSource
+  x: number
+  y: number
+}
+
+/**
+ * draw one (non-blur) shape; the context is already in image coordinates. A magnifier's lens shows `lens` (without one
+ * only its outlines are drawn).
+ */
+export function drawShape(ctx: CanvasRenderingContext2D, s: Shape, lens?: LensSource): void {
   ctx.save()
   ctx.lineCap = 'round'
   ctx.lineJoin = 'round'
@@ -206,10 +232,70 @@ export function drawShape(ctx: CanvasRenderingContext2D, s: Shape): void {
       ctx.strokeStyle = readableOn(s.color)
       ctx.stroke()
       ctx.fillStyle = readableOn(s.color)
-      ctx.font = `700 ${Math.round(s.r * 1.1)}px ${FONT_STACK}`
+      ctx.font = `700 ${badgeFontSize(s.r, s.n)}px ${FONT_STACK}`
       ctx.textAlign = 'center'
       ctx.textBaseline = 'middle'
       ctx.fillText(String(s.n), s.cx, s.cy + s.r * 0.04)
+      break
+    }
+    case 'measure': {
+      const m = measureParts(s)
+      ctx.strokeStyle = s.color
+      ctx.lineWidth = m.line
+      ctx.lineCap = 'butt'
+      if (m.box) {
+        ctx.setLineDash([m.line * 4, m.line * 3])
+        ctx.strokeRect(m.box.x, m.box.y, m.box.w, m.box.h)
+        ctx.setLineDash([])
+      } else {
+        ctx.beginPath()
+        ctx.moveTo(s.a.x, s.a.y)
+        ctx.lineTo(s.b.x, s.b.y)
+        for (const [p, q] of m.ticks) {
+          ctx.moveTo(p.x, p.y)
+          ctx.lineTo(q.x, q.y)
+        }
+        ctx.stroke()
+      }
+      const l = m.label
+      ctx.fillStyle = s.color
+      ctx.beginPath()
+      ctx.roundRect(l.x, l.y, l.w, l.h, l.h * 0.3)
+      ctx.fill()
+      ctx.fillStyle = readableOn(s.color)
+      ctx.font = `600 ${l.fontSize}px ${FONT_STACK}`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText(l.text, l.cx, l.cy + l.fontSize * 0.04)
+      break
+    }
+    case 'magnify': {
+      const g = lensParts(s)
+      ctx.strokeStyle = s.color
+      ctx.lineWidth = Math.max(1, s.width * 0.6)
+      ctx.lineJoin = 'miter'
+      ctx.strokeRect(s.src.x, s.src.y, s.src.w, s.src.h)
+      if (g.connector) {
+        ctx.beginPath()
+        ctx.moveTo(g.connector[0].x, g.connector[0].y)
+        ctx.lineTo(g.connector[1].x, g.connector[1].y)
+        ctx.stroke()
+      }
+      ctx.save()
+      ctx.beginPath()
+      ctx.arc(g.cx, g.cy, g.r, 0, Math.PI * 2)
+      ctx.clip()
+      ctx.fillStyle = '#ffffff'
+      ctx.fill()
+      if (lens) {
+        ctx.transform(g.k, 0, 0, g.k, g.tx, g.ty)
+        ctx.drawImage(lens.canvas, lens.x, lens.y)
+      }
+      ctx.restore()
+      ctx.lineWidth = s.width
+      ctx.beginPath()
+      ctx.arc(g.cx, g.cy, g.r, 0, Math.PI * 2)
+      ctx.stroke()
       break
     }
     case 'blur':
@@ -259,45 +345,103 @@ const defaultCanvas = (w: number, h: number): CanvasLike => {
   return c
 }
 
+const intersect = (a: Rect, b: Rect): Rect => {
+  const x = Math.max(a.x, b.x)
+  const y = Math.max(a.y, b.y)
+  return {
+    x,
+    y,
+    w: Math.max(0, Math.min(a.x + a.w, b.x + b.w) - x),
+    h: Math.max(0, Math.min(a.y + a.h, b.y + b.h) - y),
+  }
+}
+
 /**
- * Crop, pixelate the blur boxes, draw the shapes in order, encode. PNG, or JPEG 0.92 when the source was a JPEG and the
- * PNG came out bigger than 1.5 MB.
+ * The picture around a magnifier's source at 1:1, with the blur boxes that reach it blurred (and enough margin that the
+ * blur's edges are fed like on the main canvas), so a magnified blur box stays unreadable.
+ */
+function lensSource(
+  i: FlattenInput,
+  s: MagnifyShape,
+  make: (w: number, h: number) => CanvasLike,
+): LensSource | undefined {
+  const margin = Math.ceil(blurRadiusFor(1e9, 1e9) * 3) + 2
+  const x = Math.max(0, Math.floor(s.src.x - margin))
+  const y = Math.max(0, Math.floor(s.src.y - margin))
+  const w = Math.min(i.width, Math.ceil(s.src.x + s.src.w + margin)) - x
+  const h = Math.min(i.height, Math.ceil(s.src.y + s.src.h + margin)) - y
+  if (w < 1 || h < 1) return undefined
+  const c = make(w, h)
+  c.width = w
+  c.height = h
+  const ctx = c.getContext('2d')
+  if (!ctx) return undefined
+  ctx.drawImage(i.source, x, y, w, h, 0, 0, w, h)
+  for (const b of i.doc.shapes) {
+    if (b.kind !== 'blur') continue
+    const r = intersect(b, { x, y, w, h })
+    if (r.w <= 0 || r.h <= 0) continue
+    blurRegion(ctx, { x: b.x - x, y: b.y - y, w: b.w, h: b.h }, blurRadiusFor(b.w, b.h), c)
+  }
+  return { canvas: c as unknown as CanvasImageSource, x, y }
+}
+
+/**
+ * Crop, pad, scale, blur the blur boxes, draw the shapes in order, encode. PNG, or JPEG 0.92 when the source was a JPEG
+ * and the PNG came out bigger than 1.5 MB.
  */
 export async function flattenToFile(i: FlattenInput): Promise<File> {
   const img = { w: i.width, h: i.height }
   const region = cropOutput(i.doc.crop, img) ?? { x: 0, y: 0, w: img.w, h: img.h }
+  const pad = padSize(i.doc)
+  const outer = pad ? padRect(region, pad) : region
   const limits = exportLimits()
   const maxPixels = i.maxPixels ?? limits.maxPixels
   const maxSide = i.maxSide ?? limits.maxSide
   const k = Math.min(
-    1,
-    Math.sqrt(maxPixels / (region.w * region.h)),
-    maxSide / Math.max(region.w, region.h),
+    docScale(i.doc),
+    Math.sqrt(maxPixels / (outer.w * outer.h)),
+    maxSide / Math.max(outer.w, outer.h),
   )
-  const outW = Math.max(1, Math.round(region.w * k))
-  const outH = Math.max(1, Math.round(region.h * k))
-  const canvas = (i.createCanvas ?? defaultCanvas)(outW, outH)
+  const outW = Math.max(1, Math.round(outer.w * k))
+  const outH = Math.max(1, Math.round(outer.h * k))
+  const make = i.createCanvas ?? defaultCanvas
+  const canvas = make(outW, outH)
   canvas.width = outW
   canvas.height = outH
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('This browser can’t draw the edited image')
   ctx.imageSmoothingQuality = 'high'
-  ctx.setTransform(k, 0, 0, k, -region.x * k, -region.y * k)
+  const padColor = i.doc.pad?.color
+  if (pad && padColor && padColor !== 'transparent') {
+    ctx.fillStyle = padColor
+    ctx.fillRect(0, 0, outW, outH)
+  }
+  ctx.setTransform(k, 0, 0, k, -outer.x * k, -outer.y * k)
+  if (pad) {
+    // the padding shows its color, not the picture cropped away under it
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(region.x, region.y, region.w, region.h)
+    ctx.clip()
+  }
   ctx.drawImage(i.source, 0, 0, img.w, img.h)
+  if (pad) ctx.restore()
 
-  // blur boxes pixelate the PICTURE (before any annotation is drawn), so arrows and text on top stay crisp
+  // blur boxes blur the PICTURE (before any annotation is drawn), so arrows and text on top stay crisp
+  const shown = { x: (region.x - outer.x) * k, y: (region.y - outer.y) * k, w: region.w * k, h: region.h * k }
   for (const s of i.doc.shapes) {
     if (s.kind !== 'blur') continue
+    const box = { x: (s.x - outer.x) * k, y: (s.y - outer.y) * k, w: s.w * k, h: s.h * k }
     ctx.save()
     ctx.setTransform(1, 0, 0, 1, 0, 0)
-    pixelateRegion(
-      ctx,
-      { x: (s.x - region.x) * k, y: (s.y - region.y) * k, w: s.w * k, h: s.h * k },
-      canvas,
-    )
+    blurRegion(ctx, pad ? intersect(box, shown) : box, blurRadiusFor(s.w, s.h) * k, canvas)
     ctx.restore()
   }
-  for (const s of i.doc.shapes) if (s.kind !== 'blur') drawShape(ctx, s)
+  for (const s of i.doc.shapes) {
+    if (s.kind === 'blur') continue
+    drawShape(ctx, s, s.kind === 'magnify' ? lensSource(i, s, make) : undefined)
+  }
 
   let blob = await toBlob(canvas, 'image/png')
   let ext: 'png' | 'jpg' = 'png'

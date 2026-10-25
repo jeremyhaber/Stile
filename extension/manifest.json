@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Stile",
-  "version": "1.3.0",
-  "description": "An Arc-style side panel: favourites, pinned tabs, today's tabs, auto-archive and profile switching.",
+  "version": "1.0.0",
+  "description": "Your tabs in a vertical side panel: favourites, pinned folders, auto-archive, screenshots and more. Requires the Stile Mac app.",
   "minimum_chrome_version": "116",
   "incognito": "spanning",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzdeEuaIu2+SMvOlZh8DQoCr4pR8Jqxi5Ln/5JnEf3shuxpT+EdRPi3Gefw25R09s1Vh/aE70n5eA4lilqf18su5+7lQ+wvJc/kCeNFwsrhyi9XK/sbbCEoPN/x+ssSuht2wCCcEZ9Z4EmQ/j9S7Mr+tm8ci/6KErXUbjNS4/EzHrj41TMpbjx/CbGb4L7Bvf4oIvoTKoYBCzQ3czmGrcFQ8q3+tuY75yUatLeZukQXPAz6nohLTncAJF4OuUSCwBVs3Y9juRbFuvmD4owNkSGCG6jEjtUgIW2SFYUqtgYiitpfAMBJb95oy4PiqBxub8zWGQZEM9zkbdyQ+HYN0yZQIDAQAB",

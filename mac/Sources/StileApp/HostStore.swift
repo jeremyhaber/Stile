@@ -31,6 +31,11 @@ enum HostPaths {
         env("SIDEBAR_NMH_DIR") ?? (NSHomeDirectory() + "/Library/Application Support/Google/Chrome/NativeMessagingHosts")
     }
 
+    /// v3.10: Chrome's External Extensions directory (override: SIDEBAR_EXTERNAL_EXT_DIR).
+    static var externalExtensionsDir: String {
+        env("SIDEBAR_EXTERNAL_EXT_DIR") ?? (NSHomeDirectory() + "/Library/Application Support/Google/Chrome/External Extensions")
+    }
+
     static var stateFile: String { appDir + "/state.json" }
     /// Present while the user has quit the app from the sidebar's settings; the connector then won't relaunch it.
     static var quitFlagPath: String { appDir + "/quit-by-user" }

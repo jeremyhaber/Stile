@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sidebar</title>
+  <title>Stile</title>
   <link rel="stylesheet" href="sidepanel.css">
   <link rel="stylesheet" href="boost.css">
   <link rel="stylesheet" href="capture/capture-view.css">
@@ -14,10 +14,15 @@
   <div id="app">
     <section id="view-main" class="view" data-testid="view-main">
       <div class="top">
+        <div id="sidebar-toggle-row" class="sidebar-toggle-row" hidden><button type="button" id="sidebar-toggle" class="icon-btn" data-testid="sidebar-toggle" aria-pressed="false"></button></div>
         <div id="profiles" class="profiles" data-testid="profile-switcher" hidden></div>
-        <div id="popout-bar" class="popout-bar" data-testid="popout-bar" hidden>
+        <div id="popout-bar" class="popout-bar" data-testid="popout-bar" title="Pop-out window" hidden>
           <span class="pb-text">Pop-out window</span>
           <button type="button" class="btn small" id="popout-merge" data-testid="popout-merge" title="Move this window's tabs into the main window">Merge back</button>
+        </div>
+        <div id="present-bar" class="popout-bar present-bar" data-testid="present-bar" title="Presenting" hidden>
+          <span class="pb-text">Presenting</span>
+          <button type="button" class="btn small" id="present-stop" data-testid="present-stop" title="Move this window's tabs back to the main window">Stop presenting</button>
         </div>
         <div class="addr-row">
           <form id="addr-form" class="addr" autocomplete="off">
@@ -27,22 +32,20 @@
         </div>
       </div>
       <div class="scroll" id="scroll-main">
-        <div id="app-offline" class="hint-card" data-testid="app-offline-card" hidden>
-          <div class="hc-body">
-            <strong>Sidebar.app isn't running</strong>
-            <span id="app-offline-msg" data-testid="app-offline-message">Open it to cover Chrome's tabs with this sidebar.</span>
-            <span class="hc-actions">
-              <button type="button" class="btn small primary" id="app-offline-open" data-testid="app-offline-open">Open Sidebar.app</button>
-              <button type="button" class="btn small" id="app-offline-retry" data-testid="app-offline-retry">Retry</button>
-            </span>
-          </div>
-        </div>
         <div id="vt-hint" class="hint-card" data-testid="vertical-tabs-hint" hidden>
           <div class="hc-body">
             <strong>Turn on vertical tabs to get the full sidebar</strong>
-            <span>Right-click Chrome's tab bar → Show tabs vertically. Then collapse them.</span>
+            <span>Right-click Chrome's tab bar → Show tabs vertically, or let Stile do it (Chrome restarts and reopens your tabs).</span>
+            <button type="button" class="btn small primary" id="vt-hint-btn" data-testid="vertical-tabs-hint-button">Set it up for me</button>
           </div>
           <button type="button" class="icon-btn" id="vt-hint-close" aria-label="Dismiss" title="Dismiss" data-testid="vertical-tabs-hint-dismiss"></button>
+        </div>
+        <div id="gb-note" class="hint-card" data-testid="green-button-note" hidden>
+          <div class="hc-body">
+            <strong>The green button now fills the screen</strong>
+            <span>Full screen hides the sidebar on this Mac, so the green button now fills the screen instead. Change it in Settings → Windows.</span>
+          </div>
+          <button type="button" class="icon-btn" id="gb-note-close" aria-label="Dismiss" title="Dismiss" data-testid="green-button-note-dismiss"></button>
         </div>
         <div id="left-hint" class="hint-card" data-testid="left-hint" hidden>
           <div class="hc-body">
@@ -112,11 +115,29 @@
       <span id="capture-slot" class="capture-slot"></span>
       <!-- BOOST HOOK 3 slot: the button from createBoostButton(ctx) is placed here -->
       <span id="boost-slot" class="boost-slot"></span>
-      <button type="button" id="pin-toggle" class="icon-btn" data-testid="pin-toggle" aria-pressed="false" aria-label="Pin sidebar" title="Pin sidebar" hidden></button>
       <button type="button" id="settings-btn" class="icon-btn" aria-label="Settings" title="Settings" data-testid="settings-button"></button>
     </footer>
+    <!-- Stile.app required: covers the whole panel until the app is detected (side panel only) -->
+    <section id="app-required" class="app-gate" data-testid="app-required" hidden>
+      <div class="ag-body">
+        <h2 id="ag-title" data-testid="app-required-title"></h2>
+        <p id="app-offline-msg" data-testid="app-offline-message"></p>
+        <ol id="ag-steps" class="ag-steps" data-testid="app-required-steps">
+          <li>Download Stile.app and move it to Applications.</li>
+          <li>Open it and allow Accessibility.</li>
+          <li>Come back here.</li>
+        </ol>
+        <div class="hc-actions">
+          <button type="button" class="btn primary" id="app-offline-open" data-testid="app-offline-open">Open Stile.app</button>
+          <button type="button" class="btn primary" id="app-required-download" data-testid="app-required-download">Download Stile.app</button>
+          <button type="button" class="btn" id="app-offline-retry" data-testid="app-offline-retry">Check again</button>
+        </div>
+        <button type="button" class="ag-link" id="app-required-get" data-testid="app-required-get">Don't have it? Download Stile.app</button>
+      </div>
+    </section>
   </div>
   <div id="new-window-drop" class="newwin-drop" data-testid="new-window-drop" hidden><span id="newwin-drop-ic"></span><span>Drop to open in a new window</span></div>
+  <div id="present-drop" class="newwin-drop present-drop" data-testid="present-drop" hidden><span id="presentdrop-ic"></span><span>Drop to add to presentation</span></div>
   <div id="menu-root"></div>
   <div id="toast-root" aria-live="polite"></div>
   <div id="dialog-root"></div>

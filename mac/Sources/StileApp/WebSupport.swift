@@ -129,4 +129,19 @@ final class ResizeHandleView: NSView {
 /// the first click instead of needing a second one.
 final class FirstMouseWebView: WKWebView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// Chrome is frontmost, so Stile is never the active app and WebKit's own tracking areas
+    /// (`.activeInActiveApp` / `.activeInKeyWindow`) never deliver mouseMoved/mouseEntered, which kills
+    /// CSS :hover. Swap them for `.activeAlways` equivalents. Areas already `.activeAlways` are left
+    /// alone, so our replacements are not re-replaced on later passes.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        let stale: NSTrackingArea.Options = [.activeInActiveApp, .activeInKeyWindow, .activeWhenFirstResponder]
+        for area in trackingAreas where !area.options.contains(.activeAlways) {
+            removeTrackingArea(area)
+            var options = area.options.subtracting(stale)
+            options.insert(.activeAlways)
+            addTrackingArea(NSTrackingArea(rect: area.rect, options: options, owner: area.owner, userInfo: area.userInfo))
+        }
+    }
 }

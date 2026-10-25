@@ -1,6 +1,7 @@
 // Thin typed access to the extension APIs the editor uses.
 declare const chrome: any
-export const ext = chrome as {
+// through globalThis: the editor also runs in a Stile.app window (WebKit), where `chrome` is undefined
+export const ext = (globalThis as any).chrome as {
   downloads: { download: (o: Record<string, unknown>) => Promise<number> }
   runtime: any
   windows: any

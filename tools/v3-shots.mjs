@@ -77,7 +77,7 @@ const U = (n) => `http://127.0.0.1:${SITE}/${n}.html`;
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml', '.json': 'application/json' };
 const app = {
   fromExt: [], bridgeEvents: [], bridgeCalls: [], sse: new Set(), hostLog: [],
-  host: { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: false, railFound: true, railControllable: true, launchAtLogin: false, lockstep: true, accessibility: true, appVersion: '2.1.0-test' },
+  host: { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: false, railFound: true, railControllable: true, launchAtLogin: false,accessibility: true, appVersion: '2.1.0-test' },
 };
 // TEST-ONLY split hook: Chromium 141 has no split API, so tabs served to the page through this test transport can be stamped with a
 // splitViewId (app.splitMap: tabId -> splitViewId). Production code paths are untouched.
@@ -137,7 +137,6 @@ const appSrv = http.createServer((req, res) => {
         if (m.action === 'ready') hostState();
         if (m.action === 'setPinned') setHost({ state: m.value ? 'pinned' : 'peek' });
         if (m.action === 'setLaunchAtLogin') setHost({ launchAtLogin: !!m.value });
-        if (m.action === 'setLockstep') setHost({ lockstep: !!m.value });
         res.writeHead(204).end(); return;
       }
       res.writeHead(400).end();
@@ -246,7 +245,7 @@ async function main() {
     const sp = await until(() => ctx.pages().find((p) => p.url().includes('settings.html')), 8000, 100);
     await sp.setViewportSize({ width: 860, height: 600 });
     await sleep(500);
-    const SEC = ['general', 'appearance', 'tabs', 'windows', 'little', 'screenshots', 'boosts', 'profiles', 'app'];
+    const SEC = ['appearance', 'tabs', 'windows', 'little', 'screenshots', 'boosts', 'profiles', 'app'];
     for (const scheme of ['light', 'dark']) {
       await sp.emulateMedia({ colorScheme: scheme });
       for (const id of SEC) {

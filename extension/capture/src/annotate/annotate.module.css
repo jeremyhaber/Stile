@@ -235,6 +235,13 @@
 .stage[data-tool='text'] {
   cursor: text;
 }
+.stage[data-tool='canvas'] {
+  cursor: default;
+}
+.stage[data-tool='picker'],
+.stage[data-tool='measure'] {
+  cursor: cell;
+}
 .stage:focus-visible {
   outline: 3px solid var(--accent-text);
   outline-offset: 3px;
@@ -440,4 +447,36 @@
 }
 .dialog[data-phone] .textEdit {
   font-size: 16px;
+}
+
+/* ---- resize and padding (the canvas tool) */
+.numField {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+}
+.numField input {
+  width: 64px;
+  height: 26px;
+  box-sizing: border-box;
+  padding: 0 6px;
+  border: 1px solid var(--border-control);
+  border-radius: var(--r-control);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.numField input:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.times {
+  color: var(--text-3);
+}
+.checker {
+  background: repeating-conic-gradient(var(--check-a) 0 25%, var(--check-b) 0 50%) 50% / 8px 8px;
 }

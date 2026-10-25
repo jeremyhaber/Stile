@@ -1,18 +1,19 @@
 import {
   getRoots, faviconUrl, normUrl, fmtMinutes, ARCHIVE_CHOICES, DEFAULT_ARCHIVE_MINUTES,
-  looksLikeUrl, toUrl, resolveStyle, onColor, PROFILE_COLORS, PROFILE_GLYPHS, GROUP_COLORS, hashStr
+  STILE_APP_URL, looksLikeUrl, toUrl, resolveStyle, onColor, PROFILE_COLORS, PROFILE_GLYPHS, GROUP_COLORS, hashStr
 } from './shared.js';
 import { icon } from './icons.js';
 import { renderBoostView, createBoostButton } from './boost-view.js';
 import { createCaptureButton, renderCaptureRecent } from './capture/capture-view.js';
+import { setupDownloads } from './downloads.js';
 
-// Overlay mode (Sidebar.app): chrome.* is provided by bridge-shim.js and must be ready before anything touches it.
+// Overlay mode (Stile.app): chrome.* is provided by bridge-shim.js and must be ready before anything touches it.
 if (window.__sidebarReady) {
   try { await window.__sidebarReady; } catch (e) {
     const m = document.createElement('p');
     m.setAttribute('data-testid', 'bridge-error');
     m.style.cssText = 'padding:16px;font:13px system-ui;color:#888';
-    m.textContent = 'Waiting for the Sidebar extension. Make sure it is installed and enabled in Chrome.';
+    m.textContent = 'Waiting for the Stile extension. Make sure it is installed and enabled in Chrome.';
     document.body.replaceChildren(m);
     throw e;
   }
@@ -192,6 +193,8 @@ const S = {
   normalCount: 1,
   lastMerge: null,
   otherWins: [],
+  presentation: null,   // v3.3: { windowId, startedAt } while a presentation window exists
+  presenting: false,    // this panel belongs to the presentation window
   groups: new Map(),
   groupTabs: new Map(),
   sections: [],
@@ -205,6 +208,7 @@ const S = {
   boundByBm: new Map(),
   today: []
 };
+let downloadsUi = null;   // v3.2 downloads popover
 let seenMergeAt = 0;
 let renamingId = null;
 let dragging = null;
@@ -221,7 +225,7 @@ async function load() {
     chrome.tabs.query({ windowId: S.windowId }).catch(() => []),
     chrome.windows.getAll({ populate: true, windowTypes: ['normal'] }).catch(() => []),
     (chrome.tabGroups ? chrome.tabGroups.query({}).catch(() => []) : Promise.resolve([])),
-    chrome.storage.session.get(['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'incTabNames', 'incLockedTabs', 'littleWindows']).catch(() => ({})),
+    chrome.storage.session.get(['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'incTabNames', 'incLockedTabs', 'littleWindows', 'presentation', 'recordingTab']).catch(() => ({})),
     chrome.storage.local.get(['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs', 'faviconCache', 'appEverConnected', 'overlayEnabled', 'temporary', 'defaultBrowser']).catch(() => ({})),
     chrome.storage.sync.get(['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor', 'littleStyle', 'littleMaxOpen', 'temporaryMinutes', 'pinnedResetOnRestart']).catch(() => ({}))
   ]);
@@ -250,8 +254,11 @@ async function load() {
   // v2.8: little windows (regular style are 'normal' windows) are never listed as windows of Today
   S.littleIds = new Set(Object.keys(ses.littleWindows || {}).map(Number));
   wins = wins.filter((w) => !S.littleIds.has(w.id));
-  S.otherWins = wins.filter((w) => w.id !== S.windowId && w.type === 'normal' && sameWorld(w))
-    .map((w) => ({ id: w.id, focused: !!w.focused, tabs: (w.tabs || []).slice().sort((a, b) => a.index - b.index) }));
+  // v3.3: the presentation window (explicit role in session storage). Its own sidebar lists nothing but its tabs.
+  S.presentation = !S.incognito && ses.presentation && wins.some((w) => w.id === ses.presentation.windowId) ? ses.presentation : null;
+  S.presenting = !!S.presentation && S.presentation.windowId === S.windowId;
+  S.otherWins = S.presenting ? [] : wins.filter((w) => w.id !== S.windowId && w.type === 'normal' && sameWorld(w))
+    .map((w) => ({ id: w.id, focused: !!w.focused, presentation: !!S.presentation && w.id === S.presentation.windowId, tabs: (w.tabs || []).slice().sort((a, b) => a.index - b.index) }));
   S.groups = new Map((groups || []).map((g) => [g.id, g]));
   S.groupTabs = new Map();
   for (const t of [...S.tabs, ...S.otherWins.flatMap((w) => w.tabs)]) {
@@ -276,7 +283,7 @@ async function load() {
   S.defaultBrowser = !!loc.defaultBrowser;
   // Temporary is per profile and never for incognito; an unused littlesearch.html window is not a link yet
   S.temporary = S.incognito ? [] : (Array.isArray(loc.temporary) ? loc.temporary : []).filter((e) => e && e.url && !isSearchUrl(e.url));
-  S.normalCount = wins.filter((w) => w.type === 'normal' && sameWorld(w)).length;
+  S.normalCount = wins.filter((w) => w.type === 'normal' && sameWorld(w) && !(S.presentation && w.id === S.presentation.windowId)).length;
   {
     const order = Array.isArray(ses.windowOrder) ? ses.windowOrder : [];
     S.mainWindowId = ses.mainWindowId != null ? ses.mainWindowId : (order[0] != null ? order[0] : null);
@@ -297,6 +304,7 @@ async function load() {
   S.favCache = loc.faviconCache || {};
   S.bindings = ses.bindings || {};
   S.helper = ses.helper || null;
+  S.recordingTab = ses.recordingTab ? ses.recordingTab.tabId : null;   // v3.6: the tab the app is recording
   S.appEverConnected = !!loc.appEverConnected;
   S.overlayEnabled = loc.overlayEnabled !== false;
   S.lastActive = loc.lastActive || {};
@@ -313,7 +321,7 @@ async function load() {
 }
 
 function isPopout() {
-  if (S.incognito) return false;   // v2.6: no main window / pop-out logic in the incognito world
+  if (S.incognito || S.presenting) return false;   // v2.6: no main window / pop-out logic in the incognito world
   return S.mainWindowId != null && S.windowId !== S.mainWindowId && S.normalCount > 0;
 }
 
@@ -338,6 +346,7 @@ function derive() {
   S.ownUnits = [];
   S.sections = [];
   const visibleOf = (tabs, own) => {
+    if (S.presenting && own) return tabs.slice();   // v3.3: Pinned is hidden in the presentation window, so bound tabs stay in the list
     const claimed = new Set();
     const visible = [];
     for (const t of tabs) {
@@ -359,7 +368,7 @@ function derive() {
   }
   S.ownUnits = buildUnits(own);
   for (const w of S.otherWins) {
-    const visible = visibleOf(w.tabs, false);
+    const visible = w.presentation ? w.tabs.slice() : visibleOf(w.tabs, false);
     if (!visible.length) continue;
     S.sections.push({ id: w.id, tabs: w.tabs, visible, units: buildUnits(visible) });
   }
@@ -587,7 +596,41 @@ function drawProfiles() {
 function drawPopoutBar() {
   const pop = isPopout();
   $('popout-bar').hidden = !pop;
-  $('merge-all').hidden = S.normalCount < 2 || S.incognito;
+  $('merge-all').hidden = S.normalCount < 2 || S.incognito || S.presenting;
+  // v3.3: presentation window
+  document.body.classList.toggle('presenting', S.presenting);
+  $('present-bar').hidden = !S.presenting;
+  if (S.presenting && downloadsUi) downloadsUi.hide();
+}
+
+// ---- v3.3: presentation mode
+const presentToast = (r, ok) => {
+  if (!r || !r.ok) toast((r && r.error) || 'Could not update the presentation');
+  else if (ok) toast(ok);
+};
+async function startPresenting(tabId) {
+  const r = await cmd('startPresenting', tabId != null ? { tabId } : {});
+  presentToast(r, null);
+  if (r && r.ok && r.windowId != null && !r.already) await openSidePanelFor(r.windowId);
+}
+async function stopPresenting() {
+  const r = await cmd('stopPresenting');
+  if (!r || !r.ok) presentToast(r);
+  else if (r.count) toast(`Moved ${plural(r.count, 'tab')} back to the main window`);
+}
+async function addToPresentation(args) {
+  const r = await cmd('addToPresentation', args);
+  presentToast(r, null);
+}
+async function removeFromPresentation(tabId) {
+  const r = await cmd('removeFromPresentation', { tabId });
+  presentToast(r, null);
+}
+// Window-level items for the empty Today area: Start / Stop presenting.
+function presentMenuItems() {
+  if (S.incognito) return [];
+  if (S.presentation) return [{ label: 'Stop presenting', action: 'stop-presenting', run: stopPresenting }];
+  return [{ label: 'Start presenting', action: 'start-presenting', run: () => startPresenting() }];
 }
 
 function mergeToast(r) {
@@ -600,6 +643,13 @@ const goToWindow = (windowId) => safe(chrome.windows.update(windowId, { focused:
 
 function showWindowMenu(ev, wid) {
   const isMain = wid === S.mainWindowId;
+  if (S.presentation && wid === S.presentation.windowId) {
+    showMenu(ev, [
+      { label: 'Stop presenting', action: 'stop-presenting', run: stopPresenting },
+      { label: 'Go to window', action: 'go-to-window', run: () => goToWindow(wid) }
+    ]);
+    return;
+  }
   showMenu(ev, [
     !isMain && !S.incognito ? { label: 'Merge into main window', action: 'merge-window', run: () => mergeWindowCmd(wid) } : null,
     !isMain && !S.incognito ? { label: 'Make this the main window', action: 'make-main', run: () => cmd('setMainWindow', { windowId: wid }) } : null,
@@ -613,6 +663,7 @@ function drawHint() {
   $('left-hint').hidden = S.leftHintDismissed;
   // Chrome is in horizontal-tabs mode (the app found no rail): explain how to get the full sidebar.
   $('vt-hint').hidden = !(OVERLAY && HOSTS.railFound === false && !vtHintDismissed);
+  $('gb-note').hidden = !(OVERLAY && HOSTS.greenButtonNote && !gbNoteDismissed);
 }
 
 // ---- favourites
@@ -858,6 +909,7 @@ function toggleWindow(id) {
 function sectionEl(sec) {
   const open = !S.collapsedWindows[sec.id];
   const isMain = isPopout() && sec.id === S.mainWindowId;
+  const isPres = !!(S.presentation && sec.id === S.presentation.windowId);
   const active = sec.tabs.find((t) => t.active);
   const head = h('div', {
     class: 'row window-head', role: 'button', tabindex: '0', 'aria-expanded': open ? 'true' : 'false',
@@ -868,14 +920,18 @@ function sectionEl(sec) {
   },
   rbg(),
   h('span', { class: 'chev' }, icon('chevron', 14)),
-  h('span', { class: 'wmeta', text: `${isMain ? 'Main window' : 'Window'} · ${plural(sec.visible.length, 'tab')}` }),
+  h('span', { class: 'wmeta', text: `${isPres ? 'Presentation' : isMain ? 'Main window' : 'Window'} · ${plural(sec.visible.length, 'tab')}` }),
   h('span', { class: 'wsub', text: active ? (active.title || '') : '' }),
-  isMain || S.incognito ? null : h('button', {
+  isPres ? h('button', {
+    type: 'button', class: 'text-btn wmerge', title: 'Stop presenting and move its tabs back', 'aria-label': 'Stop presenting', 'data-testid': 'present-section-stop', text: 'Stop',
+    onclick: (ev) => { ev.stopPropagation(); stopPresenting(); },
+    onkeydown: (ev) => ev.stopPropagation()
+  }) : isMain || S.incognito ? null : h('button', {
     type: 'button', class: 'text-btn wmerge', title: 'Merge into main window', 'aria-label': 'Merge into main window', 'data-testid': 'window-merge', text: 'Merge',
     onclick: (ev) => { ev.stopPropagation(); mergeWindowCmd(sec.id); },
     onkeydown: (ev) => ev.stopPropagation()
   }));
-  return h('div', { class: 'window-section', 'data-testid': 'window-section', 'data-window-id': sec.id, 'data-open': open ? 'true' : 'false' },
+  return h('div', { class: 'window-section' + (isPres ? ' is-presentation' : ''), 'data-testid': 'window-section', 'data-window-id': sec.id, 'data-open': open ? 'true' : 'false', 'data-presentation': isPres ? 'true' : null },
     head, open ? h('div', { class: 'window-body' }, ...renderUnits(sec.units, true)) : null);
 }
 
@@ -959,6 +1015,7 @@ function todayRow(tab, act, other) {
     ? renameInput(title, (v) => cmd('renameTab', { tabId: tab.id, name: v }), true)
     : h('span', { class: 'title', text: title, ondblclick: (ev) => { ev.stopPropagation(); startRename('n' + tab.id); } }),
   lockBadge(tab),
+  S.recordingTab === tab.id ? h('span', { class: 'rec-dot', title: 'Recording this tab', 'data-testid': 'recording-dot' }) : null,
   tab.audible ? h('span', { class: 'badge-ic audio', title: 'Playing audio', 'data-testid': 'audible-icon' }, icon('speaker', 13)) : null,
   clock,
   h('button', {
@@ -1097,7 +1154,7 @@ function drawArchive() {
   const box = $('archive-list');
   const m = effectiveMinutes();
   $('archive-hint').textContent = m > 0 ? `Tabs you haven't used for ${fmtMinutes(m)} end up here.` : 'Automatic archiving is off.';
-  $('archive-clear').disabled = all.length === 0;
+  document.querySelector('.archive-foot').hidden = all.length === 0;
   if (!list.length) {
     box.replaceChildren(h('div', { class: 'empty-note', 'data-testid': 'archive-empty', text: all.length ? 'No matches' : 'Nothing archived yet' }));
     return;
@@ -1135,13 +1192,22 @@ let offlineFailed = false;
 let offlineTimer = null;
 function drawOfflineCard() {
   const hs = S.helper;
-  const down = !OVERLAY && S.appEverConnected && !!(hs && (hs.status === 'not_installed' || hs.status === 'error'));
-  $('app-offline').hidden = !down;
+  // Stile.app is required: a full-panel gate while it isn't detected (never for 'checking'/unknown, never in overlay mode).
+  const down = !OVERLAY && !!(hs && (hs.status === 'not_installed' || hs.status === 'error'));
+  const gate = $('app-required');
+  gate.hidden = !down;
+  for (const el of document.getElementById('app').children) if (el !== gate) el.inert = down;
   if (!down) { offlineFailed = false; offlineTryAt = 0; return; }
-  $('app-offline-msg').textContent = offlineFailed
-    ? "Couldn't start it. Open Sidebar.app from your Applications folder."
-    : "Open it to cover Chrome's tabs with this sidebar.";
-}
+  const fresh = !S.appEverConnected;
+  $('ag-title').textContent = fresh ? 'Stile needs the Stile app' : "Stile.app isn't running";
+  $('app-offline-msg').textContent = fresh
+    ? 'Stile works together with Stile.app on your Mac. Install it and this panel turns on by itself.'
+    : offlineFailed ? "Couldn't start it. Open Stile.app from your Applications folder." : "Open it to cover Chrome's tabs with this sidebar.";
+  $('ag-steps').hidden = !fresh;
+  $('app-required-download').hidden = !fresh;
+  $('app-offline-open').hidden = fresh;
+  $('app-required-get').hidden = fresh;
+  $('app-offline-retry').textContent = fresh ? 'Check again' : 'Retry';}
 async function offlineRetry(launch) {
   offlineFailed = false;
   offlineTryAt = Date.now();
@@ -1462,11 +1528,20 @@ function showTabMenu(ev, tab, opts = {}) {
   const inSplit = opts.split || (sidOf(tab) >= 0 ? { kind: 'split', splitId: sidOf(tab), tabs: [tab] } : null);
   const items = [];
   if (other) items.push({ label: 'Go to its window', action: 'go-window', run: () => cmd('goToTab', { tabId: tab.id }) }, '-');
-  items.push(
-    { label: 'Add to Favourites', action: 'add-favourite', run: () => cmd('pinTab', { tabId: tab.id, target: 'favourites', windowId: S.windowId }) },
-    { label: 'Pin', action: 'pin', run: () => cmd('pinTab', { tabId: tab.id, target: 'pinned', windowId: S.windowId }) },
-    '-'
-  );
+  if (!S.presenting) {
+    items.push(
+      { label: 'Add to Favourites', action: 'add-favourite', run: () => cmd('pinTab', { tabId: tab.id, target: 'favourites', windowId: S.windowId }) },
+      { label: 'Pin', action: 'pin', run: () => cmd('pinTab', { tabId: tab.id, target: 'pinned', windowId: S.windowId }) },
+      '-'
+    );
+  }
+  if (!S.incognito && !tab.incognito) {
+    if (S.presenting) items.push({ label: 'Remove from presentation', action: 'remove-from-presentation', run: () => removeFromPresentation(tab.id) }, '-');
+    else if (S.presentation) {
+      if (tab.windowId !== S.presentation.windowId) items.push({ label: 'Add to presentation', action: 'add-to-presentation', run: () => addToPresentation({ tabId: tab.id }) }, '-');
+      else items.push({ label: 'Remove from presentation', action: 'remove-from-presentation', run: () => removeFromPresentation(tab.id) }, '-');
+    } else items.push({ label: 'Start presenting with this tab', action: 'start-presenting-tab', run: () => startPresenting(tab.id) }, '-');
+  }
   if (HAS_GROUPS) {
     items.push({ label: 'Add to new group', action: 'new-group', run: () => newGroupWith(tab) });
     const gs = [...S.groups.values()].filter((g) => g.windowId === tab.windowId && g.id !== gidOf(tab));
@@ -1498,10 +1573,15 @@ function showTabMenu(ev, tab, opts = {}) {
   items.push({ label: locked ? 'Unlock tab' : 'Lock tab', action: locked ? 'unlock' : 'lock', run: () => cmd('setTabLock', { tabId: tab.id, locked: !locked }) });
   items.push(
     S.incognito || tab.incognito ? null : { label: 'Archive tab', action: 'archive', run: () => cmd('archiveTab', { tabId: tab.id }) },
-    S.incognito || tab.incognito || locked || S.bindings[tab.id] ? null : { label: 'Move to Temporary', action: 'to-temporary', run: async () => {
+    S.incognito || tab.incognito || locked || S.bindings[tab.id] || S.presenting ? null : { label: 'Move to Temporary', action: 'to-temporary', run: async () => {
       const r = await cmd('moveToTemporary', { tabId: tab.id });
       if (r && !r.ok) toast(r.error || 'Could not move it to Temporary');
     } },
+    S.helper && S.helper.status === 'connected' && !S.incognito && !tab.incognito && S.recordingTab !== tab.id
+      ? { label: 'Record this tab', action: 'record-tab', run: async () => {
+        const r = await cmd('recordTab', { tabId: tab.id });
+        if (r && !r.ok) toast(r.error || 'Could not start recording');
+      } } : null,
     '-',
     { label: 'Duplicate tab', action: 'duplicate', run: () => safe(chrome.tabs.duplicate(tab.id)) },
     { label: 'Close tab', action: 'close', run: () => safe(chrome.tabs.remove(tab.id)) },
@@ -1525,6 +1605,7 @@ function showGroupMenu(ev, g, other) {
       if (t) await safe(chrome.tabs.group({ tabIds: [t.id], groupId: g.id }));
     } },
     { label: 'Move to new window', action: 'new-window', run: () => toNewWindow({ groupId: g.id }) },
+    !S.incognito && S.presentation && g.windowId !== S.presentation.windowId ? { label: 'Add group to presentation', action: 'add-group-to-presentation', run: () => addToPresentation({ groupId: g.id }) } : null,
     other ? { label: 'Move group to this window', action: 'move-group-here', run: () => safe(chrome.tabGroups.move(g.id, { windowId: S.windowId, index: -1 })) } : null,
     '-',
     { label: 'Ungroup', action: 'ungroup', run: async () => { const ts = await tabsOf(); if (ts.length) await safe(chrome.tabs.ungroup(ts.map((t) => t.id))); } },
@@ -1570,6 +1651,7 @@ function startDrag(e, payload, el) {
     el.classList.add('dragged');
     if (dragging) document.body.classList.add('drag-reveal');   // v2.5: empty Favourites / Pinned appear while dragging
     if (dragging && dragging.type !== 'bm') $('new-window-drop').hidden = false;
+    if (dragging && dragging.type !== 'bm' && S.presentation && !S.presenting) $('present-drop').hidden = false;
   });
 }
 
@@ -1578,6 +1660,8 @@ function endDrag() {
   document.body.classList.remove('dragging', 'drag-reveal');
   $('new-window-drop').hidden = true;
   $('new-window-drop').classList.remove('over');
+  $('present-drop').hidden = true;
+  $('present-drop').classList.remove('over');
   clearMarks();
   document.querySelectorAll('.dragged').forEach((x) => x.classList.remove('dragged'));
   if (dirty) scheduleRender();
@@ -1846,6 +1930,23 @@ function setupDnd() {
     nw.classList.add('over');
   });
   nw.addEventListener('dragleave', (e) => { if (!nw.contains(e.relatedTarget)) nw.classList.remove('over'); });
+  const pd = $('present-drop');
+  pd.addEventListener('dragover', (e) => {
+    if (!dragging || dragging.type === 'bm') return;
+    e.preventDefault();
+    try { e.dataTransfer.dropEffect = 'move'; } catch { /* ignore */ }
+    pd.classList.add('over');
+  });
+  pd.addEventListener('dragleave', (e) => { if (!pd.contains(e.relatedTarget)) pd.classList.remove('over'); });
+  pd.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    const d = dragging;
+    endDrag();
+    if (!d || d.type === 'bm') return;
+    if (d.type === 'tab') await addToPresentation({ tabId: d.tabId });
+    else if (d.type === 'group') await addToPresentation({ groupId: d.groupId });
+    else if (d.type === 'split') await addToPresentation({ splitViewId: d.splitId });
+  });
   nw.addEventListener('drop', async (e) => {
     e.preventDefault();
     const d = dragging;
@@ -1921,8 +2022,13 @@ function setupStatic() {
   $('today').closest('.sec').addEventListener('contextmenu', (ev) => {
     if (ev.target.closest('.today-row, .split-row, .group-row, .window-head, input, textarea')) return;
     ev.preventDefault();
-    showMenu(ev, [{ label: 'New pinned folder', action: 'new-pinned-folder', run: () => newFolder(null) }]);
+    showMenu(ev, [
+      S.presenting ? null : { label: 'New pinned folder', action: 'new-pinned-folder', run: () => newFolder(null) },
+      ...presentMenuItems()
+    ]);
   });
+  $('present-stop').addEventListener('click', stopPresenting);
+  $('presentdrop-ic').append(icon('present', 18));
   $('clear').addEventListener('click', async () => {
     const r = await cmd('clearToday', { windowId: S.windowId });
     if (!r || !r.ok) toast((r && r.error) || 'Could not clear Today');
@@ -1947,6 +2053,7 @@ function setupStatic() {
   });
   $('app-offline-open').addEventListener('click', () => offlineRetry(true));
   $('app-offline-retry').addEventListener('click', () => offlineRetry(false));
+  for (const id of ['app-required-download', 'app-required-get']) $(id).addEventListener('click', () => safe(chrome.tabs.create({ url: STILE_APP_URL })));
   const openLeft = () => safe(chrome.tabs.create({ url: 'chrome://settings/appearance' }));
   $('left-hint-btn').addEventListener('click', openLeft);
   $('left-hint-close').append(icon('x', 14));
@@ -1961,6 +2068,7 @@ function setupStatic() {
     if (!r || !r.ok) toast((r && r.error) || 'Could not clear Temporary');
     else if (n) toast(`Archived ${plural(n, 'temporary link')}`);
   });
+  $('popout-bar').prepend(icon('arrowUpRight', 16));   // the only part left visible in the collapsed rail
   $('popout-merge').addEventListener('click', () => mergeWindowCmd(S.windowId));
   $('popout-bar').addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
@@ -1995,7 +2103,7 @@ function setupListeners() {
   chrome.storage.onChanged.addListener((changes, area) => {
     const keys = Object.keys(changes);
     const rel = {
-      session: ['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'overlayConnected', 'incTabNames', 'incLockedTabs', 'littleWindows'],
+      session: ['bindings', 'helper', 'mainWindowId', 'windowOrder', 'lastMerge', 'overlayConnected', 'incTabNames', 'incLockedTabs', 'littleWindows', 'presentation', 'recordingTab'],
       local: ['lastActive', 'archive', 'globalDefaultMinutes', 'profileDir', 'collapsed', 'roots', 'collapsedWindows', 'leftHintDismissed', 'tabNames', 'lockedTabs', 'appEverConnected', 'overlayEnabled', 'temporary', 'defaultBrowser'],
       sync: ['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor', 'littleStyle', 'littleMaxOpen', 'temporaryMinutes', 'pinnedResetOnRestart']
     }[area];
@@ -2011,7 +2119,9 @@ function setupListeners() {
 
 // ------------------------------------------------------------------ overlay mode (host protocol)
 // Host state pushed by the app (`__sidebarHostState`): state is "collapsed" | "peek" | "pinned".
-const HOSTS = { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: null, railFound: null, railControllable: true, launchAtLogin: false, lockstep: true, accessibility: null, appVersion: '', pinMode: 'push', topBar: false };
+const HOSTS = { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: null, railFound: null, railControllable: true, launchAtLogin: false,accessibility: null, appVersion: '', pinMode: 'push', topBar: false, topBarToggle: false, greenButtonNote: false };
+let gbNoteDismissed = false; // v3.1: the one-time "green button fills the screen" note, dismissed for this page load
+let gbNoteArmed = false;     // last greenButtonNote value from the app (a false -> true edge shows the note again)
 let vtHintDismissed = false;
 try { vtHintDismissed = localStorage.getItem('vtHintDismissed') === '1'; } catch { /* storage unavailable */ }
 const hostPost = (action, value) => { try { if (window.__sidebarHost) window.__sidebarHost.post(action, value); } catch { /* ignore */ } };
@@ -2064,18 +2174,27 @@ function applyHostState(st) {
   if ('railFound' in st) HOSTS.railFound = typeof st.railFound === 'boolean' ? st.railFound : null;
   if ('railControllable' in st) HOSTS.railControllable = st.railControllable !== false;
   if ('launchAtLogin' in st) HOSTS.launchAtLogin = !!st.launchAtLogin;
-  if ('lockstep' in st) HOSTS.lockstep = st.lockstep !== false;
   if ('accessibility' in st) HOSTS.accessibility = typeof st.accessibility === 'boolean' ? st.accessibility : null;
   if (typeof st.appVersion === 'string') HOSTS.appVersion = st.appVersion;
   if ('topBar' in st) HOSTS.topBar = st.topBar === true;
+  if ('topBarToggle' in st) HOSTS.topBarToggle = st.topBarToggle === true;
+  if ('greenButtonNote' in st) {
+    const note = st.greenButtonNote === true;
+    // Latched: the app clears its flag once told the note was seen, but the card stays until dismissed.
+    if (note && !gbNoteArmed) { gbNoteDismissed = false; hostPost('greenButtonNoteSeen', true); }
+    gbNoteArmed = note;
+    if (note) HOSTS.greenButtonNote = true;
+  }
   const root = document.documentElement;
   root.style.setProperty('--icon-x', `${HOSTS.railWidth / 2}px`);
   root.classList.toggle('overlay-float', HOSTS.state === 'peek' || (isPinned() && !HOSTS.railControllable));
   if (wasCompact !== HOSTS.compact) setCompact(HOSTS.compact);
-  const btn = $('pin-toggle');
-  btn.hidden = HOSTS.topBar;
+  const btn = $('sidebar-toggle');
+  // Stands in for the header's own toggle when the header has no room for it (collapsed rail: Chrome's toolbar
+  // starts right after the traffic lights), so it sits at the top of the strip, just under them.
+  $('sidebar-toggle-row').hidden = HOSTS.topBar && HOSTS.topBarToggle;
   btn.setAttribute('aria-pressed', isPinned() ? 'true' : 'false');
-  const lbl = isPinned() ? 'Unpin sidebar' : 'Pin sidebar';
+  const lbl = isPinned() ? 'Collapse sidebar' : 'Keep sidebar open (\u2303\u2325S)';
   btn.title = lbl; btn.setAttribute('aria-label', lbl);
   if (loaded) {
     if (oldColor !== HOSTS.chromeColor) { drawTheme(); }
@@ -2161,13 +2280,21 @@ function setupOverlay() {
   setupWindowDrag();
   document.documentElement.classList.add('overlay');
   drawChromeTheme(null);
-  $('pin-toggle').hidden = false;
-  $('pin-toggle').append(icon('pin', 15));
-  $('pin-toggle').addEventListener('click', () => hostPost('setPinned', !isPinned()));
+  $('sidebar-toggle-row').hidden = false;
+  $('sidebar-toggle').append(icon('sidebarLeft', 16));
+  $('sidebar-toggle').addEventListener('click', () => hostPost('setPinned', !isPinned()));
+  $('vt-hint-btn').addEventListener('click', () => hostPost('setUpChrome', true));
   $('vt-hint-close').append(icon('x', 14));
   $('vt-hint-close').addEventListener('click', () => {
     vtHintDismissed = true;
     try { localStorage.setItem('vtHintDismissed', '1'); } catch { /* ignore */ }
+    drawHint();
+  });
+  $('gb-note-close').append(icon('x', 14));
+  $('gb-note-close').addEventListener('click', () => {
+    gbNoteDismissed = true;
+    HOSTS.greenButtonNote = false;
+    hostPost('greenButtonNoteSeen', true);
     drawHint();
   });
   setupEditingReport();
@@ -2183,6 +2310,11 @@ function setupOverlay() {
 (async function init() {
   if (OVERLAY) setupOverlay();
   setupStatic();
+  downloadsUi = setupDownloads({
+    h, $, cmd, hostPost, OVERLAY,
+    canShow: () => loaded && !S.presenting && !isCompact() && !dragging && !menuEl && !nativeMenu,
+    busy: () => !!(dragging || menuEl || nativeMenu)
+  });
   setupAddress();
   setupKeyboard();
   setupDnd();

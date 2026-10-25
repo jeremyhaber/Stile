@@ -6,7 +6,7 @@ import {
   applyHandle,
   arrowParts,
   badgeRadiusFor,
-  blockSizeFor,
+  blurRadiusFor,
   boundsOf,
   clientToImage,
   clampPan,
@@ -86,13 +86,20 @@ const text = (o: Partial<TextShape> = {}): TextShape => ({
 })
 
 describe('sizes are relative to the image', () => {
-  it('scales stroke, font and badge with the long side, with minimums', () => {
+  it('scales stroke, font and badge with the image, with minimums', () => {
     expect(strokeFor(1, 1920, 1080)).toBe(10)
     expect(strokeFor(1, 100, 100)).toBe(4)
     expect(strokeFor(0, 1920, 1080)).toBeLessThan(strokeFor(2, 1920, 1080))
     expect(fontSizeFor(1, 1920, 1080)).toBe(54)
     expect(fontSizeFor(0, 50, 50)).toBe(14)
     expect(badgeRadiusFor(2, 1000, 600)).toBe(20)
+  })
+  it('sizes a tall full-page capture like a screen of the same width, not by its height', () => {
+    expect(badgeRadiusFor(1, 3300, 20000)).toBe(badgeRadiusFor(1, 3300, 2000))
+    expect(strokeFor(1, 3300, 20000)).toBe(strokeFor(1, 3300, 2000))
+    expect(fontSizeFor(1, 1170, 2532)).toBe(33)
+    // a panorama is capped by its height
+    expect(strokeFor(1, 10000, 1000)).toBe(13)
   })
   it('finds the size step nearest to a width', () => {
     expect(sizeIndexOf(strokeFor(2, 1000, 600), 1000, 600)).toBe(2)
@@ -434,9 +441,10 @@ describe('shared drawing geometry', () => {
     expect(head[1]!.y).toBeCloseTo(-head[2]!.y)
     expect(arrowParts({ x: 5, y: 5 }, { x: 5, y: 5 }, 6).shaftEnd).toEqual({ x: 5, y: 5 })
   })
-  it('pixelates in blocks big enough to hide text', () => {
-    expect(blockSizeFor(300, 40)).toBe(8)
-    expect(blockSizeFor(1000, 500)).toBe(48)
+  it('blurs strongly enough to hide text', () => {
+    expect(blurRadiusFor(300, 40)).toBe(10)
+    expect(blurRadiusFor(100, 20)).toBe(8)
+    expect(blurRadiusFor(1000, 500)).toBe(40)
   })
 })
 

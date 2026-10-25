@@ -107,15 +107,6 @@ extension Settings {
         get { UserDefaults.standard.bool(forKey: "greenButtonNotePending") }
         set { UserDefaults.standard.set(newValue, forKey: "greenButtonNotePending") }
     }
-
-    /// v2.9: Stile.app moves/resizes Chrome's window itself during a toolbar drag or edge resize (default on).
-    static var lockstepDrag: Bool {
-        get { UserDefaults.standard.bool(forKey: "lockstepDrag") }   // opt-in (default off) until proven on more setups
-        set {
-            UserDefaults.standard.set(newValue, forKey: "lockstepDrag")
-            post()
-        }
-    }
 }
 
 // MARK: - Launch at login
@@ -293,5 +284,16 @@ enum JSONUtil {
     static func int(_ v: Any?) -> Int? {
         if let n = v as? NSNumber { return n.intValue }
         return nil
+    }
+}
+
+/// The Dock icon (and Command+Tab) shows while any editor, recording preview or the settings window is open.
+@MainActor
+enum DockPresence {
+    static func update() {
+        let on = CaptureEditors.shared.hasOpen || RecordingWindows.shared.hasOpen || AppSettingsWindow.shared.isOpen
+        guard (NSApp.activationPolicy() == .regular) != on else { return }
+        NSApp.setActivationPolicy(on ? .regular : .accessory)
+        Log.write("dock: \(on ? "in the Dock (window open)" : "menu bar only again")")
     }
 }

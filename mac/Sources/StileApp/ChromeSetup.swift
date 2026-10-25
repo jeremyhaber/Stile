@@ -78,8 +78,31 @@ enum ChromeSetup {
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { done?(false); return }
 
+        quitChrome(apps, reason: "to set up \(todo.map(\.dir).joined(separator: ", "))") { quit in
+            guard quit else { done?(false); return }
+            let ok = apply(todo)
+            relaunch()
+            done?(ok)
+        }
+    }
+
+    /// v3.10: gracefully quits Chrome and reopens it with its session restored (no prompt: the caller's button
+    /// was the user's consent). `done(true)` once relaunched; `done(false)` if Chrome didn't quit.
+    static func restartChrome(_ done: ((Bool) -> Void)? = nil) {
+        guard !busy else { return }
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+        guard !apps.isEmpty else { relaunch(); done?(true); return }
+        quitChrome(apps, reason: "to restart it") { quit in
+            if quit { relaunch() }
+            done?(quit)
+        }
+    }
+
+    /// Asks Chrome to quit and waits up to 20 s; shows the "didn't quit" alert on failure.
+    private static func quitChrome(_ apps: [NSRunningApplication], reason: String,
+                                   _ then: @escaping @MainActor (Bool) -> Void) {
         busy = true
-        Log.write("chrome setup: quitting Chrome to set up \(todo.map(\.dir).joined(separator: ", "))")
+        Log.write("chrome setup: quitting Chrome \(reason)")
         for a in apps { a.terminate() }
         waitForQuit(until: Date().addingTimeInterval(20)) { quit in
             busy = false
@@ -89,12 +112,10 @@ enum ChromeSetup {
                 a.messageText = "Chrome didn\u{2019}t quit"
                 a.informativeText = "Close any \u{201C}Leave site?\u{201D} dialogs in Chrome and try again."
                 a.runModal()
-                done?(false)
+                then(false)
                 return
             }
-            let ok = apply(todo)
-            relaunch()
-            done?(ok)
+            then(true)
         }
     }
 

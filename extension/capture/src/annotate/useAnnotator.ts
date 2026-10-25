@@ -1,7 +1,7 @@
 /**
  * State and interaction logic of the annotation editor: tools, selection, pointer drags (create / move / resize / pen /
- * crop), keyboard operation (place, nudge, resize, cycle, delete), inline text editing, undo / redo and the polite
- * status line. The stage and toolbar components only draw and forward events.
+ * crop), keyboard operation (place, nudge, resize, cycle, delete), inline text editing, undo / redo, the pointer probe
+ * (color under the pointer, smart measurement), canvas padding / export scale and the polite status line. The stage and toolbar components only draw and forward events.
  */
 import {
   useCallback,
@@ -28,7 +28,12 @@ import {
   DEFAULT_COLOR,
   EMPTY_DOC,
   FONT_LABELS,
+  SELECTION_GAP,
   HIGHLIGHT_COLOR,
+  KIND_NAME,
+  MAX_PAD,
+  MAX_SCALE,
+  MIN_SCALE,
   PLACEABLE,
   SIZE_LABELS,
   TOOL_LABEL,
@@ -36,6 +41,7 @@ import {
   applyHandle,
   badgeRadiusFor,
   boundsOf,
+  canvasRect,
   centerOf,
   clampN,
   colorName,
@@ -47,25 +53,34 @@ import {
   fontSizeFor,
   freeSpot,
   handleAt,
+  handleOutset,
   hitTest,
   keyDelta,
   keyStep,
+  magnifyPart,
+  measureLabel,
   moveRect,
   moveShape,
   nearestIndex,
   newShapeId,
-  nextBadgeNumber,
+  badgeCounter,
+  clampBadge,
+  outputSize,
+  padSize,
   rectOf,
   resizeRect,
   resizeShapeBy,
+  selectionPad,
   selectionAnnouncement,
   shapeLabel,
   sizeIndexOf,
   strokeFor,
+  translateMagnifyPart,
   viewRect,
   MIN_CROP,
   type AnnotDoc,
   type Handle,
+  type Pad,
   type Pt,
   type Rect,
   type Shape,
@@ -74,10 +89,21 @@ import {
   type TextMeasure,
   type Tool,
 } from './model'
+import type { Probe, Sampler } from './pixels'
 
 type Drag =
-  | { mode: 'move'; id: string; orig: Shape; start: Pt; base: AnnotDoc; moved: boolean }
-  | { mode: 'resize'; id: string; handle: Handle; orig: Shape; base: AnnotDoc }
+  /** part: a magnifier's lens or source dragged on its own */
+  | {
+      mode: 'move'
+      id: string
+      orig: Shape
+      start: Pt
+      base: AnnotDoc
+      moved: boolean
+      part?: 'lens' | 'src'
+    }
+  /** off: how far the grabbed handle sits outside the shape (see selectionPad), so grabbing it doesn't jump */
+  | { mode: 'resize'; id: string; handle: Handle; orig: Shape; base: AnnotDoc; off: Pt }
   | { mode: 'create'; id: string; orig: Shape; start: Pt; base: AnnotDoc; kind: PointerKind }
   | { mode: 'pen'; id: string; base: AnnotDoc; start: Pt; kind: PointerKind }
   | { mode: 'text-tap'; start: Pt; base: AnnotDoc }
@@ -102,6 +128,12 @@ export interface AnnotatorOptions {
   /** screen pixels per image pixel (the stage's current fit) */
   scale: number
   measure?: TextMeasure
+  /** reads the picture (color picker, smart measurement); without one those tools do nothing */
+  sampler?: Sampler | null
+  /** image px per measured px (a Retina capture's devicePixelRatio: measurements are in CSS px) */
+  unit?: number
+  /** the color picker copies a hex color (Tab, or a click) */
+  onCopyColor?: (hex: string) => void
 }
 
 const withShapes = (d: AnnotDoc, shapes: Shape[]): AnnotDoc => ({ ...d, shapes })
@@ -111,7 +143,17 @@ const mapShape = (d: AnnotDoc, id: string, fn: (s: Shape) => Shape): AnnotDoc =>
     d.shapes.map((s) => (s.id === id ? fn(s) : s)),
   )
 
-export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
+/** the kinds a picked color goes to */
+const COLOR_KINDS = Object.keys(KIND_NAME)
+
+export function useAnnotator({
+  img,
+  scale,
+  measure,
+  sampler,
+  unit = 1,
+  onCopyColor,
+}: AnnotatorOptions) {
   const [hist, apply] = useReducer(
     (h: History, fn: (h: History) => History) => fn(h),
     EMPTY_DOC,
@@ -129,10 +171,14 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
   const editingRef = useRef(editing)
   editingRef.current = editing
   const [status, setStatus] = useState('')
+  const [probe, setProbe] = useState<Probe | null>(null)
+  const probeRef = useRef(probe)
+  probeRef.current = probe
+  const [measureBox, setMeasureBoxState] = useState(false)
   const drag = useRef<Drag | null>(null)
   const lastClick = useRef<{ id: string; at: number } | null>(null)
-  const geo = useRef({ scale, img, measure })
-  geo.current = { scale, img, measure }
+  const geo = useRef({ scale, img, measure, sampler, unit, onCopyColor })
+  geo.current = { scale, img, measure, sampler, unit, onCopyColor }
 
   const say = useCallback((msg: string) => {
     // an identical message must still be announced again
@@ -160,7 +206,9 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
   const styleRef = useRef(style)
   styleRef.current = style
 
-  const view = viewRect(tool, doc.crop, img)
+  const view = viewRect(tool, doc.crop, img, padSize(doc))
+  /** where shapes may go: the exported canvas (the crop plus any padding) */
+  const area = () => canvasRect(docRef.current, geo.current.img)
 
   // ---------------------------------------------------------------------------------------- selection + tool
   const select = useCallback(
@@ -189,7 +237,9 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
     apply((h) => record(h, fn(h.present), co ? { key: co, now: Date.now() } : undefined))
   const addShape = (shape: Shape, how: 'record' | 'replace') =>
     apply((h) => {
-      const next = withShapes(h.present, [...h.present.shapes, shape])
+      let next = withShapes(h.present, [...h.present.shapes, shape])
+      // placing a badge uses the counter, which moves on to the number after it
+      if (shape.kind === 'badge') next = { ...next, nextBadge: clampBadge(shape.n + 1) }
       return how === 'record' ? record(h, next) : replace(h, next)
     })
 
@@ -234,16 +284,93 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
   }, [say])
 
   // ---------------------------------------------------------------------------------------------- placing
-  const canPlace = tool === 'crop' || PLACEABLE.has(tool)
+  const canPlace = tool === 'crop' || tool === 'measure' || tool === 'picker' || PLACEABLE.has(tool)
+
+  // ------------------------------------------------------------------------------------- probe, pick, measure
+  const probeAt = (pt: Pt | null, t: Tool = tool) => {
+    const smp = geo.current.sampler
+    if (!pt) {
+      setProbe(null)
+      return null
+    }
+    const next: Probe = {
+      pt,
+      color: smp?.color(pt) ?? null,
+      span: t === 'measure' ? (smp?.span(pt) ?? null) : null,
+    }
+    setProbe(next)
+    return next
+  }
+
+  /** the color picker: the pixel's color becomes the drawing color (every tool) and is copied */
+  const pickAt = (pt: Pt) => {
+    const c = geo.current.sampler?.color(pt)
+    if (!c) {
+      say('No color here')
+      return
+    }
+    setToolColors(Object.fromEntries(COLOR_KINDS.map((k) => [k, c])))
+    geo.current.onCopyColor?.(c)
+    say(`${c} picked`)
+  }
+
+  const copyProbeColor = () => {
+    const c = probeRef.current?.color
+    if (!c) return false
+    geo.current.onCopyColor?.(c)
+    return true
+  }
+
+  /** a smart measurement: the like-colored run through `pt` across and down, as up to two dimension lines */
+  const measureAt = (pt: Pt) => {
+    const sp = geo.current.sampler?.span(pt)
+    if (!sp) {
+      say('Nothing to measure here')
+      return
+    }
+    const st = styleRef.current
+    const u = geo.current.unit
+    const x = Math.floor(pt.x) + 0.5
+    const y = Math.floor(pt.y) + 0.5
+    const base = { color: st.color, width: st.width, box: false, unit: u, kind: 'measure' as const }
+    const out: Shape[] = []
+    if (sp.x2 - sp.x1 >= 2)
+      out.push({ ...base, id: newShapeId(), a: { x: sp.x1, y }, b: { x: sp.x2, y } })
+    if (sp.y2 - sp.y1 >= 2)
+      out.push({ ...base, id: newShapeId(), a: { x, y: sp.y1 }, b: { x, y: sp.y2 } })
+    if (!out.length) {
+      say('Nothing to measure here')
+      return
+    }
+    recordDoc((d) => withShapes(d, [...d.shapes, ...out]))
+    say(`Measured ${out.map((m) => (m.kind === 'measure' ? measureLabel(m) : '')).join(' by ')}`)
+  }
+
+  const setMeasureBox = (box: boolean) => {
+    setMeasureBoxState(box)
+    if (selected?.kind === 'measure')
+      recordDoc((d) => mapShape(d, selected.id, (s) => ({ ...s, box }) as Shape))
+    say(box ? 'Measure boxes' : 'Measure lines')
+  }
 
   const place = useCallback(() => {
     const d = docRef.current
     const { img: im, scale: sc } = geo.current
+    if (tool === 'measure' || tool === 'picker') {
+      const pt = probeRef.current?.pt ?? centerOf(viewRect(tool, d.crop, im))
+      if (tool === 'measure') measureAt(pt)
+      else pickAt(pt)
+      return
+    }
     if (tool === 'crop') {
       if (!d.crop) {
         recordDoc((x) => ({ ...x, crop: defaultCrop(im) }))
-        say('Crop area set. Arrow keys move it, Alt with arrow keys resizes it.')
+        say('Crop area set. Arrow keys move it, Alt with arrow keys resizes it, Enter applies it.')
+        return
       }
+      // Enter with a crop in place applies it: back to the select tool
+      setToolState('select')
+      say('Crop applied')
       return
     }
     if (!PLACEABLE.has(tool)) return
@@ -255,7 +382,7 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
       styleRef.current,
       newShapeId(),
       im,
-      nextBadgeNumber(d.shapes),
+      badgeCounter(d),
     )
     const next = withShapes(d, [...d.shapes, shape])
     addShape(shape, 'record')
@@ -285,9 +412,11 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
 
     if (tool === 'select') {
       if (selected) {
-        const h = handleAt(selected, pt, tol.handle, m)
+        const pad = selectionPad(selected, SELECTION_GAP / (geo.current.scale || 1))
+        const h = handleAt(selected, pt, tol.handle, m, pad)
         if (h) {
-          drag.current = { mode: 'resize', id: selected.id, handle: h, orig: selected, base: d }
+          const off = handleOutset(h, pad)
+          drag.current = { mode: 'resize', id: selected.id, handle: h, orig: selected, base: d, off }
           return
         }
       }
@@ -295,7 +424,12 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
       const hit = d.shapes.find((s) => s.id === id)
       if (hit) {
         select(hit.id, hit.id !== selectedId)
-        drag.current = { mode: 'move', id: hit.id, orig: hit, start: pt, base: d, moved: false }
+        // a selected magnifier's lens and source move apart (an unselected one moves as a whole)
+        const part =
+          hit.kind === 'magnify' && hit.id === selectedId
+            ? (magnifyPart(hit, pt, tol.hit) ?? undefined)
+            : undefined
+        drag.current = { mode: 'move', id: hit.id, orig: hit, start: pt, base: d, moved: false, part }
       } else select(null)
       return
     }
@@ -326,8 +460,23 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
       return
     }
 
+    if (tool === 'picker') {
+      pickAt(pt)
+      return
+    }
+    if (tool === 'canvas') return
+
     const st = styleRef.current
     const id = newShapeId()
+    if (tool === 'measure') {
+      setProbe(null)
+      const base = defaultShape('measure', pt, st, id, im)
+      const orig = { ...base, box: measureBox, unit: geo.current.unit } as Shape
+      addShape(dragCreate(orig, pt, pt), 'replace')
+      setSelectedId(null)
+      drag.current = { mode: 'create', id, orig, start: pt, base: d, kind }
+      return
+    }
     if (tool === 'pen') {
       addShape({ id, kind: 'pen', color: st.color, width: st.width, points: [pt] }, 'replace')
       setSelectedId(null)
@@ -340,7 +489,7 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
       return
     }
     if (tool === 'badge') {
-      const shape = defaultShape('badge', pt, st, id, im, nextBadgeNumber(d.shapes))
+      const shape = defaultShape('badge', pt, st, id, im, badgeCounter(d))
       addShape(shape, 'record')
       setSelectedId(id)
       say(`${shapeLabel(shape)} added`)
@@ -348,7 +497,7 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
     }
     if (PLACEABLE.has(tool)) {
       const orig = defaultShape(tool as ShapeKind, pt, st, id, im)
-      addShape(dragCreate(orig, pt, pt), 'replace')
+      addShape(dragCreate(orig, pt, pt, area()), 'replace')
       setSelectedId(null)
       drag.current = { mode: 'create', id, orig, start: pt, base: d, kind }
     }
@@ -364,14 +513,18 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
         const dy = pt.y - g.start.y
         if (!g.moved && Math.hypot(dx, dy) * sc < 3) return
         g.moved = true
-        patch(g.id, () => moveShape(g.orig, dx, dy, im))
+        patch(g.id, () =>
+          g.part && g.orig.kind === 'magnify'
+            ? translateMagnifyPart(g.orig, g.part, dx, dy)
+            : moveShape(g.orig, dx, dy, area()),
+        )
         return
       }
       case 'resize':
-        patch(g.id, () => applyHandle(g.orig, g.handle, pt))
+        patch(g.id, () => applyHandle(g.orig, g.handle, { x: pt.x - g.off.x, y: pt.y - g.off.y }))
         return
       case 'create':
-        patch(g.id, () => dragCreate(g.orig, g.start, pt))
+        patch(g.id, () => dragCreate(g.orig, g.start, pt, area()))
         return
       case 'pen':
         patch(g.id, (s) =>
@@ -421,6 +574,18 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
         return
       case 'create': {
         const tiny = Math.hypot(pt.x - g.start.x, pt.y - g.start.y) * sc < 5
+        if (g.orig.kind === 'measure') {
+          // a click (or tap) measures smartly; a drag keeps its line or box. The tool stays, for the next one.
+          if (tiny) {
+            apply((h) => replace(h, g.base))
+            measureAt(g.start)
+            return
+          }
+          apply((h) => settle(h, g.base))
+          const m = docRef.current.shapes.find((x) => x.id === g.id)
+          say(m ? `${shapeLabel(m)} added` : 'Measurement added')
+          return
+        }
         if (tiny && g.kind !== 'mouse') {
           // a stray touch or palm: nothing is created (the Add button places a shape without dragging)
           apply((h) => replace(h, g.base))
@@ -467,7 +632,8 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
           return
         }
         apply((h) => settle(h, g.base))
-        say('Crop area set')
+        setToolState('select')
+        say('Crop applied')
         return
       }
       case 'crop-move':
@@ -481,6 +647,15 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
     const g = drag.current
     drag.current = null
     if (g) apply((h) => replace(h, g.base))
+  }
+
+  /** the pointer moving over the stage with no button down: the color under it, and the span for the measure tool */
+  const hover = (pt: Pt) => {
+    if (drag.current || editingRef.current) return
+    probeAt(pt)
+  }
+  const leave = () => {
+    if (!drag.current) setProbe(null)
   }
 
   // -------------------------------------------------------------------------------------------- commands
@@ -509,7 +684,7 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
   }, [say])
   const clearAll = useCallback(() => {
     if (!docRef.current.shapes.length) return
-    recordDoc((d) => withShapes(d, []))
+    recordDoc((d) => ({ ...withShapes(d, []), nextBadge: undefined }))
     setSelectedId(null)
     say('All annotations cleared')
   }, [say])
@@ -550,6 +725,23 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
       )
     say(`${SIZE_LABELS[i]} size`)
   }
+  const resetBadgeCounter = () => {
+    if (badgeCounter(docRef.current) === 1 && docRef.current.nextBadge === 1) return
+    recordDoc((d) => ({ ...d, nextBadge: 1 }))
+    say('Next number reset to 1')
+  }
+  /** override the selected badge's number; the count carries on from it */
+  const setBadgeNumber = (value: number) => {
+    if (!selected || selected.kind !== 'badge' || !Number.isFinite(value)) return
+    const n = clampBadge(value)
+    recordDoc(
+      (d) => ({
+        ...mapShape(d, selected.id, (s) => (s.kind === 'badge' ? { ...s, n } : s)),
+        nextBadge: clampBadge(n + 1),
+      }),
+      `badgen:${selected.id}`,
+    )
+  }
   const setFont = (i: number) => {
     setFontIdx(i)
     if (selected && selected.kind === 'text')
@@ -575,10 +767,26 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
   const shownFont =
     selected?.kind === 'text' ? fontIndexOf(selected.fontSize, img.w, img.h) : fontIdx
 
+  // ------------------------------------------------------------------------------------- canvas + scale
+  const setScale = (v: number) => {
+    if (!Number.isFinite(v) || v <= 0) return
+    const k = clampN(v, MIN_SCALE, MAX_SCALE)
+    recordDoc((d) => ({ ...d, scale: k }), 'scale')
+    const o = outputSize({ ...docRef.current, scale: k }, img)
+    say(`Export size ${o.w} by ${o.h} pixels`)
+  }
+  const setPad = (pad: Pad) => {
+    const size = clampN(Math.round(pad.size) || 0, 0, MAX_PAD)
+    recordDoc((d) => ({ ...d, pad: { size, color: pad.color } }), 'pad')
+    say(size ? `Padding ${size} pixels` : 'No padding')
+  }
+
   // ------------------------------------------------------------------------------------------- keyboard
   /** keys on the stage; returns true when it handled (and prevented) the key */
   const onKey = (e: KeyboardEvent): boolean => {
     if (editingRef.current || e.ctrlKey || e.metaKey) return false
+    // typing in a field (e.g. the badge number) is not a shortcut
+    if ((e.target as HTMLElement | null)?.closest?.('input, textarea, select, [contenteditable="true"]')) return false
     const d = docRef.current
     const { img: im, scale: sc } = geo.current
     const key = e.key
@@ -586,6 +794,12 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
       e.preventDefault()
       e.stopPropagation()
       return true
+    }
+
+    if (key === 'Tab' && tool === 'picker' && !e.shiftKey) {
+      // Shottr's "Tab to copy"
+      if (!copyProbeColor()) return false
+      return handled()
     }
 
     if (key === 'Tab') {
@@ -630,6 +844,20 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
     const step = keyStep(e.shiftKey, 1 / (sc || 1))
     const delta = keyDelta(key, step)
     if (!delta) return false
+    if (tool === 'measure' || tool === 'picker') {
+      // the keyboard's pointer: arrow keys move the probe, Enter measures / picks there
+      const from = probeRef.current?.pt ?? centerOf(viewRect(tool, d.crop, im))
+      const p = probeAt({
+        x: clampN(from.x + delta.x, 0, im.w - 0.01),
+        y: clampN(from.y + delta.y, 0, im.h - 0.01),
+      })
+      if (tool === 'picker' && p?.color) say(p.color)
+      else if (p?.span)
+        say(
+          `${Math.round((p.span.x2 - p.span.x1) / geo.current.unit)} by ${Math.round((p.span.y2 - p.span.y1) / geo.current.unit)}`,
+        )
+      return handled()
+    }
     if (tool === 'crop') {
       if (!d.crop) return false
       recordDoc(
@@ -647,7 +875,7 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
     recordDoc(
       (x) =>
         mapShape(x, selected.id, (s) =>
-          e.altKey ? resizeShapeBy(s, delta.x, delta.y) : moveShape(s, delta.x, delta.y, im),
+          e.altKey ? resizeShapeBy(s, delta.x, delta.y) : moveShape(s, delta.x, delta.y, area()),
         ),
       `${e.altKey ? 'resize' : 'nudge'}:${selected.id}`,
     )
@@ -673,6 +901,7 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
 
   return {
     doc,
+    img,
     tool,
     setTool,
     view,
@@ -686,6 +915,9 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
     setSize,
     fontIdx: shownFont,
     setFont,
+    nextBadge: badgeCounter(doc),
+    resetBadgeCounter,
+    setBadgeNumber,
     editing,
     setEditText,
     commitEdit,
@@ -699,11 +931,18 @@ export function useAnnotator({ img, scale, measure }: AnnotatorOptions) {
     deleteSelected,
     canPlace,
     place,
-    pointer: { down, move, up, cancel },
+    pointer: { down, move, up, cancel, hover, leave },
     onKey,
     escape,
     status,
     say,
+    probe,
+    copyProbeColor,
+    measureBox: selected?.kind === 'measure' ? selected.box : measureBox,
+    setMeasureBox,
+    unit,
+    setScale,
+    setPad,
   }
 }
 

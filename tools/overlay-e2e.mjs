@@ -11,16 +11,16 @@ import os from 'os';
 import http from 'http';
 import { execFileSync } from 'child_process';
 const require = createRequire(import.meta.url);
-const { chromium } = require('/opt/npm-tools/node_modules/playwright');
+const { chromium } = require(process.env.PLAYWRIGHT_PATH || 'playwright');
 const { HostServer, writeHostManifest } = require('./fake-app/host-server.js');
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const EXT = path.join(ROOT, 'extension');
-// The page is served from the same web root Sidebar.app ships (mac/copy-web.sh), not the raw extension folder,
+// The page is served from the same web root Stile.app ships (mac/copy-web.sh), not the raw extension folder,
 // so a file missing from the app bundle fails here too.
 const WEB = fs.mkdtempSync(path.join(os.tmpdir(), 'sbweb-')) + '/web';
 execFileSync('bash', [path.join(ROOT, 'mac/copy-web.sh'), EXT, WEB]);
-const SHOTS = process.env.OVERLAY_SHOTS || '/tmp/claude-0/-home-claude/e0605526-dcdb-5d20-aaac-918c6d6e8268/scratchpad/overlay-shots';
+const SHOTS = process.env.OVERLAY_SHOTS || path.join(os.tmpdir(), 'overlay-shots');
 fs.mkdirSync(SHOTS, { recursive: true });
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbov-'));
 const udd = path.join(tmp, 'udd');
@@ -71,12 +71,25 @@ const siteSrv = http.createServer((req, res) => {
 await new Promise((r) => siteSrv.listen(0, '127.0.0.1', r));
 const SITE = siteSrv.address().port;
 const U = (n) => `http://127.0.0.1:${SITE}/${n}.html`;
+// v3.2: download endpoints (/fast/<n> finishes at once, /slow/<n> trickles 10 chunks, one every 400 ms)
+const dlSrv = http.createServer((req, res) => {
+  const slow = req.url.startsWith('/slow');
+  const n = req.url.split('/')[2] || '0';
+  const size = slow ? 400000 : 2048 + Number(n) * 10;
+  res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': size, 'content-disposition': `attachment; filename="overlay-${slow ? 'slow' : 'fast'}-${n}.bin"` });
+  if (!slow) { res.end(Buffer.alloc(size)); return; }
+  let sent = 0;
+  const t = setInterval(() => { res.write(Buffer.alloc(40000)); sent += 40000; if (sent >= size) { clearInterval(t); res.end(); } }, 400);
+  res.on('close', () => clearInterval(t));
+});
+await new Promise((r) => dlSrv.listen(0, '127.0.0.1', r));
+const DL = `http://127.0.0.1:${dlSrv.address().port}`;
 
 // ------------------------------------------------------------------ the "Mac app"
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml', '.json': 'application/json' };
 const app = {
   fromExt: [], bridgeEvents: [], bridgeCalls: [], sse: new Set(), hostLog: [],
-  host: { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: false, railFound: true, railControllable: true, launchAtLogin: false, lockstep: true, accessibility: true, appVersion: '2.1.0-test' },
+  host: { state: 'peek', compact: false, railWidth: 48, chromeColor: null, screenCapture: false, railFound: true, railControllable: true, launchAtLogin: false, showMenuBarIcon: true, accessibility: true, appVersion: '2.1.0-test' },
 };
 // TEST-ONLY split hook: Chromium 141 has no split API, so tabs served to the page through this test transport can be stamped with a
 // splitViewId (app.splitMap: tabId -> splitViewId). Production code paths are untouched.
@@ -102,12 +115,12 @@ const toSse = (obj) => {
 const toHelper = (msg) => refApp.sendBridge('Default', msg);
 const hostState = () => toSse({ type: 'hostState', ...app.host });
 const setHost = (patch) => { if (patch.state && !('compact' in patch)) patch = { ...patch, compact: patch.state === 'collapsed' }; Object.assign(app.host, patch); hostState(); refApp.setAppState({ ...app.host }); };
-// The settings window relays app-only settings through the extension (appSetting); this fake app applies them like Sidebar.app would
+// The settings window relays app-only settings through the extension (appSetting); this fake app applies them like Stile.app would
 // and logs them in hostLog exactly like the matching overlay host messages.
 refApp.on('appSetting', ({ name, value }) => {
   app.hostLog.push({ action: name, value, t: Date.now(), viaRelay: true });
   if (name === 'setPinned') setHost({ state: value ? 'pinned' : 'peek' });
-  else if (name === 'setLockstep') setHost({ lockstep: !!value });
+  else if (name === 'setShowMenuBarIcon') setHost({ showMenuBarIcon: !!value });
   else if (name === 'setLaunchAtLogin') setHost({ launchAtLogin: !!value });
   else if (name === 'setGreenButtonAction') setHost({ greenButtonAction: value });
 });
@@ -145,7 +158,7 @@ const appSrv = http.createServer((req, res) => {
         if (m.action === 'ready') hostState();
         if (m.action === 'setPinned') setHost({ state: m.value ? 'pinned' : 'peek' });
         if (m.action === 'setLaunchAtLogin') setHost({ launchAtLogin: !!m.value });
-        if (m.action === 'setLockstep') setHost({ lockstep: !!m.value });
+        if (m.action === 'setShowMenuBarIcon') setHost({ showMenuBarIcon: !!m.value });
         res.writeHead(204).end(); return;
       }
       res.writeHead(400).end();
@@ -168,7 +181,7 @@ let ctx;
 async function finish(code) {
   try { await ctx?.close(); } catch { /* ignore */ }
   for (const r of app.sse) r.end();
-  appSrv.close(); await refApp.close(); siteSrv.close();
+  appSrv.close(); await refApp.close(); siteSrv.close(); dlSrv.close();
   console.log(`\n${pass} passed, ${fail} failed. Screenshots in ${SHOTS}`);
   process.exit(code);
 }
@@ -273,12 +286,12 @@ async function main() {
   await until(async () => (await todayRows()) === 5, 8000);
   check('Today rows render through the bridge (5 tabs)', (await todayRows()) === 5, String(await todayRows()));
   check('left-hint card is hidden in overlay mode', !(await panel.locator('[data-testid="left-hint"]').isVisible()));
-  const pin = panel.locator('[data-testid="pin-toggle"]');
-  check('pin toggle is visible with aria-pressed=false', (await pin.isVisible()) && (await pin.getAttribute('aria-pressed')) === 'false');
-  check('no "SIDEBAR" overlay bar (nothing above the search/profile area)', (await panel.locator('.overlay-bar, #overlay-bar, .ob-title').count()) === 0 && !(await panel.locator('text=/^\\s*Sidebar\\s*$/i').count()));
-  check('pin toggle lives in the footer, left of the settings gear', (await panel.locator('#footer [data-testid="pin-toggle"]').count()) === 1 && await (async () => {
-    const a = await pin.boundingBox(), b = await panel.locator('[data-testid="settings-button"]').boundingBox();
-    return a && b && a.x < b.x && Math.abs((a.y + a.height / 2) - (b.y + b.height / 2)) < 4;
+  const pin = panel.locator('[data-testid="sidebar-toggle"]');
+  check('sidebar toggle is visible with aria-pressed=false', (await pin.isVisible()) && (await pin.getAttribute('aria-pressed')) === 'false');
+  check('no "SIDEBAR" overlay bar (nothing above the search/profile area)', (await panel.locator('.overlay-bar, #overlay-bar, .ob-title').count()) === 0 && !(await panel.locator('text=/^\\s*(Sidebar|Stile)\\s*$/i').count()));
+  check('sidebar toggle sits at the top, above the address field, centred on the icon column', (await panel.locator('#footer [data-testid="sidebar-toggle"]').count()) === 0 && await (async () => {
+    const a = await pin.boundingBox(), b = await panel.locator('[data-testid="address-field"]').boundingBox();
+    return a && b && a.y + a.height <= b.y && Math.abs(a.x + a.width / 2 - 24) <= 1;
   })());
   check('vertical-tabs hint is hidden while the rail is found', !(await panel.locator('[data-testid="vertical-tabs-hint"]').isVisible()));
   await openSettings('app');
@@ -347,9 +360,9 @@ async function main() {
   check('compact: placeholders keep their height (favourites / pinned empty)', sameCol(posExp, posCmp, 'pinnedEmpty', 99, 1) && sameCol(posExp, posCmp, 'favEmpty', 999, 1), JSON.stringify([posExp.pinnedEmpty, posCmp.pinnedEmpty, posExp.favEmpty, posCmp.favEmpty]));
   const fades = await panel.evaluate(() => {
     const cs = (sel) => { const el = document.querySelector(sel).closest('.sec-actions, .act') || document.querySelector(sel); const c = getComputedStyle(el); return { o: c.opacity, pe: c.pointerEvents }; };
-    return { h2: cs('.sec-h h2'), tidy: cs('#tidy'), clear: cs('#clear'), newFolder: cs('#new-folder'), pin: cs('#pin-toggle'), settings: cs('#settings-btn'), archiveLbl: getComputedStyle(document.querySelector('#archive-btn')).opacity, close: cs('[data-testid="today-close"]') };
+    return { h2: cs('.sec-h h2'), tidy: cs('#tidy'), clear: cs('#clear'), newFolder: cs('#new-folder'), settings: cs('#settings-btn'), archiveLbl: getComputedStyle(document.querySelector('#archive-btn')).opacity, close: cs('[data-testid="today-close"]') };
   });
-  check('compact: section header text, Tidy/Clear, folder-new and footer right side fade out and ignore the pointer', ['h2', 'tidy', 'clear', 'newFolder', 'pin', 'settings', 'close'].every((k) => fades[k].o === '0' && fades[k].pe === 'none') && fades.archiveLbl === '1', JSON.stringify(fades));
+  check('compact: section header text, Tidy/Clear, folder-new and footer right side fade out and ignore the pointer', ['h2', 'tidy', 'clear', 'newFolder', 'settings', 'close'].every((k) => fades[k].o === '0' && fades[k].pe === 'none') && fades.archiveLbl === '1', JSON.stringify(fades));
   check('compact: the address field is a 32px square at the same left position, search icon centred', Math.abs(posCmp.addrW - 32) <= 1 && Math.abs(posCmp.addrH - 32) <= 1 && Math.abs(posExp.addrLeft - posCmp.addrLeft) <= 1 && posExp.addrW > 200, JSON.stringify([posExp.addrW, posCmp.addrW, posCmp.addrH]));
   // the address field animates (sample mid-transition) instead of snapping
   const addrMid = await panel.evaluate(async () => {
@@ -504,34 +517,47 @@ async function main() {
   await openSettings('app');
   check('App: version shown', /2\.1\.0-test/.test(await sp.locator('[data-testid="app-version"]').innerText()));
   await openSettings('appearance');
-  check('Appearance: "Keep the sidebar open" switch mirrors state (off)', !(await sp.locator('[data-testid="app-pinned"]').isChecked()));
-  await sp.locator('[data-testid="app-pinned"]').check(); await sleep(300);
-  check('App: pinned switch posts setPinned(true) and follows hostState', lastHost('setPinned')?.value === true && (await pin.getAttribute('aria-pressed')) === 'true' && app.host.state === 'pinned');
-  await sp.locator('[data-testid="app-pinned"]').uncheck(); await sleep(300);
-  check('App: pinned switch off posts setPinned(false)', lastHost('setPinned')?.value === false && app.host.state === 'peek');
-  setHost({ topBar: true }); await sleep(300);
-  check('v3.1: topBar hides the footer pin toggle (still in the DOM)', (await pin.count()) === 1 && !(await pin.isVisible()));
-  setHost({ topBar: false }); await sleep(300);
+  check('Appearance: no "Keep the sidebar open" switch (the sidebar toggle does it)', (await sp.locator('[data-testid="app-pinned"]').count()) === 0);
+  await pin.click(); await sleep(300);
+  check('sidebar toggle posts setPinned(true) and follows hostState', lastHost('setPinned')?.value === true && (await pin.getAttribute('aria-pressed')) === 'true' && app.host.state === 'pinned');
+  await pin.click(); await sleep(300);
+  check('sidebar toggle off posts setPinned(false)', lastHost('setPinned')?.value === false && app.host.state === 'peek');
+  setHost({ topBar: true, topBarToggle: true }); await sleep(300);
+  check('v3.1: the header toggle hides the sidebar toggle (still in the DOM)', (await pin.count()) === 1 && !(await pin.isVisible()));
+  setHost({ topBar: true, topBarToggle: false }); await sleep(300);
+  check('topBar without its toggle (collapsed rail) keeps the footer pin toggle', await pin.isVisible());
+  setHost({ topBar: false, topBarToggle: false }); await sleep(300);
   check('v3.1: topBar off shows the footer pin toggle again', await pin.isVisible());
+  const gbn = panel.locator('[data-testid="green-button-note"]');
+  check('v3.1: green-button note hidden by default', !(await gbn.isVisible()));
+  setHost({ greenButtonNote: true }); await sleep(400);
+  check('v3.1: greenButtonNote:true shows the note and posts greenButtonNoteSeen', (await gbn.isVisible()) && /fills the screen instead/.test(await gbn.innerText()) && !!lastHost('greenButtonNoteSeen'));
+  const seenBefore = app.hostLog.filter((x) => x.action === 'greenButtonNoteSeen').length;
+  await panel.locator('[data-testid="green-button-note-dismiss"]').click(); await sleep(300);
+  check('v3.1: dismissing the green-button note hides it and posts greenButtonNoteSeen', !(await gbn.isVisible()) && app.hostLog.filter((x) => x.action === 'greenButtonNoteSeen').length === seenBefore + 1);
+  setHost({ greenButtonNote: false }); await sleep(300); setHost({ greenButtonNote: true }); await sleep(300);
+  check('v3.1: greenButtonNote re-armed (false then true) shows the note again', await gbn.isVisible());
+  setHost({ greenButtonNote: false }); await sleep(300);
+  check('v3.1: greenButtonNote:false (app acknowledged) keeps the note until dismissed', await gbn.isVisible());
+  await panel.locator('[data-testid="green-button-note-dismiss"]').click(); await sleep(300);
+  check('v3.1: dismissing after the app acknowledged hides the note', !(await gbn.isVisible()));
   await openSettings('windows');
-  const gb = sp.locator('[data-testid="green-button-action"]');
-  check('v3.1: Green button select defaults to Full screen', (await gb.inputValue()) === 'full' && /Full screen/.test(await gb.locator('option').first().innerText()));
-  await gb.selectOption('fill'); await sleep(400);
-  check('v3.1: Green button relays setGreenButtonAction("fill") and follows appState', lastHost('setGreenButtonAction')?.value === 'fill' && app.host.greenButtonAction === 'fill' && (await gb.inputValue()) === 'fill');
-  setHost({ greenButtonAction: 'full' }); await sleep(400);
-  check('v3.1: Green button reflects appState back to Full screen', (await gb.inputValue()) === 'full');
+  // The green button always fills the screen now, so the Windows section no longer offers the choice.
+  check('v3.1: no Green button choice in settings', (await sp.locator('[data-testid="green-button-action"]').count()) === 0);
   await openSettings('app');
   check('App: accessibility granted, no "Open settings" button', /granted/i.test(await sp.locator('[data-testid="app-accessibility"]').innerText()) && !(await sp.locator('[data-testid="app-accessibility-open"]').isVisible()));
   await sp.locator('[data-testid="app-launch-login"]').check(); await sleep(300);
   check('App: launch at login switch posts setLaunchAtLogin(true)', lastHost('setLaunchAtLogin')?.value === true && await sp.locator('[data-testid="app-launch-login"]').isChecked());
   setHost({ launchAtLogin: false }); await sleep(300);
   check('App: launch at login follows hostState', !(await sp.locator('[data-testid="app-launch-login"]').isChecked()));
-  const ls = sp.locator('[data-testid="app-lockstep"]');
-  check('App: lockstep switch mirrors hostState (on)', await ls.isChecked());
+  const ls = sp.locator('[data-testid="app-menubar-icon"]');
+  check('App: menu bar icon switch mirrors hostState (on)', await ls.isChecked());
   await ls.uncheck(); await sleep(300);
-  check('App: lockstep switch posts setLockstep(false) and follows hostState', lastHost('setLockstep')?.value === false && app.host.lockstep === false && !(await ls.isChecked()));
-  setHost({ lockstep: true }); await sleep(300);
-  check('App: lockstep follows hostState back on', await ls.isChecked());
+  check('App: menu bar icon switch posts setShowMenuBarIcon(false) and follows hostState', lastHost('setShowMenuBarIcon')?.value === false && app.host.showMenuBarIcon === false && !(await ls.isChecked()));
+  setHost({ showMenuBarIcon: true }); await sleep(300);
+  check('App: menu bar icon follows hostState back on', await ls.isChecked());
+  check('App: the lockstep setting is gone', (await sp.locator('[data-testid="app-lockstep"]').count()) === 0);
+  check('App: connected, so no Stile.app gate (settings or panel) and the app-only rows are visible', !(await sp.locator('[data-testid="app-required"]').isVisible()) && !(await panel.locator('[data-testid="app-required"]').isVisible()) &&(await sp.locator('[data-testid="app-launch-login"]').isVisible()) && (await sp.locator('[data-testid="app-quit"]').isVisible()));
   const ovSw = sp.locator('[data-testid="overlay-enabled"]');
   check('App: "Show sidebar over Chrome\'s tabs" switch present and on', (await ovSw.isVisible()) && (await ovSw.isChecked()));
   await ovSw.uncheck(); await sleep(600);
@@ -543,7 +569,7 @@ async function main() {
   await sp.locator('[data-testid="app-accessibility-open"]').click(); await sleep(200);
   check('App: "Open settings" posts openAccessibilitySettings', hostCount('openAccessibilitySettings') === 1);
   setHost({ accessibility: true });
-  check('App: Screen Recording row shows "Turn on" and the permission note', await sp.locator('[data-testid="app-screen-capture-on"]').isVisible() && /Match Chrome.s colour exactly/.test(await sp.locator('[data-testid="settings-app"]').innerText()) && /Needs Screen Recording permission\. Sidebar only looks at Chrome.s window\./.test(await sp.locator('[data-testid="app-screen-capture-note"]').innerText()));
+  check('App: Screen Recording row shows "Turn on" and the permission note', await sp.locator('[data-testid="app-screen-capture-on"]').isVisible() && /Match Chrome.s colour exactly/.test(await sp.locator('[data-testid="settings-app"]').innerText()) && /Needs Screen Recording permission, which also lets Stile take screenshots of other apps\./.test(await sp.locator('[data-testid="app-screen-capture-note"]').innerText()));
   await sp.locator('[data-testid="app-screen-capture-on"]').click(); await sleep(200);
   check('App: "Turn on" posts requestScreenCapture', hostCount('requestScreenCapture') === 1);
   setHost({ screenCapture: true }); await sleep(300);
@@ -564,6 +590,8 @@ async function main() {
   setHost({ railFound: false }); await sleep(400);
   const vt = panel.locator('[data-testid="vertical-tabs-hint"]');
   check('railFound:false shows the vertical-tabs hint', await vt.isVisible() && /vertical tabs/i.test(await vt.innerText()) && /Show tabs vertically/i.test(await vt.innerText()));
+  await panel.locator('[data-testid="vertical-tabs-hint-button"]').click(); await sleep(200);
+  check('the vertical-tabs hint button posts setUpChrome', hostCount('setUpChrome') === 1);
   await panel.locator('[data-testid="vertical-tabs-hint-dismiss"]').click(); await sleep(200);
   check('the vertical-tabs hint can be dismissed', !(await vt.isVisible()));
   setHost({ railFound: true }); await sleep(200);
@@ -765,7 +793,7 @@ async function main() {
   await swEval(async (w) => { const t = (await chrome.tabs.query({ windowId: w, active: true }))[0]; await chrome.tabs.remove(t.id); }, mainWin);
   await sleep(700);
   check('compact: live updates still render (closed tab removed)', (await panel.locator('[data-testid="today-row"]').count()) === 4 || (await panel.locator('[data-testid="today-row"]').count()) === (await swEval(async (w) => (await chrome.tabs.query({ windowId: w })).length, mainWin)) - 1 - 1 + 1 || true);
-  check('compact: footer pin toggle is faded out and inert', await panel.evaluate(() => { const c = getComputedStyle(document.getElementById('pin-toggle')); return c.opacity === '0' && c.pointerEvents === 'none'; }));
+  check('compact: the sidebar toggle stays usable at the top of the strip', await panel.evaluate(() => { const r = document.getElementById('sidebar-toggle-row'); const c = getComputedStyle(document.getElementById('sidebar-toggle')); return r.hidden || (c.opacity === '1' && c.pointerEvents !== 'none'); }));
   // ---- v2.4: split pair, group outline, everything inside the strip
   const splitIds = await swEval(async ([w, ua, ub]) => {
     const a = await chrome.tabs.create({ windowId: w, url: ua, active: false });
@@ -1301,25 +1329,106 @@ async function main() {
     await panel.locator('[data-testid="settings-button"]').click(); await sleep(900);
     check('v3.0 settings: the gear opens one settings window and reuses it on the second click', nSet() === 1, String(nSet()));
     sp = ctx.pages().find((p) => p.url().includes('settings.html'));
-    const secs = ['general', 'appearance', 'tabs', 'windows', 'little', 'screenshots', 'boosts', 'profiles', 'app'];
+    const secs = ['appearance', 'tabs', 'windows', 'little', 'screenshots', 'boosts', 'profiles', 'app'];
     const seen = [];
     for (const id of secs) {
       await sp.locator(`[data-testid="settings-nav-${id}"]`).click(); await sleep(150);
       seen.push(((await sp.locator(`[data-testid="settings-section-${id}"], [data-testid="settings-${id}"]`).first().isVisible())) && ((await sp.locator('[data-testid="settings-title"]').innerText()).trim().length > 0));
     }
-    check('v3.0 settings: all nine sections render (General, Appearance, Tabs & Archive, Windows, Little windows, Screenshots, Boosts, Profiles, App)', seen.every(Boolean), seen.join());
+    check('v3.0 settings: all eight sections render (Appearance, Tabs & Archive, Windows, Little windows, Screenshots, Boosts, Profiles, App)', seen.every(Boolean), seen.join());
     const winType = await swEval(async () => { const t = (await chrome.tabs.query({ url: chrome.runtime.getURL('settings.html') + '*' }))[0]; return (await chrome.windows.get(t.windowId)).type; });
     check('v3.0 settings: opens in a popup window', winType === 'popup', winType);
     // app-only settings travel panel -> worker -> native port -> app and the app state comes back
-    check('v3.0 settings: app-only switches reached the app through the worker (appSetting relay)', app.hostLog.some((x) => x.viaRelay && x.action === 'setLockstep') && app.hostLog.some((x) => x.viaRelay && x.action === 'setLaunchAtLogin'));
+    check('v3.0 settings: app-only switches reached the app through the worker (appSetting relay)', app.hostLog.some((x) => x.viaRelay && x.action === 'setShowMenuBarIcon') && app.hostLog.some((x) => x.viaRelay && x.action === 'setLaunchAtLogin'));
     const relayed = await sp.evaluate(() => new Promise((res) => chrome.runtime.sendMessage({ cmd: 'appSetting', name: 'rescanRail', value: true }, res)));
     const bogus = await sp.evaluate(() => new Promise((res) => chrome.runtime.sendMessage({ cmd: 'appSetting', name: 'formatDisk', value: true }, res)));
     const nRescan = hostCount('rescanRail');
     check('v3.0 settings: appSetting accepts known names and refuses unknown ones', relayed?.ok === true && bogus?.ok === false && nRescan >= 1, JSON.stringify([relayed, bogus]));
-    setHost({ lockstep: false, appVersion: '9.9.9-test' }); await sleep(500);
+    setHost({ showMenuBarIcon: false, appVersion: '9.9.9-test' }); await sleep(500);
     const as = await sp.evaluate(() => new Promise((res) => chrome.runtime.sendMessage({ cmd: 'appState' }, res)));
-    check('v3.0 settings: appState returns the latest state pushed by the app', as?.ok && as.connected && as.state?.appVersion === '9.9.9-test' && as.state?.lockstep === false, JSON.stringify(as));
-    setHost({ lockstep: true, appVersion: '2.1.0-test' });
+    check('v3.0 settings: appState returns the latest state pushed by the app', as?.ok && as.connected && as.state?.appVersion === '9.9.9-test' && as.state?.showMenuBarIcon === false, JSON.stringify(as));
+    setHost({ showMenuBarIcon: true, appVersion: '2.1.0-test' });
+
+    // ---- v3.5c: the app owns the capture settings; the extension's settings page edits them through the relay
+    {
+      const cap = refApp.capture, hasLog = (n) => app.hostLog.some((x) => x.viaRelay && x.action === n);
+      await sp.locator('[data-testid="settings-nav-screenshots"]').click(); await sleep(300);
+      const box = sp.locator('[data-testid="capture-settings"]');
+      await until(async () => (await box.getAttribute('data-source')) === 'app', 6000);
+      check('v3.5c settings: with the app connected the Screenshots section is app-owned (data-source=app)', (await box.getAttribute('data-source')) === 'app');
+      check('v3.5c settings: app-only rows (folder, file name, shadow) appear and the extension-only "After taking" row goes',
+        await sp.locator('[data-testid="capture-folder"]').isVisible() && await sp.locator('[data-testid="capture-pattern"]').isVisible() && await sp.locator('[data-testid="capture-shadow"]').isVisible() && !(await sp.locator('[data-testid="capture-after"]').isVisible()));
+      check('v3.5c settings: the folder row shows the app\'s default save folder', /Downloads\/Screenshots$/.test(await sp.locator('[data-testid="capture-folder"]').innerText()));
+      check('v3.5c settings: the Recording group is visible (defaults to 30 fps, H.264, countdown on)',
+        await sp.locator('[data-testid="recording-settings"]').isVisible() && await sp.locator('[data-testid="recording-fps"]').inputValue() === '30' && await sp.locator('[data-testid="recording-codec"]').inputValue() === 'h264' && await sp.locator('[data-testid="recording-countdown"]').isChecked());
+      // edits go to the app
+      await sp.locator('[data-testid="capture-pattern"]').fill('Shot {yyyy}-{mm}-{dd}');
+      await until(() => cap.filenamePattern === 'Shot {yyyy}-{mm}-{dd}', 4000);
+      check('v3.5c settings: the file name pattern is written to the app (appSetting setCaptureSettings)', cap.filenamePattern === 'Shot {yyyy}-{mm}-{dd}' && hasLog('setCaptureSettings'), cap.filenamePattern);
+      await sp.locator('[data-testid="capture-shadow"]').uncheck();
+      await until(() => cap.windowShadow === false, 4000);
+      check('v3.5c settings: the window shadow switch is written to the app', cap.windowShadow === false);
+      await sp.locator('[data-testid="capture-annotate"]').uncheck();
+      await until(() => cap.annotate === false, 4000);
+      check('v3.5c settings: annotation tools switch is written to the app, not to the extension\'s storage', cap.annotate === false && (await swEval(async () => (await chrome.storage.sync.get('captureAnnotate')).captureAnnotate)) !== false);
+      await sp.locator('[data-testid="capture-annotate"]').check();
+      await sp.locator('[data-testid="recording-fps"]').selectOption('60');
+      await sp.locator('[data-testid="recording-codec"]').selectOption('hevc');
+      await sp.locator('[data-testid="recording-countdown"]').uncheck();
+      await until(() => cap.recording.fps === 60 && cap.recording.codec === 'hevc' && cap.recording.countdown === false, 4000);
+      check('v3.5c settings: the recording defaults (fps, codec, countdown) are written to the app', cap.recording.fps === 60 && cap.recording.codec === 'hevc' && cap.recording.countdown === false, JSON.stringify(cap.recording));
+      await sp.locator('[data-testid="capture-folder-choose"]').click();
+      await until(() => hasLog('chooseCaptureFolder'), 4000);
+      check('v3.5c settings: "Choose…" asks the app to show its folder panel', app.hostLog.some((x) => x.viaRelay && x.action === 'chooseCaptureFolder' && x.value === 'screenshots'));
+      await sp.locator('[data-testid="recording-folder-choose"]').click();
+      await until(() => app.hostLog.some((x) => x.action === 'chooseCaptureFolder' && x.value === 'recordings'), 4000);
+      check('v3.5c settings: the recordings folder asks the app too', app.hostLog.some((x) => x.action === 'chooseCaptureFolder' && x.value === 'recordings'));
+      // S3 with the secret in the app's keychain, never shown again
+      await sp.locator('[data-testid="capture-s3-endpoint"]').fill('https://s3.example.test');
+      await sp.locator('[data-testid="capture-s3-bucket"]').fill('app-bucket');
+      await sp.locator('[data-testid="capture-s3-key"]').fill('APPKEY');
+      await sp.locator('[data-testid="capture-s3-secret"]').fill('APP-SECRET-VALUE');
+      await sleep(500);
+      check('v3.5c settings: the secret is not sent while it is being typed (only when the field is left)', cap.keychainSecret === '');
+      await sp.evaluate(() => document.activeElement && document.activeElement.blur());   // leaving the secret field sends it
+      await until(() => cap.keychainSecret === 'APP-SECRET-VALUE' && cap.s3Public.bucket === 'app-bucket', 4000);
+      check('v3.5c settings: bucket, endpoint, key id go to the app and the secret to its keychain', cap.s3Public.bucket === 'app-bucket' && cap.s3Public.accessKeyId === 'APPKEY' && cap.s3Public.endpoint === 'https://s3.example.test' && cap.keychainSecret === 'APP-SECRET-VALUE', JSON.stringify(cap.s3Public));
+      check('v3.5c settings: the extension\'s own storage does not get the app\'s S3 setup', !(await swEval(async () => (await chrome.storage.local.get('captureS3')).captureS3?.bucket === 'app-bucket')));
+      await until(async () => (await sp.locator('[data-testid="capture-s3-secret"]').getAttribute('placeholder') || '').includes('Keychain'), 5000);
+      const dom = await sp.evaluate(() => document.body.innerText + [...document.querySelectorAll('input')].map((i) => i.value).join('|') + JSON.stringify(Object.entries(document.documentElement.dataset)));
+      check('v3.5c settings: the secret field is empty with a "saved in the Keychain" hint, the secret is nowhere in the page', (await sp.locator('[data-testid="capture-s3-secret"]').inputValue()) === '' && !dom.includes('APP-SECRET-VALUE'));
+      const stored = await swEval(async () => JSON.stringify(await chrome.storage.session.get('appState')));
+      check('v3.5c settings: the appState the app pushes carries no secret', !stored.includes('APP-SECRET-VALUE') && /"secretSet":true/.test(stored));
+      const full = await sp.evaluate(() => new Promise((res) => chrome.runtime.sendMessage({ cmd: 'captureAppFull' }, res)));
+      check('v3.5c settings: the full settings (with the secret, for the connection test) come from the app on request', full?.ok === true && full.settings.s3.secretAccessKey === 'APP-SECRET-VALUE', JSON.stringify(full).slice(0, 120));
+      // changes made in the app show up in the page (single source of truth)
+      await sp.evaluate(() => document.activeElement && document.activeElement.blur());   // a field being edited is not overwritten
+      cap.apply({ filenamePattern: 'From the app {hh}', windowShadow: true });
+      await until(async () => (await sp.locator('[data-testid="capture-pattern"]').inputValue()) === 'From the app {hh}', 6000);
+      check('v3.5c settings: a change made in the app is shown in the page', (await sp.locator('[data-testid="capture-pattern"]').inputValue()) === 'From the app {hh}' && await sp.locator('[data-testid="capture-shadow"]').isChecked());
+      // the mode switch lives in App
+      await sp.locator('[data-testid="settings-nav-app"]').click(); await sleep(200);
+      check('v3.5c settings: "Use Stile with Chrome" is on by default', await sp.locator('[data-testid="app-use-chrome"]').isChecked());
+      await sp.locator('[data-testid="app-use-chrome"]').uncheck();
+      await until(() => refApp.useChrome === false && hasLog('setUseChrome'), 4000);
+      check('v3.5c settings: switching it off is relayed to the app (setUseChrome false)', refApp.useChrome === false && app.hostLog.some((x) => x.viaRelay && x.action === 'setUseChrome' && x.value === false));
+      await sp.locator('[data-testid="app-use-chrome"]').check();
+      await until(() => refApp.useChrome === true, 4000);
+      // the app goes away: the page falls back to the extension's own copy
+      const savedCap = refApp.capture.publicDict();
+      await sp.locator('[data-testid="settings-nav-screenshots"]').click();
+      await swEval(async () => chrome.storage.session.remove('appState'));
+      await until(async () => (await box.getAttribute('data-source')) === 'extension', 6000);
+      check('v3.5c settings: without app state the page goes back to the extension\'s own settings (After taking row, no Recording group)',
+        await sp.locator('[data-testid="capture-after"]').isVisible() && !(await sp.locator('[data-testid="recording-settings"]').isVisible()) && !(await sp.locator('[data-testid="capture-folder"]').isVisible()));
+      refApp.setAppState({ ...app.host }); await sleep(400);
+      await until(async () => (await box.getAttribute('data-source')) === 'app', 6000);
+      // reset the reference app
+      cap.apply({ filenamePattern: '', windowShadow: true, annotate: true, askWhere: false, screenshotFolder: '', recordingFolder: '',
+        s3: { endpoint: '', bucket: '', accessKeyId: '', secretAccessKey: '' }, recording: { fps: 30, codec: 'h264', countdown: true } });
+      check('v3.5c settings: reference app reset', savedCap.s3.bucket === 'app-bucket' && cap.s3Public.bucket === '');
+      await sleep(300);
+    }
     await closeSettings();
 
     // split menu: the split icon is a button that posts a native menu; "Close right tab" closes that half
@@ -1405,7 +1514,7 @@ async function main() {
     check('v3.0 window drag: mousedown on bare sidebar space posts beginWindowDrag with the point', hostCount('beginWindowDrag') === n1 + 1 && wd.value && Math.abs(wd.value.clientX - bgPoint.x) <= 1 && Math.abs(wd.value.clientY - bgPoint.y) <= 1 && wd.value.clickCount >= 1, JSON.stringify(wd?.value));
     const rb = await panel.locator('[data-testid="today-row"]').first().boundingBox();
     await panel.mouse.move(rb.x + 120, rb.y + rb.height / 2); await panel.mouse.down(); await panel.mouse.up(); await sleep(250);
-    const sbtn = await panel.locator('[data-testid="pin-toggle"]').boundingBox();
+    const sbtn = await panel.locator('[data-testid="sidebar-toggle"]').boundingBox();
     await panel.mouse.move(sbtn.x + sbtn.width / 2, sbtn.y + sbtn.height / 2); await panel.mouse.down(); await panel.mouse.up(); await sleep(250);
     await panel.locator('[data-testid="address-field"]').click(); await sleep(150);
     check('v3.0 window drag: rows, buttons and the address field do not start a window drag', hostCount('beginWindowDrag') === n1 + 1, String(hostCount('beginWindowDrag') - n1));
@@ -1414,6 +1523,141 @@ async function main() {
     check('v3.0 window drag: only the left button starts it', hostCount('beginWindowDrag') === n1 + 1);
     await panel.keyboard.press('Escape'); await sleep(2500);
   }
+
+  // ==== v3.2 downloads (overlay) begin
+  {
+    // bridge allow-list
+    const okS = await rawCall('downloads.search', [{ limit: 1 }]);
+    check('v3.2 bridge: downloads.search is allowed', okS?.ok === true && Array.isArray(okS.result), JSON.stringify(okS)?.slice(0, 120));
+    for (const fn of ['drag', 'download', 'erase', 'removeFile', 'acceptDanger', 'cancel', 'setShelfEnabled']) {
+      const r = await rawCall('downloads.' + fn, [1]);
+      check(`v3.2 bridge: downloads.${fn} is rejected`, r && r.ok === false && /not allowed/i.test(r.error || ''), JSON.stringify(r)?.slice(0, 120));
+    }
+    const dpop = panel.locator('[data-testid="downloads-popover"]');
+    const arch = panel.locator('[data-testid="archive-button"]');
+    const drows = panel.locator('[data-testid="download-row"]');
+    const away = async () => { await panel.mouse.move(250, 400); await sleep(700); };
+    const onArch = async () => { await panel.mouse.move(250, 400); await arch.hover(); };
+    await swEval(async () => { for (const d of await chrome.downloads.search({})) { try { await chrome.downloads.erase({ id: d.id }); } catch { /* ignore */ } } });
+    const ids = [];
+    for (let i = 1; i <= 3; i++) { ids.push(await swEval(async (u) => chrome.downloads.download({ url: u }), `${DL}/fast/${i}`)); await sleep(150); }
+    for (let t = 0; t < 8000; t += 200) { const l = await swEval(async () => chrome.downloads.search({ state: 'complete' })); if (l.length >= 3) break; await sleep(200); }
+    const nEvD = app.bridgeEvents.filter((e) => /^downloads\./.test(e.name)).length;
+    ids.push(await swEval(async (u) => chrome.downloads.download({ url: u }), `${DL}/slow/1`));
+    await sleep(1000);
+    const evD = app.bridgeEvents.filter((e) => /^downloads\./.test(e.name));
+    check('v3.2 bridge: downloads.onCreated / onChanged are forwarded to the app', evD.length > nEvD && evD.some((e) => e.name === 'downloads.onCreated'), JSON.stringify(evD.slice(-3)).slice(0, 200));
+    const ico = await rawCall('downloads.getFileIcon', [ids[0], { size: 32 }]);
+    check('v3.2 bridge: downloads.getFileIcon goes through (data URL or a clean error)', !!ico && (ico.ok ? /^data:image\//.test(ico.result || '') : typeof ico.error === 'string'), JSON.stringify(ico)?.slice(0, 120));
+    await onArch(); await dpop.waitFor({ timeout: 5000 }).catch(() => {});
+    check('v3.2 overlay: hovering Archive opens the downloads popover through the bridge', (await dpop.count()) === 1 && (await drows.count()) === 4);
+    const slowRow = panel.locator(`[data-testid="download-row"][data-id="${ids[3]}"]`);
+    const pr = async () => Number(await slowRow.locator('[data-testid="download-progress"]').getAttribute('data-progress').catch(() => '-1'));
+    const p1 = await pr(); await sleep(1300); const p2 = await pr();
+    check('v3.2 overlay: progress moves live (bridge events + polling)', p1 >= 0 && p2 > p1, `${p1} -> ${p2}`);
+    await panel.screenshot({ path: path.join(SHOTS, '32-overlay-downloads.png') });
+    for (let t = 0; t < 9000 && (await slowRow.locator('[data-testid="download-progress"]').count()); t += 200) await sleep(200);
+    check('v3.2 overlay: finished rows are draggable', (await slowRow.getAttribute('draggable')) === 'true' && (await slowRow.getAttribute('data-state')) === 'complete');
+    const real = await swEval(async (id) => (await chrome.downloads.search({ id }))[0].filename, ids[3]);
+    const shape2 = await panel.evaluate(() => ({ drag: typeof chrome.downloads.drag, open: typeof chrome.downloads.open }));
+    check('v3.2 overlay: the page has no chrome.downloads.drag (the app does the drag)', shape2.drag === 'undefined' && shape2.open === 'function', JSON.stringify(shape2));
+    const nDrag = hostCount('dragDownload');
+    const notPrevented = await panel.evaluate((id) => {
+      const row = document.querySelector(`[data-testid="download-row"][data-id="${id}"]`);
+      return row.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, clientX: 40, clientY: 700, dataTransfer: new DataTransfer() }));
+    }, ids[3]);
+    await sleep(200);
+    const dd = lastHost('dragDownload');
+    check('v3.2 overlay: dragstart on a finished row posts dragDownload {path, clientX, clientY} and cancels the web drag', hostCount('dragDownload') === nDrag + 1 && dd.value.path === real && path.isAbsolute(real) && Math.abs(dd.value.clientX - 40) <= 1 && Math.abs(dd.value.clientY - 700) <= 1 && notPrevented === false, JSON.stringify([dd?.value, notPrevented]));
+    // an in-progress / missing file is never offered
+    const nDrag2 = hostCount('dragDownload');
+    await panel.evaluate(() => { const r = document.querySelector('[data-testid="download-row"]:not([draggable="true"])'); if (r) r.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer: new DataTransfer() })); });
+    check('v3.2 overlay: a row that is not a finished file posts nothing', hostCount('dragDownload') === nDrag2);
+    // click: open goes through the bridge (stubbed here so the test never opens a file on the host machine)
+    await panel.evaluate(() => { window.__dlcalls = []; chrome.downloads.open = (id) => { window.__dlcalls.push(['open', id]); return Promise.resolve(); }; });
+    await slowRow.click(); await sleep(300);
+    check('v3.2 overlay: clicking a finished row calls downloads.open and closes the popover', JSON.stringify(await panel.evaluate(() => window.__dlcalls)) === JSON.stringify([['open', ids[3]]]) && (await dpop.count()) === 0);
+    await away(); await onArch(); await dpop.waitFor({ timeout: 5000 }).catch(() => {});
+    const nTabsD = (await swEval(async () => chrome.tabs.query({}))).length;
+    await panel.locator('[data-testid="downloads-show-all"]').click();
+    let dt = null;
+    for (let t = 0; t < 5000 && !dt; t += 200) { dt = (await swEval(async () => chrome.tabs.query({}))).find((x) => /^chrome:\/\/downloads/.test(x.url || x.pendingUrl || '')); if (!dt) await sleep(200); }
+    check('v3.2 overlay: "Show all downloads" opens chrome://downloads', !!dt && (await swEval(async () => chrome.tabs.query({}))).length === nTabsD + 1);
+    if (dt) await swEval(async (id) => chrome.tabs.remove(id), dt.id);
+    // collapsed strip: no popover
+    await away();
+    setHost({ compact: true, railWidth: 56 }); await sleep(500);
+    await onArch(); await sleep(800);
+    check('v3.2 overlay: no popover over the collapsed strip', (await dpop.count()) === 0 || !(await dpop.isVisible()));
+    await away();
+    setHost({ compact: false, railWidth: 48 }); await sleep(500);
+    await swEval(async () => { for (const d of await chrome.downloads.search({})) { try { await chrome.downloads.erase({ id: d.id }); } catch { /* ignore */ } } });
+  }
+  // ==== v3.2 downloads (overlay) end
+
+  // ==== v3.3 presentation (overlay) begin
+  {
+    const cmdB = async (c) => (await rawCall('sidebar.cmd', [c]))?.result;
+    const mk = async (u) => (await swEval(async ([w, url]) => (await chrome.tabs.create({ windowId: w, url, active: false })).id, [mainWin, u]));
+    const tA = await mk(U('foxtrot') + '?ov1'); const tB = await mk(U('golf') + '?ov2');
+    await sleep(900);
+    const roles0 = (await rawCall('sidebar.windowRoles'))?.result;
+    // start from the native menu of a tab
+    const rowA = panel.locator(`[data-testid="today-row"][data-tab-id="${tA}"]`);
+    const m1 = await openMenu(rowA);
+    const labels1 = (m1.items || []).map((i) => i.label);
+    check('v3.3 overlay: the native tab menu offers "Start presenting with this tab"', labels1.includes('Start presenting with this tab') && !labels1.includes('Add to presentation'), labels1.join('|'));
+    await panel.evaluate((id) => window.__sidebarMenuResult(id), findItem(m1.items, (i) => i.label === 'Start presenting with this tab').id);
+    let st = null;
+    for (let t = 0; t < 8000 && !st; t += 200) { const d = await cmdB({ cmd: 'debugState' }); if (d?.presentation) st = d; else await sleep(200); }
+    const PW = st?.presentation?.windowId;
+    check('v3.3 overlay: starting through the bridge creates the presentation window with that tab', PW != null && (st.windows.find((w) => w.id === PW)?.tabs || []).some((t) => t.id === tA), JSON.stringify(st?.presentation));
+    await sleep(700);
+    const roles1 = (await rawCall('sidebar.windowRoles'))?.result;
+    check('v3.3 overlay: sidebar.windowRoles is unchanged (the app does not see the presentation role)', roles1.mainWindowId === roles0.mainWindowId && JSON.stringify(roles1.littleWindowIds) === JSON.stringify(roles0.littleWindowIds) && roles1.mainWindowId !== PW && !('presentationWindowId' in roles1), JSON.stringify([roles0, roles1]));
+    const secs = panel.locator('[data-testid="window-section"][data-presentation="true"]');
+    check('v3.3 overlay: the main sidebar shows the Presentation section', (await secs.count()) === 1 && /Presentation · 1 tab/.test(await secs.locator('.wmeta').innerText()));
+    // add the second tab through the native menu
+    const rowB = panel.locator(`[data-testid="today-row"][data-tab-id="${tB}"]`);
+    const m2 = await openMenu(rowB);
+    const add = findItem(m2.items, (i) => i.label === 'Add to presentation');
+    check('v3.3 overlay: while presenting the native tab menu offers "Add to presentation"', !!add && !findItem(m2.items, (i) => i.label === 'Start presenting with this tab'));
+    await panel.evaluate((id) => window.__sidebarMenuResult(id), add.id);
+    await until(async () => ((await cmdB({ cmd: 'debugState' })).windows.find((w) => w.id === PW)?.tabs || []).length === 2, 6000, 200);
+    st = await cmdB({ cmd: 'debugState' });
+    check('v3.3 overlay: "Add to presentation" moved the tab', (st.windows.find((w) => w.id === PW)?.tabs || []).map((t) => t.id).sort().join() === [tA, tB].sort().join());
+    // the empty Today area's native menu has Stop presenting
+    const n0 = hostCount('contextMenu');
+    await panel.locator('.sec-today .sec-h h2').click({ button: 'right' });
+    await until(() => hostCount('contextMenu') > n0, 3000);
+    const em = lastHost('contextMenu').value;
+    check('v3.3 overlay: the empty Today area menu has "Stop presenting"', !!findItem(em.items, (i) => i.label === 'Stop presenting') && !findItem(em.items, (i) => i.label === 'Start presenting'), JSON.stringify((em.items || []).map((i) => i.label)));
+    await panel.evaluate(() => window.__sidebarMenuResult(null)); await sleep(200);
+    // the presentation window's own overlay sidebar
+    const before2 = new Set(ctx.pages());
+    await swEval(async (u) => chrome.windows.create({ url: u, type: 'popup', width: 320, height: 860 }), `${APP}/sidepanel.html?mode=overlay&windowId=${PW}&bridgeHttp=${encodeURIComponent(APP)}`);
+    const pres = await until(() => ctx.pages().find((p) => !before2.has(p) && p.url().includes(`windowId=${PW}`)), 8000, 100);
+    await pres.setViewportSize({ width: 320, height: 860 });
+    await until(async () => (await pres.locator('[data-testid="today-row"]').count()) === 2, 8000, 150);
+    const vis = async (sel) => pres.locator(sel).first().isVisible().catch(() => false);
+    check('v3.3 overlay: the presentation sidebar lists only its two tabs under the presenting bar', (await pres.locator('[data-testid="today-row"]').count()) === 2 && await vis('[data-testid="present-bar"]'));
+    check('v3.3 overlay: it hides profiles, Favourites, Pinned, Temporary, other windows and the downloads popover',
+      !(await vis('[data-testid="profile-switcher"]')) && !(await vis('[data-testid="favourites-grid"]')) && !(await vis('[data-testid="pinned-tree"]')) && !(await vis('[data-testid="temp-section"]')) && !(await vis('[data-testid="window-section"]')));
+    await pres.locator('[data-testid="archive-button"]').hover(); await sleep(900);
+    check('v3.3 overlay: hovering Archive in the presentation window shows no downloads popover', (await pres.locator('[data-testid="downloads-popover"]').count()) === 0);
+    await pres.screenshot({ path: path.join(SHOTS, '33-overlay-presentation.png') });
+    // stop from that sidebar
+    await pres.locator('[data-testid="present-stop"]').click();
+    for (let t = 0; t < 9000; t += 250) { const d = await cmdB({ cmd: 'debugState' }); if (!d.presentation && !d.windows.some((w) => w.id === PW)) { st = d; break; } await sleep(250); }
+    const mainTabs = (st.windows.find((w) => w.id === mainWin)?.tabs || []).map((t) => t.id);
+    check('v3.3 overlay: "Stop presenting" merged both tabs back into the main window and closed the presentation window', !st.presentation && mainTabs.includes(tA) && mainTabs.includes(tB) && !st.windows.some((w) => w.id === PW), JSON.stringify([st.presentation, mainTabs.length]));
+    await pres.close().catch(() => {});
+    await sleep(700);
+    check('v3.3 overlay: the Presentation section is gone', (await secs.count()) === 0);
+    await swEval(async ([a, b]) => chrome.tabs.remove([a, b]), [tA, tB]);
+    await sleep(600);
+  }
+  // ==== v3.3 presentation (overlay) end
 
   // ---- connection drop: the extension stops forwarding; reconnecting resumes
   const nBefore = refApp.isConnected('Default');

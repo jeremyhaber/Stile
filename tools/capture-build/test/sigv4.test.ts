@@ -46,7 +46,7 @@ describe('agrees with the aws4 library on arbitrary requests', () => {
 
 describe('keys and links', () => {
   it('addressing styles', () => {
-    expect(objectUrl({ endpoint: 'https://s3.{region}.amazonaws.com', region: 'eu-west-1', bucket: 'bkt', style: 'virtual' }, 'a b/c.png')).toBe('https://bkt.s3.eu-west-1.amazonaws.com/a%20b/c.png')
+    expect(objectUrl({ endpoint: 'https://s3.eu-west-1.amazonaws.com', region: 'eu-west-1', bucket: 'bkt', style: 'virtual' }, 'a b/c.png')).toBe('https://bkt.s3.eu-west-1.amazonaws.com/a%20b/c.png')
     expect(objectUrl({ endpoint: 'https://x.r2.cloudflarestorage.com', region: 'auto', bucket: 'bkt', style: 'path' }, 'a/c.png')).toBe('https://x.r2.cloudflarestorage.com/bkt/a/c.png')
   })
   it('prefix tokens, naming and public link', () => {

@@ -1,5 +1,7 @@
 import AppKit
 import ApplicationServices
+import AVFoundation
+import StileCore
 
 /// A flipped container so a scroll view's document starts at the top.
 private final class FlippedView: NSView {
@@ -13,7 +15,7 @@ private final class StatusSlot {
     let button: NSButton
     private let granted = NSStackView()
 
-    init(buttonTitle: String, target: AnyObject, action: Selector) {
+    init(buttonTitle: String, grantedTitle: String = "Allowed", target: AnyObject, action: Selector) {
         button = NSButton(title: buttonTitle, target: target, action: action)
         button.bezelStyle = .rounded
 
@@ -22,7 +24,7 @@ private final class StatusSlot {
             img.image = i
         }
         img.contentTintColor = .systemGreen
-        let label = NSTextField(labelWithString: "Allowed")
+        let label = NSTextField(labelWithString: grantedTitle)
         label.font = NSFont.systemFont(ofSize: 12)
         label.textColor = .secondaryLabelColor
         granted.orientation = .horizontal
@@ -45,7 +47,7 @@ private final class StatusSlot {
 }
 
 /// Permissions onboarding (v3.0): a native welcome window with live status for Accessibility (required),
-/// Screen Recording, launch at login, default browser and the Chrome extension. Shown on first launch, from
+/// Screen Recording, launch at login, default browser, Chrome's vertical tabs and the Chrome extension. Shown on first launch, from
 /// Settings > App > "Review permissions" (host message `reviewPermissions`), and automatically whenever
 /// Accessibility is missing. Replaces the old Accessibility-only window.
 @MainActor
@@ -65,10 +67,19 @@ final class Permissions: NSObject, NSWindowDelegate {
     // Live controls (nil while the window is closed)
     private var axSlot: StatusSlot?
     private var screenSlot: StatusSlot?
+    private var micSlot: StatusSlot?
+    private var chromeSlot: StatusSlot?
     private var loginSwitch: NSSwitch?
     private var defaultSwitch: NSSwitch?
     private var extList: NSStackView?
     private var extSignature = ""
+    // v3.10: store-install controls (only built when HostSetup.storeIDSet)
+    private var installButton: NSButton?
+    private var installNote: NSTextField?
+    private var installConfirm: NSTextField?
+    private var installError: NSTextField?
+    private var restartButton: NSButton?
+    private var installRequested = false
     private var doneButton: NSButton?
     private var cachedDefaultBrowser = false
 
@@ -79,6 +90,13 @@ final class Permissions: NSObject, NSWindowDelegate {
 
     @discardableResult
     static func requestScreenCapture() -> Bool { CGRequestScreenCaptureAccess() }
+
+    /// v3.5c: Microphone (for recording, later). Asked on the first recording with a mic selected, or from here.
+    static var microphoneGranted: Bool { AVCaptureDevice.authorizationStatus(for: .audio) == .authorized }
+
+    static func openMicrophoneSettings() {
+        openPane("Privacy_Microphone")
+    }
 
     static func openSettings() {
         openPane("Privacy_Accessibility")
@@ -100,6 +118,7 @@ final class Permissions: NSObject, NSWindowDelegate {
     /// Accessibility is missing or the welcome has never been dismissed.
     func ensure(_ onTrusted: @escaping () -> Void) {
         self.onTrusted = onTrusted
+        trustedFired = false
         let trusted = Self.isTrusted
         if trusted { fireTrusted() }
         if !trusted || !UserDefaults.standard.bool(forKey: Self.onboardedKey) {
@@ -107,6 +126,23 @@ final class Permissions: NSObject, NSWindowDelegate {
         } else {
             startTimerIfNeeded()
         }
+    }
+
+    /// v3.5c capture-only mode: nothing needs Accessibility. The window opens on the first run (or after a mode switch)
+    /// and asks for Screen Recording; the Microphone row is optional and for recording.
+    func ensureCaptureOnly() {
+        if !UserDefaults.standard.bool(forKey: Self.onboardedKey) {
+            show()
+        } else {
+            startTimerIfNeeded()
+        }
+    }
+
+    /// The mode changed while the window may be open: rebuild it for the new mode.
+    func modeChanged() {
+        guard let w = window else { return }
+        w.close()   // windowWillClose resets the controls; the caller decides whether to show it again
+        show()
     }
 
     /// Opens (or raises) the window.
@@ -168,6 +204,16 @@ final class Permissions: NSObject, NSWindowDelegate {
         if !granted && asked { Self.openScreenCaptureSettings() }
     }
 
+    @objc private func allowMicrophone() {
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] _ in
+                Task { @MainActor in self?.refresh(force: true) }
+            }
+        } else {
+            Self.openMicrophoneSettings()
+        }
+    }
+
     @objc private func loginToggled(_ sender: NSSwitch) {
         LoginItem.set(sender.state == .on)
         Settings.post()
@@ -187,6 +233,10 @@ final class Permissions: NSObject, NSWindowDelegate {
             sender?.state = now ? .on : .off
             sender?.isEnabled = true
         }
+    }
+
+    @objc private func setUpChrome() {
+        ChromeSetup.run { [weak self] _ in self?.refresh(force: true) }
     }
 
     @objc private func showExtensionFolder() {
@@ -213,10 +263,18 @@ final class Permissions: NSObject, NSWindowDelegate {
         window = nil
         axSlot = nil
         screenSlot = nil
+        micSlot = nil
+        chromeSlot = nil
         loginSwitch = nil
         defaultSwitch = nil
         extList = nil
         extSignature = ""
+        installButton = nil
+        installNote = nil
+        installConfirm = nil
+        installError = nil
+        restartButton = nil
+        installRequested = false
         doneButton = nil
         stopTimerIfIdle()
     }
@@ -228,7 +286,8 @@ final class Permissions: NSObject, NSWindowDelegate {
         let trusted = Self.isTrusted
         axSlot?.set(granted: trusted)
         screenSlot?.set(granted: Self.screenCaptureGranted)
-        doneButton?.isEnabled = trusted
+        micSlot?.set(granted: Self.microphoneGranted)
+        doneButton?.isEnabled = trusted || !Settings.useChrome
         let slow = force || pollCount % 3 == 0
         if let sw = loginSwitch {
             let want: NSControl.StateValue = LoginItem.enabled ? .on : .off
@@ -240,6 +299,7 @@ final class Permissions: NSObject, NSWindowDelegate {
                 let want: NSControl.StateValue = cachedDefaultBrowser ? .on : .off
                 if sw.state != want { sw.state = want }
             }
+            chromeSlot?.set(granted: ChromeSetup.profilesNeedingSetup().isEmpty)
             refreshExtensions()
         }
     }
@@ -248,12 +308,14 @@ final class Permissions: NSObject, NSWindowDelegate {
         guard let list = extList else { return }
         let connected = Set((server?.identified ?? []).map { $0.profileDir })
         let profiles = HostStore.readProfiles(withExtras: false)
-        var entries: [(name: String, ok: Bool)] = []
+        let kinds = HostSetup.installedKinds()
+        var entries: [(dir: String, name: String, ok: Bool, kind: ExtensionInstallKind?)] = []
         for p in profiles {
             guard let dir = p["dir"] as? String else { continue }
-            entries.append((name: (p["name"] as? String) ?? dir, ok: connected.contains(dir)))
+            entries.append((dir: dir, name: (p["name"] as? String) ?? dir, ok: connected.contains(dir), kind: kinds[dir]))
         }
-        let sig = entries.map { "\($0.name)|\($0.ok)" }.joined(separator: ";")
+        updateInstallBlock(entries)
+        let sig = entries.map { "\($0.name)|\($0.ok)|\($0.kind.map { "\($0)" } ?? "-")" }.joined(separator: ";")
         if sig == extSignature { return }
         extSignature = sig
         for v in list.arrangedSubviews {
@@ -270,19 +332,78 @@ final class Permissions: NSObject, NSWindowDelegate {
         for e in entries {
             let name = NSTextField(labelWithString: e.name)
             name.font = NSFont.systemFont(ofSize: 12)
-            let status = NSTextField(labelWithString: e.ok ? "Connected" : "Not installed")
+            let statusText: String
+            switch (e.ok, e.kind) {
+            case (true, _): statusText = "Connected"
+            case (false, .store?): statusText = "Installed (store)"
+            case (false, .unpacked?): statusText = "Installed (unpacked)"
+            case (false, nil): statusText = "Not installed"
+            }
+            let status = NSTextField(labelWithString: statusText)
             status.font = NSFont.systemFont(ofSize: 12)
             status.textColor = e.ok ? .systemGreen : .secondaryLabelColor
             status.alignment = .right
             let spacer = NSView()
             spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
-            let row = NSStackView(views: [name, spacer, status])
+            var rowViews: [NSView] = [name, spacer]
+            if HostSetup.storeIDSet && !e.ok && e.kind == nil {
+                let add = NSButton(title: "Add from Chrome Web Store", target: self, action: #selector(addFromStore(_:)))
+                add.bezelStyle = .rounded
+                add.controlSize = .small
+                add.identifier = NSUserInterfaceItemIdentifier(e.dir)
+                rowViews.append(add)
+            }
+            rowViews.append(status)
+            let row = NSStackView(views: rowViews)
             row.orientation = .horizontal
             row.distribution = .fill
             row.alignment = .centerY
             list.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: list.widthAnchor).isActive = true
         }
+    }
+
+    /// v3.10: shows the right store-install control for the current profile states (no-op without a store ID).
+    private func updateInstallBlock(_ entries: [(dir: String, name: String, ok: Bool, kind: ExtensionInstallKind?)]) {
+        guard HostSetup.storeIDSet, let button = installButton else { return }
+        let missing = entries.contains { !$0.ok && $0.kind == nil }
+        let hasUnpacked = entries.contains { $0.kind == .unpacked }
+        let fileThere = ExtensionInstall.externalFileExists(dir: HostPaths.externalExtensionsDir, id: HostSetup.storeExtensionID)
+        let requested = installRequested || fileThere
+        let failed = !(installError?.stringValue.isEmpty ?? true)
+        button.isHidden = !missing || hasUnpacked || requested
+        installNote?.isHidden = !(missing && hasUnpacked)
+        let confirmed = missing && !hasUnpacked && requested
+        installConfirm?.isHidden = !confirmed
+        installError?.isHidden = !failed || !missing || hasUnpacked || requested
+        restartButton?.isHidden = !(confirmed && ChromeSetup.chromeRunning)
+    }
+
+    @objc private func installInAllProfiles() {
+        switch ExtensionInstall.writeExternalExtensionFile(dir: HostPaths.externalExtensionsDir, id: HostSetup.storeExtensionID) {
+        case .written:
+            Log.write("setup: wrote External Extensions file for the store extension")
+            installRequested = true
+            installError?.stringValue = ""
+        case .alreadyPresent:
+            Log.write("setup: External Extensions file already present")
+            installRequested = true
+            installError?.stringValue = ""
+        case .failed(let msg):
+            Log.write("setup: cannot write External Extensions file: \(msg)")
+            installError?.stringValue = "Couldn\u{2019}t add Stile: \(msg)"
+        }
+        extSignature = ""
+        refreshExtensions()
+    }
+
+    @objc private func restartChromeClicked() {
+        ChromeSetup.restartChrome { [weak self] _ in self?.refresh(force: true) }
+    }
+
+    @objc private func addFromStore(_ sender: NSButton) {
+        guard let dir = sender.identifier?.rawValue, !dir.isEmpty else { return }
+        HostActions.openStorePage(profileDir: dir)
     }
 
     // MARK: Window
@@ -324,7 +445,7 @@ final class Permissions: NSObject, NSWindowDelegate {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 520),
                          styleMask: [.titled, .closable],
                          backing: .buffered, defer: false)
-        w.title = "Welcome to Sidebar"
+        w.title = "Welcome to Stile"
         w.isReleasedWhenClosed = false
         w.delegate = self
 
@@ -335,9 +456,12 @@ final class Permissions: NSObject, NSWindowDelegate {
         icon.image = NSApp.applicationIconImage
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.translatesAutoresizingMaskIntoConstraints = false
-        let heading = NSTextField(labelWithString: "Welcome to Sidebar")
+        let heading = NSTextField(labelWithString: "Welcome to Stile")
         heading.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
-        let sub = NSTextField(labelWithString: "A few permissions let Sidebar follow Chrome. Only Accessibility is required.")
+        let chromeMode = Settings.useChrome
+        let sub = NSTextField(labelWithString: chromeMode
+            ? "A few permissions let Stile follow Chrome. Only Accessibility is required."
+            : "Capture only: Stile needs Screen Recording to take screenshots. Everything else is optional.")
         sub.font = NSFont.systemFont(ofSize: 12)
         sub.textColor = .secondaryLabelColor
         let header = NSStackView(views: [icon, heading, sub])
@@ -355,6 +479,10 @@ final class Permissions: NSObject, NSWindowDelegate {
         axSlot = ax
         let screen = StatusSlot(buttonTitle: "Allow\u{2026}", target: self, action: #selector(allowScreenRecording))
         screenSlot = screen
+        let mic = StatusSlot(buttonTitle: "Allow\u{2026}", target: self, action: #selector(allowMicrophone))
+        micSlot = mic
+        let chrome = StatusSlot(buttonTitle: "Set up\u{2026}", grantedTitle: "Ready", target: self, action: #selector(setUpChrome))
+        chromeSlot = chrome
         let login = NSSwitch()
         login.target = self
         login.action = #selector(loginToggled(_:))
@@ -382,25 +510,62 @@ final class Permissions: NSObject, NSWindowDelegate {
         buttons.spacing = 8
 
         let extTitle = label("Chrome extension", size: 13, weight: .semibold)
-        let extDetail = label("Sidebar talks to Chrome through its extension, which is added to each profile you use.",
+        let extDetail = label("Stile talks to Chrome through its extension, which is added to each profile you use.",
                               size: 12, secondary: true)
         extDetail.preferredMaxLayoutWidth = 480
-        let extBlock = NSStackView(views: [extTitle, extDetail, list, steps, buttons])
+        var extViews: [NSView] = [extTitle, extDetail, list, steps, buttons]
+        if HostSetup.storeIDSet {
+            // v3.10: store install first; the unpacked steps move under a secondary heading.
+            let install = NSButton(title: "Install in all profiles", target: self, action: #selector(installInAllProfiles))
+            install.bezelStyle = .rounded
+            let note = label("A profile has the developer (unpacked) copy loaded, so Stile won\u{2019}t add the store copy " +
+                             "automatically. Use Add from Chrome Web Store per profile, or remove the unpacked copy first.",
+                             size: 12, secondary: true)
+            note.preferredMaxLayoutWidth = 480
+            let confirm = label("Chrome adds Stile to each profile the next time it starts and asks you to enable it.",
+                                size: 12, secondary: true)
+            confirm.preferredMaxLayoutWidth = 480
+            let err = label("", size: 12)
+            err.textColor = .systemRed
+            err.preferredMaxLayoutWidth = 480
+            let restart = NSButton(title: "Restart Chrome", target: self, action: #selector(restartChromeClicked))
+            restart.bezelStyle = .rounded
+            for v in [install, note, confirm, err, restart] as [NSView] { v.isHidden = true }
+            installButton = install
+            installNote = note
+            installConfirm = confirm
+            installError = err
+            restartButton = restart
+            let dev = label("Developer: load unpacked", size: 11, weight: .semibold, secondary: true)
+            extViews = [extTitle, extDetail, list, install, note, confirm, err, restart, dev, steps, buttons]
+        }
+        let extBlock = NSStackView(views: extViews)
         extBlock.orientation = .vertical
         extBlock.alignment = .leading
         extBlock.spacing = 8
 
-        let items: [NSView] = [
+        let screenRow = row(title: chromeMode ? "Screen Recording (optional)" : "Screen Recording (required)",
+                            detail: chromeMode
+                                ? "Matches the sidebar to Chrome\u{2019}s exact colour, and takes screenshots of other apps."
+                                : "Lets Stile capture what is on your screen.", trailing: screen.view)
+        let micRow = row(title: "Microphone (optional)",
+                         detail: "For screen recordings with your voice. Asked again on the first recording if you skip it.",
+                         trailing: mic.view)
+        let loginRow = row(title: "Launch at login (optional)", detail: "Start Stile when you log in.", trailing: login)
+        let items: [NSView] = chromeMode ? [
             row(title: "Accessibility (required)",
-                detail: "Lets Sidebar follow and move Chrome\u{2019}s windows.", trailing: ax.view),
-            row(title: "Screen Recording (optional)",
-                detail: "Matches the sidebar to Chrome\u{2019}s exact colour.", trailing: screen.view),
-            row(title: "Launch at login (optional)",
-                detail: "Start Sidebar when you log in.", trailing: login),
+                detail: "Lets Stile follow and move Chrome\u{2019}s windows.", trailing: ax.view),
+            row(title: "Chrome vertical tabs (recommended)",
+                detail: "The sidebar sits over Chrome\u{2019}s vertical tabs. Set up turns them on in every profile " +
+                    "(Chrome restarts and reopens your tabs). To do it yourself: right-click Chrome\u{2019}s tab bar " +
+                    "\u{2192} Show tabs vertically, in each profile.", trailing: chrome.view),
+            screenRow,
+            micRow,
+            loginRow,
             row(title: "Default browser for links from other apps (optional)",
                 detail: "Links from other apps open in a little window in Chrome.", trailing: def),
             extBlock,
-        ]
+        ] : [screenRow, micRow, loginRow]
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -446,7 +611,7 @@ final class Permissions: NSObject, NSWindowDelegate {
         let done = NSButton(title: "Done", target: self, action: #selector(doneClicked))
         done.bezelStyle = .rounded
         done.keyEquivalent = "\r"
-        done.isEnabled = Self.isTrusted
+        done.isEnabled = Self.isTrusted || !chromeMode
         doneButton = done
         let footerSpacer = NSView()
         footerSpacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)

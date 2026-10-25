@@ -132,7 +132,8 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
         handle.onResizeEnded = { [weak self] in self?.onResizeEnded?() }
         container.addSubview(handle)
 
-        NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: self, queue: .main) { [weak self] _ in
+        NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: self, queue: .main) { [weak self] note in
+            if note.userInfo?["stileSynthetic"] != nil { return }
             Task { @MainActor in self?.onDidBecomeKey?() }
         }
 
@@ -142,8 +143,29 @@ final class SidebarPanel: NSPanel, WKNavigationDelegate {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
-    override func mouseEntered(with event: NSEvent) { onPointerEnter?() }
-    override func mouseExited(with event: NSEvent) { onPointerExit?() }
+    private var pointerInside = false
+
+    /// WebKit treats a non-key window as inactive and ignores hover. Report key while the pointer is
+    /// over the panel. This does not change NSApp.keyWindow, so keystrokes still go to Chrome.
+    override var isKeyWindow: Bool { super.isKeyWindow || pointerInside }
+
+    override func mouseEntered(with event: NSEvent) {
+        pointerInside = true
+        if !super.isKeyWindow {
+            NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: self,
+                                            userInfo: ["stileSynthetic": true])
+        }
+        onPointerEnter?()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerInside = false
+        if !super.isKeyWindow {
+            NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: self,
+                                            userInfo: ["stileSynthetic": true])
+        }
+        onPointerExit?()
+    }
 
     override func sendEvent(_ event: NSEvent) {
         switch event.type {

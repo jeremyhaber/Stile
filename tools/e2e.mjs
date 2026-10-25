@@ -1,12 +1,12 @@
 // End-to-end test: loads the extension in Chromium, wired to the Node reference host (tools/fake-app, which
-// plays the Sidebar Mac app) through connector.js, a fake Chrome "Local State" and a fake Chrome binary.
+// plays the Stile Mac app) through connector.js, a fake Chrome "Local State" and a fake Chrome binary.
 import { createRequire } from 'module';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
 const require = createRequire(import.meta.url);
-const { chromium } = require('/opt/npm-tools/node_modules/playwright');
+const { chromium } = require(process.env.PLAYWRIGHT_PATH || 'playwright');
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const EXT = path.join(ROOT, 'extension');
@@ -46,6 +46,21 @@ for (const n of ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf'
 const PORT = 8765;
 const server = spawn('python3', ['-m', 'http.server', String(PORT), '--bind', '127.0.0.1'], { cwd: site, stdio: 'ignore' });
 const U = (n) => `http://127.0.0.1:${PORT}/${n}.html`;
+
+// v3.2: download endpoints. /fast/<n> finishes at once, /slow/<n> sends 10 chunks (one every 400 ms) so progress can be watched.
+import http from 'http';
+const dlSrv = http.createServer((req, res) => {
+  const slow = req.url.startsWith('/slow');
+  const n = req.url.split('/')[2] || '0';
+  const size = slow ? 400000 : 2048 + Number(n) * 10;
+  res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': size, 'content-disposition': `attachment; filename="sidebar-${slow ? 'slow' : 'fast'}-${n}.bin"` });
+  if (!slow) { res.end(Buffer.alloc(size)); return; }
+  let sent = 0;
+  const t = setInterval(() => { res.write(Buffer.alloc(40000)); sent += 40000; if (sent >= size) { clearInterval(t); res.end(); } }, 400);
+  res.on('close', () => clearInterval(t));
+});
+await new Promise((r) => dlSrv.listen(0, '127.0.0.1', r));
+const DL = `http://127.0.0.1:${dlSrv.address().port}`;
 
 let pass = 0, fail = 0;
 const check = (name, ok, extra = '') => { ok ? pass++ : fail++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? '  — ' + extra : ''}`); };
@@ -259,7 +274,46 @@ async function main() {
   await sp.locator('[data-testid="settings-archive-profile"]').selectOption({ index: 0 }); await sleep(400);
   const st4 = await cmd({ cmd: 'debugState' });
   check('profile setting "use default" follows global', st4.settings.archiveMinutes == null && st4.settings.effectiveMinutes === 1440, JSON.stringify(st4.settings));
+  // v3.7: scope + layout
+  check('settings: there is no General section', (await sp.locator('[data-testid="settings-nav-general"]').count()) === 0 && (await sp.locator('[data-testid="settings-section-general"]').count()) === 0);
+  const scopeSel = sp.locator('[data-testid="settings-scope"]');
+  check('settings: a per-profile / mixed section (Tabs) shows the "Settings for" profile picker, disabled in the Chrome page', (await scopeSel.isVisible()) && (await scopeSel.isDisabled()) && (await sp.locator('[data-testid="settings-scope-global"]').count()) === 0 && /Settings for/.test(await sp.locator('#pane-scope').innerText()) && (await scopeSel.locator('option').count()) === 1, await sp.locator('#pane-scope').innerText());
+  const headsTxt = await sp.locator('[data-testid="settings-section-tabs"] .group-h:visible').allInnerTexts();
+  check('settings: Tabs shows "All profiles" first, then a heading with this profile\'s name', headsTxt[0] === 'All profiles' && headsTxt[1] && headsTxt[1] !== 'This profile', JSON.stringify(headsTxt));
+  const profSel = sp.locator('[data-testid="settings-archive-profile"]');
+  const firstOpt = () => profSel.locator('option').first().innerText();
+  check('settings: the profile override\'s first option is "Use default (24 hours)"', (await firstOpt()) === 'Use default (24 hours)', await firstOpt());
+  await g.selectOption(opts.find(([, t]) => /12 hours/.test(t))[0]); await sleep(700);
+  check('settings: "Use default (…)" follows a global change live', (await firstOpt()) === 'Use default (12 hours)', await firstOpt());
+  await g.selectOption(day[0]); await sleep(500);
+  await profSel.selectOption(String(60)); await sleep(500);
+  check('settings: a profile override is stored in sync storage', (await swEval(async () => (await chrome.storage.sync.get('archiveMinutes')).archiveMinutes)) === 60);
+  await sp.locator('[data-testid="archive-apply-all"]').click(); await sleep(900);
+  check('settings: "Apply to all profiles" clears the profile override (sync storage) and the select shows the default again', (await swEval(async () => (await chrome.storage.sync.get('archiveMinutes')).archiveMinutes)) == null && (await profSel.inputValue()) === '');
+  check('settings: "Apply to all profiles" toasts the shared value', /All profiles now use 24 hours/.test(await sp.locator('[data-testid="toast"]').first().innerText()));
+  await sp.locator('[data-testid="settings-nav-app"]').click(); await sleep(200);
+  check('settings: a global section (App) shows the "All profiles" chip instead of the picker', (await sp.locator('[data-testid="settings-scope-global"]').isVisible()) && !(await scopeSel.isVisible()));
+  check('settings: Troubleshooting has the Chrome profile picker (relocated from General)', (await sp.locator('[data-testid="settings-profile-picker"]').isVisible()) && (await sp.locator('[data-testid="settings-current-profile"]').count()) === 1);
+  await sp.locator('[data-testid="settings-nav-profiles"]').click(); await sleep(200);
+  check('settings: Profiles is a global section too', await sp.locator('[data-testid="settings-scope-global"]').isVisible());
+  await sp.locator('[data-testid="settings-nav-windows"]').click(); await sleep(200);
+  check('settings: Windows is per profile (picker)', await scopeSel.isVisible());
+  await sp.locator('[data-testid="settings-nav-little"]').click(); await sleep(200);
+  check('settings: Little windows is mixed (picker, with an "All profiles" group)', (await scopeSel.isVisible()) && (await sp.locator('[data-testid="settings-section-little"], [data-testid="settings-little"]').locator('.group-h:visible').first().innerText()) === 'All profiles');
+  // the gear asks Stile.app for its settings window first; this fake app has none, so it fell back to the page above
+  check('settings: the gear asked the app (showSettings) before opening the Chrome page', host.showSettingsCalls.length >= 1 && host.showSettingsCalls[0].profileDir != null, JSON.stringify(host.showSettingsCalls));
   await closeSettings();
+  {
+    const n0 = host.showSettingsCalls.length;
+    host.settingsWindow = true;
+    const r = await cmd({ cmd: 'openSettings', section: 'tabs' }); await sleep(800);
+    host.settingsWindow = false;
+    check('settings: with an app settings window, openSettings goes to the app and opens no Chrome page', r?.ok === true && r.app === true && host.showSettingsCalls.length === n0 + 1 && host.showSettingsCalls[n0].section === 'tabs' && !ctx.pages().some((p) => !p.isClosed() && p.url().includes('settings.html')), JSON.stringify([r, host.showSettingsCalls.slice(n0)]));
+    const r2 = await cmd({ cmd: 'openSettings' }); await sleep(1200);
+    check('settings: when the app has no window, openSettings falls back to the Chrome page', r2?.ok === true && !r2.app && ctx.pages().some((p) => !p.isClosed() && p.url().includes('settings.html')), JSON.stringify(r2));
+    sp = ctx.pages().find((p) => !p.isClosed() && p.url().includes('settings.html')) || null;   // opened outside openSettings()
+    await closeSettings();
+  }
 
   // Profile switch → helper launches Chrome for the other profile
   await panel.locator('[data-testid="profile-pill"]').nth(1).click();
@@ -525,6 +579,67 @@ async function main() {
     d = await dbg();
     check('v2.6 lock: Unlock tab removes the lock and the icon', !d.lockedTabs?.[lid] && (await rowOf(lid).locator('[data-testid="lock-icon"]').count()) === 0);
 
+    // ---- v3.6: Record Chrome Tab (the app records; the extension sends the request and tracks the tab)
+    {
+      const recs = [];
+      host.on('record', (x) => recs.push(x));
+      const lastOf = (type) => [...recs].reverse().find((r) => r.type === type);
+      const tabInfo = await swEval(async (id) => { const t = await chrome.tabs.get(id); return { windowId: t.windowId, title: t.title }; }, lid);
+      const activeBefore = await swEval(async (w) => (await chrome.tabs.query({ active: true, windowId: w }))[0].id, tabInfo.windowId);
+      await rowOf(lid).click({ button: 'right' }); await sleep(300);
+      check('v3.6 record: the tab menu offers "Record this tab" while the app is connected', (await panel.locator('[data-testid="context-menu-item"][data-action="record-tab"]').count()) === 1);
+      await panel.locator('[data-testid="context-menu-item"][data-action="record-tab"]').click(); await sleep(600);
+      const rt = lastOf('recordTab');
+      check('v3.6 record: the menu item sends recordTab {windowId, tabId, title} to the app', rt?.msg.tabId === lid && rt.msg.windowId === tabInfo.windowId && typeof rt.msg.title === 'string', JSON.stringify(rt?.msg));
+      const n0 = recs.length;
+      const r2 = await cmd({ cmd: 'recordTab', tabId: lid }); await sleep(300);
+      check('v3.6 record: the recordTab command answers ok and sends the same message', r2?.ok === true && recs.length === n0 + 1 && recs.at(-1).msg.tabId === lid, JSON.stringify(r2));
+      const r3 = await cmd({ cmd: 'recordTab', tabId: 999999 });
+      check('v3.6 record: the command refuses a tab that is gone', r3?.ok === false && /gone/.test(r3.error || ''), JSON.stringify(r3));
+
+      host.setRecordingTab('Default', lid); await sleep(700);
+      check('v3.6 record: the app naming the tab puts a red dot on its row, and the menu stops offering the item',
+        (await rowOf(lid).locator('[data-testid="recording-dot"]').count()) === 1);
+      await rowOf(lid).click({ button: 'right' }); await sleep(300);
+      check('v3.6 record: no "Record this tab" for the tab being recorded', (await panel.locator('[data-action="record-tab"]').count()) === 0);
+      await panel.keyboard.press('Escape');
+
+      // leaving / returning to the tab: auto-pause and resume
+      const otherId = await swEval(async ([w, id]) => (await chrome.tabs.query({ windowId: w })).find((t) => t.id !== id)?.id ?? null, [tabInfo.windowId, lid]);
+      if (otherId != null) {
+        recs.length = 0;
+        await swEval(async (id) => chrome.tabs.update(id, { active: true }), otherId); await sleep(500);
+        check('v3.6 record: switching to another tab sends recordTabState active:false', recs.some((r) => r.type === 'recordTabState' && r.msg.tabId === lid && r.msg.active === false), JSON.stringify(recs.map((r) => r.msg)));
+        recs.length = 0;
+        await swEval(async (id) => chrome.tabs.update(id, { active: true }), lid); await sleep(500);
+        check('v3.6 record: coming back sends recordTabState active:true', recs.some((r) => r.type === 'recordTabState' && r.msg.tabId === lid && r.msg.active === true), JSON.stringify(recs.map((r) => r.msg)));
+        check('v3.6 record: a tab switch in a window that is not recorded sends nothing else', !recs.some((r) => r.msg.tabId !== lid));
+      }
+
+      // the menu bar's "Record Chrome Tab": the app asks, the extension answers with the active tab of the last focused window
+      recs.length = 0;
+      host.requestRecordTab('Default'); await sleep(700);
+      check('v3.6 record: recordTabRequest is answered with recordTab for an active tab', recs.some((r) => r.type === 'recordTab' && Number.isFinite(r.msg.tabId) && Number.isFinite(r.msg.windowId)), JSON.stringify(recs.map((r) => r.msg)));
+
+      // a recorded tab that is closed, and one that moves to another window
+      const fresh = await swEval(async (w) => (await chrome.tabs.create({ windowId: w, url: 'about:blank', active: false })).id, tabInfo.windowId);
+      host.setRecordingTab('Default', fresh); await sleep(500);
+      recs.length = 0;
+      await swEval(async (id) => chrome.tabs.remove(id), fresh); await sleep(600);
+      check('v3.6 record: closing the recorded tab sends recordTabClosed', recs.some((r) => r.type === 'recordTabClosed' && r.msg.tabId === fresh), JSON.stringify(recs.map((r) => r.msg)));
+      const fresh2 = await swEval(async (w) => (await chrome.tabs.create({ windowId: w, url: 'about:blank', active: false })).id, tabInfo.windowId);
+      host.setRecordingTab('Default', fresh2); await sleep(500);
+      recs.length = 0;
+      const newWin = await swEval(async (id) => (await chrome.windows.create({ tabId: id })).id, fresh2); await sleep(900);
+      check('v3.6 record: moving the recorded tab to another window sends recordTabMoved (then its state there)', recs.some((r) => r.type === 'recordTabMoved' && r.msg.tabId === fresh2 && r.msg.windowId === newWin) && recs.some((r) => r.type === 'recordTabState' && r.msg.tabId === fresh2 && r.msg.active === true), JSON.stringify(recs.map((r) => [r.type, r.msg])));
+      host.setRecordingTab('Default', null); await sleep(500);
+      check('v3.6 record: recordingTab null clears the dot and the tracking', (await rowOf(lid).locator('[data-testid="recording-dot"]').count()) === 0);
+      recs.length = 0;
+      await swEval(async (id) => chrome.windows.remove(id), newWin); await sleep(500);
+      check('v3.6 record: after the recording, tab changes send nothing', recs.length === 0, JSON.stringify(recs.map((r) => r.msg)));
+      await swEval(async (id) => chrome.tabs.update(id, { active: true }), activeBefore); await sleep(300);
+    }
+
     // effects, in a window of their own
     const prevMin = d.settings.archiveMinutes;
     const urlsL = [0, 1, 2, 3, 4].map((i) => U('alpha') + `?l=${i}`);
@@ -748,7 +863,7 @@ async function main() {
     const arc2 = (await dbg()).archive.length;
     await cmd({ cmd: 'runArchiveNow' });
     check('v2.8 little: auto-archive never touches a little window', (await winExists(r2.windowId)) && (await dbg()).archive.length === arc2);
-    // Sidebar.app promotes by Chrome window id (pill / ⌘O), not entry id.
+    // Stile.app promotes by Chrome window id (pill / ⌘O), not entry id.
     const pr2 = await cmd({ cmd: 'promoteLittle', windowId: r2.windowId });
     check('v2.8 promote (regular): the same tab id moves into the main window', pr2.ok && pr2.moved === true && pr2.tabId === r2.tabId && pr2.windowId === mainWin, JSON.stringify([pr2, r2]));
     await sleep(700);
@@ -1019,16 +1134,200 @@ async function main() {
   const wb = await swEval(async () => { const w = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }); return { left: w.left, top: w.top, width: w.width, height: w.height }; });
   check('activate from another profile applies window bounds', wb.width === 900 && wb.height === 640, JSON.stringify(wb));
 
+  // ==== v3.2 downloads begin
+  {
+    const dbgS = () => cmd({ cmd: 'debugState' });
+    const pop = panel.locator('[data-testid="downloads-popover"]');
+    const arch = panel.locator('[data-testid="archive-button"]');
+    const rowsL = panel.locator('[data-testid="download-row"]');
+    const hoverOff = async () => { await panel.mouse.move(200, 300); await sleep(700); };
+    const hoverArchive = async () => { await panel.mouse.move(200, 300); await arch.hover(); };
+    // nothing downloaded yet: hover shows nothing
+    await swEval(async () => { for (const d of await chrome.downloads.search({})) { try { await chrome.downloads.erase({ id: d.id }); } catch { /* ignore */ } } });
+    await hoverArchive(); await sleep(900);
+    check('v3.2 downloads: hovering Archive with no downloads shows no popover', (await pop.count()) === 0);
+    await hoverOff();
+    // 5 quick downloads, then a slow one
+    const ids = [];
+    for (let i = 1; i <= 5; i++) { ids.push(await swEval(async (u) => chrome.downloads.download({ url: u }), `${DL}/fast/${i}`)); await sleep(150); }
+    for (let t = 0; t < 8000; t += 200) { const l = await swEval(async () => chrome.downloads.search({ state: 'complete' })); if (l.length >= 5) break; await sleep(200); }
+    ids.push(await swEval(async (u) => chrome.downloads.download({ url: u }), `${DL}/slow/1`));
+    await sleep(900);
+    await hoverArchive();
+    await pop.waitFor({ timeout: 5000 }).catch(() => {});
+    check('v3.2 downloads: hovering Archive opens the popover', (await pop.count()) === 1 && (await pop.isVisible()));
+    check('v3.2 downloads: it lists the last 4 downloads, newest first', (await rowsL.count()) === 4 && (await rowsL.evaluateAll((r) => r.map((x) => Number(x.dataset.id)))).join() === [...ids].reverse().slice(0, 4).join(), JSON.stringify(await rowsL.evaluateAll((r) => r.map((x) => x.dataset.id))) + ' vs ' + JSON.stringify(ids));
+    const slowRow = panel.locator(`[data-testid="download-row"][data-id="${ids[5]}"]`);
+    check('v3.2 downloads: an in-progress download has a progress bar and "x of y" text', (await slowRow.locator('[data-testid="download-progress"]').count()) === 1 && /of 400 KB/.test(await slowRow.locator('[data-testid="download-meta"]').innerText()), await slowRow.innerText().catch(() => ''));
+    const pr = async () => Number(await slowRow.locator('[data-testid="download-progress"]').getAttribute('data-progress').catch(() => '-1'));
+    const p1 = await pr(); await sleep(1300); const p2 = await pr();
+    check('v3.2 downloads: the progress bar moves live while it downloads', p1 >= 0 && p2 > p1, `${p1} -> ${p2}`);
+    check('v3.2 downloads: in-progress rows are not draggable', (await slowRow.getAttribute('draggable')) === null);
+    await panel.screenshot({ path: path.join(OUT, '32-downloads-popover.png') });
+    for (let t = 0; t < 9000 && (await slowRow.locator('[data-testid="download-progress"]').count()); t += 200) await sleep(200);
+    check('v3.2 downloads: when done the bar goes away and the size shows', (await slowRow.locator('[data-testid="download-progress"]').count()) === 0 && /400 KB/.test(await slowRow.locator('[data-testid="download-meta"]').innerText()) && (await slowRow.getAttribute('data-state')) === 'complete', await slowRow.innerText().catch(() => ''));
+    check('v3.2 downloads: a finished row is draggable and shows the file name', (await slowRow.getAttribute('draggable')) === 'true' && !!(await slowRow.getAttribute('data-name')));
+    // Stub the actions that would touch the OS (open / reveal / drag) in the panel page and record them.
+    const stubbed = await panel.evaluate(() => {
+      window.__dl = [];
+      const d = chrome.downloads;
+      try {
+        Object.defineProperty(d, 'open', { configurable: true, writable: true, value: (id) => { window.__dl.push(['open', id]); return Promise.resolve(); } });
+        Object.defineProperty(d, 'show', { configurable: true, writable: true, value: (id) => { window.__dl.push(['show', id]); return Promise.resolve(); } });
+        Object.defineProperty(d, 'drag', { configurable: true, writable: true, value: (id) => { window.__dl.push(['drag', id]); } });
+        return typeof d.drag === 'function' && d.open.length === 1;
+      } catch (e) { return String(e); }
+    });
+    check('v3.2 downloads: (test) OS actions stubbed in the panel page', stubbed === true, String(stubbed));
+    await slowRow.click();
+    await sleep(300);
+    check('v3.2 downloads: clicking a finished row opens the file', JSON.stringify(await panel.evaluate(() => window.__dl)) === JSON.stringify([['open', ids[5]]]) && (await pop.count()) === 0, JSON.stringify(await panel.evaluate(() => window.__dl)));
+    await hoverOff(); await hoverArchive(); await pop.waitFor({ timeout: 5000 }).catch(() => {});
+    await panel.evaluate((id) => {
+      const row = document.querySelector(`[data-testid="download-row"][data-id="${id}"]`);
+      row.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer: new DataTransfer() }));
+    }, ids[4]);
+    check('v3.2 downloads: dragstart on a finished row calls chrome.downloads.drag (side-panel mode)', JSON.stringify((await panel.evaluate(() => window.__dl)).slice(-1)) === JSON.stringify([['drag', ids[4]]]), JSON.stringify(await panel.evaluate(() => window.__dl)));
+    await panel.locator('[data-testid="downloads-show-all"]').click();
+    let dtab = null;
+    for (let t = 0; t < 5000 && !dtab; t += 200) { dtab = (await swEval(async () => chrome.tabs.query({}))).find((x) => /^chrome:\/\/downloads/.test(x.url || x.pendingUrl || '')); if (!dtab) await sleep(200); }
+    check('v3.2 downloads: "Show all downloads" opens chrome://downloads', !!dtab);
+    if (dtab) await swEval(async (id) => chrome.tabs.remove(id), dtab.id);
+    // clicking the Archive button hides the popover and still opens the archive
+    await hoverOff(); await hoverArchive(); await pop.waitFor({ timeout: 5000 }).catch(() => {});
+    await arch.click(); await sleep(400);
+    check('v3.2 downloads: clicking Archive closes the popover and opens the Archive view', (await pop.count()) === 0 && (await panel.locator('[data-testid="archive-view"]').isVisible()));
+    await panel.locator('[data-testid="back-button"]').click(); await sleep(300);
+    await hoverOff();
+    check('v3.2 downloads: moving the pointer away closes the popover', (await pop.count()) === 0);
+    // erased downloads vanish from a re-opened popover
+    await swEval(async (id) => chrome.downloads.erase({ id }), ids[5]);
+    await hoverArchive(); await pop.waitFor({ timeout: 5000 }).catch(() => {});
+    check('v3.2 downloads: an erased download is no longer listed', (await panel.locator(`[data-testid="download-row"][data-id="${ids[5]}"]`).count()) === 0 && (await rowsL.count()) === 4);
+    await hoverOff();
+  }
+  // ==== v3.2 downloads end
+
+  // ==== v3.3 presentation begin
+  {
+    const dbgS = () => cmd({ cmd: 'debugState' });
+    const win = async (id) => (await swEval(async (i) => chrome.windows.get(i, { populate: true }).catch(() => null), id));
+    const untilWin = async (fn, ms = 6000) => { for (let t = 0; t < ms; t += 200) { const d = await dbgS(); if (fn(d)) return d; await sleep(200); } return dbgS(); };
+    const mkTab = async (u) => (await swEval(async ([w, url]) => (await chrome.tabs.create({ windowId: w, url, active: false })).id, [mainWin, u]));
+    // unique URLs: earlier tests pinned some of the site pages and a bound tab is never archived
+    const tA = await mkTab(U('foxtrot') + '?pa'); const tB = await mkTab(U('golf') + '?pb'); const tC = await mkTab(U('delta') + '?pc');
+    await sleep(700);
+    const mainBefore = (await dbgS()).mainWindowId;
+    const secs = panel.locator('[data-testid="window-section"][data-presentation="true"]');
+    check('v3.3 present: no presentation section before starting', (await secs.count()) === 0 && (await dbgS()).presentation == null);
+    // start from the empty-Today context menu
+    await panel.locator('.sec-today .sec-h h2').click({ button: 'right' });
+    await panel.locator('[data-testid="context-menu-item"][data-action="start-presenting"]').click();
+    let d = await untilWin((x) => !!x.presentation);
+    const PW = d.presentation && d.presentation.windowId;
+    check('v3.3 present: "Start presenting" creates a presentation window and stores the role', PW != null && !!(await win(PW)) && d.presentation.startedAt > 0, JSON.stringify(d.presentation));
+    check('v3.3 present: it is not the main window and not in the window order', d.mainWindowId === mainBefore && !(d.windowOrder || []).includes(PW), JSON.stringify([d.mainWindowId, d.windowOrder, PW]));
+    await sleep(600);
+    check('v3.3 present: the main sidebar lists it as a Presentation section', (await secs.count()) === 1 && /Presentation · 1 tab/.test(await secs.locator('.wmeta').innerText()), await secs.first().innerText().catch(() => ''));
+    // add via the tab menu
+    const rowOf = (id) => panel.locator(`[data-testid="today-row"][data-tab-id="${id}"]`);
+    await rowOf(tA).click({ button: 'right' });
+    check('v3.3 present: the tab menu offers "Add to presentation" (and no "Start presenting with this tab")', (await panel.locator('[data-testid="context-menu-item"][data-action="add-to-presentation"]').count()) === 1 && (await panel.locator('[data-testid="context-menu-item"][data-action="start-presenting-tab"]').count()) === 0);
+    await panel.locator('[data-testid="context-menu-item"][data-action="add-to-presentation"]').click();
+    d = await untilWin((x) => (x.windows.find((w) => w.id === PW)?.tabs || []).some((t) => t.id === tA));
+    const pwTabs = () => d.windows.find((w) => w.id === PW)?.tabs || [];
+    check('v3.3 present: "Add to presentation" moves the tab into the presentation window and closes its blank start page', pwTabs().some((t) => t.id === tA) && pwTabs().length === 1, JSON.stringify(pwTabs().map((t) => [t.id, t.url])));
+    const r2 = await cmd({ cmd: 'addToPresentation', tabId: tB });
+    d = await dbgS();
+    check('v3.3 present: addToPresentation by command appends another tab', r2.ok && pwTabs().length === 2 && pwTabs()[1].id === tB, JSON.stringify(r2));
+    // the presentation window's own sidebar
+    const pp = await ctx.newPage();   // placeholder page so the popup does not become the only window
+    await pp.close();
+    await swEval(async ([u]) => chrome.windows.create({ url: u, type: 'popup', width: 320, height: 800 }), [`chrome-extension://${extId}/sidepanel.html?windowId=${PW}`]);
+    let pres = null;
+    for (let t = 0; t < 8000 && !pres; t += 200) { pres = ctx.pages().find((x) => x.url().includes(`windowId=${PW}`)); if (!pres) await sleep(200); }
+    await pres.setViewportSize({ width: 320, height: 860 });
+    await sleep(1200);
+    const vis = async (sel) => pres.locator(sel).first().isVisible().catch(() => false);
+    const presRows = pres.locator('[data-testid="today-list"] [data-testid="today-row"]');
+    check('v3.3 present: the presentation sidebar shows the presenting bar', await vis('[data-testid="present-bar"]') && /Presenting/.test(await pres.locator('[data-testid="present-bar"]').innerText()));
+    check('v3.3 present: it lists only the tabs added to it', (await presRows.count()) === 2 && (await presRows.evaluateAll((r) => r.map((x) => Number(x.dataset.tabId)))).join() === [tA, tB].join());
+    check('v3.3 present: other windows, profiles, Favourites, Pinned, Temporary and Merge all are hidden',
+      !(await vis('[data-testid="window-section"]')) && !(await vis('[data-testid="profile-switcher"]')) && !(await vis('[data-testid="favourites-grid"]')) && !(await vis('[data-testid="pinned-tree"]')) && !(await vis('[data-testid="temp-section"]')) && !(await vis('[data-testid="merge-all"]')) && !(await vis('[data-testid="popout-bar"]')));
+    await pres.locator('[data-testid="today-row"]').first().click({ button: 'right' });
+    const acts = await pres.locator('[data-testid="context-menu-item"]').evaluateAll((l) => l.map((x) => x.dataset.action));
+    check('v3.3 present: its tab menu has "Remove from presentation" and no Favourite / Pin / Temporary entries', acts.includes('remove-from-presentation') && !acts.includes('add-favourite') && !acts.includes('pin') && !acts.includes('to-temporary') && !acts.includes('add-to-presentation'), acts.join());
+    await pres.keyboard.press('Escape');
+    // hovering Archive there shows no downloads popover (there are downloads)
+    await pres.locator('[data-testid="archive-button"]').hover(); await sleep(900);
+    check('v3.3 present: the downloads popover is not shown in the presentation window', (await pres.locator('[data-testid="downloads-popover"]').count()) === 0);
+    await pres.mouse.move(150, 300);
+    await pres.screenshot({ path: path.join(OUT, '33-presentation-sidebar.png') });
+    // an auto-archive sweep never touches the presentation window's tabs
+    // (the active tab of a window is never archived, and deactivating a tab refreshes its clock: switch tabs first)
+    await swEval(async ([w, keep]) => { const o = (await chrome.tabs.query({ windowId: w })).find((t) => t.id !== keep); if (o) await chrome.tabs.update(o.id, { active: true }); }, [mainBefore, tC]);
+    await sleep(400);
+    await swEval(async ([ids]) => {
+      const { lastActive = {} } = await chrome.storage.local.get('lastActive');
+      for (const id of ids) lastActive[id] = 1000;
+      await chrome.storage.local.set({ lastActive });
+      await chrome.storage.sync.set({ archiveMinutes: 1 });
+    }, [[tB, tC]]);
+    const sw1 = await cmd({ cmd: 'runArchiveNow' });
+    await sleep(500);
+    d = await dbgS();
+    const live = (id) => d.windows.some((w) => w.tabs.some((t) => t.id === id));
+    check('v3.3 present: auto-archive skips the presentation window (control tab in main is archived)', sw1.ok && live(tB) && !live(tC), JSON.stringify([sw1, live(tB), live(tC)]));
+    await swEval(async () => chrome.storage.sync.remove('archiveMinutes'));
+    // stop presenting from the presentation sidebar: the tabs go back to the main window, the window closes
+    await pres.locator('[data-testid="present-stop"]').click();
+    d = await untilWin((x) => x.presentation == null && !x.windows.some((w) => w.id === PW));
+    check('v3.3 present: "Stop presenting" merges the tabs back into the main window and closes the window', d.presentation == null && !d.windows.some((w) => w.id === PW) && d.windows.find((w) => w.id === mainBefore).tabs.some((t) => t.id === tA) && d.windows.find((w) => w.id === mainBefore).tabs.some((t) => t.id === tB), JSON.stringify([d.presentation, d.windows.map((w) => w.id)]));
+    await sleep(600);
+    check('v3.3 present: the Presentation section is gone from the main sidebar', (await secs.count()) === 0);
+    await pres.close().catch(() => {});
+    // start with a tab (menu "Start presenting with this tab"), then close the window by hand
+    await rowOf(tA).click({ button: 'right' });
+    await panel.locator('[data-testid="context-menu-item"][data-action="start-presenting-tab"]').click();
+    d = await untilWin((x) => !!x.presentation);
+    const PW2 = d.presentation && d.presentation.windowId;
+    check('v3.3 present: "Start presenting with this tab" moves that tab into the new presentation window', PW2 != null && PW2 !== PW && (d.windows.find((w) => w.id === PW2)?.tabs || []).some((t) => t.id === tA));
+    // a stop command from the main sidebar's Presentation section
+    await sleep(500);
+    await panel.locator('[data-testid="present-section-stop"]').click({ force: true });
+    d = await untilWin((x) => x.presentation == null);
+    check('v3.3 present: the section\'s Stop button ends the presentation', d.presentation == null && !d.windows.some((w) => w.id === PW2));
+    // mergeWindow on the presentation window means "stop presenting"
+    await cmd({ cmd: 'startPresenting', tabId: tC > 0 && live(tC) ? tC : tB });
+    d = await untilWin((x) => !!x.presentation);
+    const PW3 = d.presentation.windowId;
+    const mw = await cmd({ cmd: 'mergeWindow', windowId: PW3 });
+    d = await untilWin((x) => x.presentation == null);
+    check('v3.3 present: mergeWindow on the presentation window stops it (used by the Mac close button)', mw.ok && d.presentation == null && !d.windows.some((w) => w.id === PW3), JSON.stringify(mw));
+    // closing the window by hand ends the role as well
+    await cmd({ cmd: 'startPresenting', tabId: tB });
+    d = await untilWin((x) => !!x.presentation);
+    const PW4 = d.presentation.windowId;
+    await swEval(async (w) => chrome.windows.remove(w), PW4);
+    d = await untilWin((x) => x.presentation == null);
+    check('v3.3 present: closing the presentation window clears the role', d.presentation == null && !d.windows.some((w) => w.id === PW4));
+    // incognito tabs can't be presented; stopping when idle is a refusal, not a crash
+    const idle = await cmd({ cmd: 'stopPresenting' });
+    check('v3.3 present: stop when not presenting is refused', idle.ok === false);
+    await sleep(1800);
+  }
+  // ==== v3.3 presentation end
+
   // ---- v2.7: toolbar badge, offline card, overlay toggle
   {
     const dbg = () => cmd({ cmd: 'debugState' });
     const untilSt = async (fn, ms = 8000) => { for (let t = 0; t < ms; t += 250) { const d = await dbg(); if (fn(d)) return d; await sleep(250); } return dbg(); };
     let d = await untilSt((x) => x?.helper?.status === 'connected' && x.settings?.appEverConnected);
     check('v2.7: appEverConnected stored after the first connection', d.settings?.appEverConnected === true);
-    check('v2.7: badge cleared and title "Sidebar" while connected', d.badge?.text === '' && d.badge?.title === 'Sidebar', JSON.stringify(d.badge));
+    check('v2.7: badge cleared and title "Stile" while connected', d.badge?.text === '' && d.badge?.title === 'Stile', JSON.stringify(d.badge));
     const menu = () => (d.contextMenus || []).find((m) => m.id === 'overlay-toggle');
     check('v2.7: context menu item exists while connected (checkbox, action context, checked)', menu()?.type === 'checkbox' && menu().checked === true && menu().contexts?.[0] === 'action', JSON.stringify(d.contextMenus));
-    check('v2.7: offline card hidden while connected', (await panel.locator('[data-testid="app-offline-card"]').isVisible()) === false);
+    check('v2.7: gate hidden while connected', (await panel.locator('[data-testid="app-required"]').isVisible()) === false);
 
     await openSettings('app');
     const sw = sp.locator('[data-testid="overlay-enabled"]');
@@ -1043,6 +1342,7 @@ async function main() {
     check('v2.7: broadcast from the app updates switch and menu', (await sw.isChecked()) && menu()?.checked === true && d.settings?.overlayEnabled === true);
     await closeSettings();
 
+    await openSettings('little');   // stays open: the gate will cover it, so it can't be navigated afterwards
     // drop the connection (the app "quit")
     for (const c of [...host.conns]) c.sock.destroy();
     d = await untilSt((x) => x?.helper?.status !== 'connected');
@@ -1051,17 +1351,58 @@ async function main() {
     check('v2.7: badge "!" after having connected once', d.badge?.text === '!' && /isn't running/.test(d.badge?.title || ''), JSON.stringify(d.badge));
     check('v2.7: context menu removed while disconnected', !menu(), JSON.stringify(d.contextMenus));
     await sleep(500);
-    const card = panel.locator('[data-testid="app-offline-card"]');
-    await openSettings('little');
-    check('v2.8 settings: the default-browser switch is disabled with a hint while the app is offline', (await sp.locator('[data-testid="little-default-browser"]').isDisabled()) && /Needs Sidebar\.app/.test(await sp.locator('[data-testid="little-default-hint"]').innerText()));
-    await closeSettings();
-    check('v2.7: offline card shown with both buttons', (await card.isVisible()) && /isn't running/.test(await card.innerText()) && (await panel.locator('[data-testid="app-offline-open"]').isVisible()) && (await panel.locator('[data-testid="app-offline-retry"]').isVisible()));
+    // Stile.app is required: the gate covers the panel and the (already open) settings window. Settings can't be navigated while gated, so rows are checked through the DOM.
+    const gate = panel.locator('[data-testid="app-required"]');
+    const rowHidden = (tid) => sp.evaluate((t) => { const e = document.querySelector(`[data-testid="${t}"]`); const r = e && (e.closest('.row') || e); return !r || r.offsetParent === null; }, tid);
+    check('settings: app-only rows (default browser, hotkey note, global archive default, App rows) are hidden while the app is offline', (await rowHidden('little-default-browser')) && (await rowHidden('little-hotkey-note')) && (await rowHidden('settings-archive-global')) && (await rowHidden('app-launch-login')) && (await rowHidden('app-quit')) && (await rowHidden('app-accessibility')) && !(await rowHidden('little-style')) && (await sp.locator('[data-testid="app-lockstep"]').count()) === 0);
+    const sgate = sp.locator('[data-testid="app-required"]');
+    check('settings gate (has connected before): "Stile.app isn\'t running" with Open and Retry, no steps', (await sgate.isVisible()) && /isn.t running/.test(await sgate.innerText()) && (await sgate.locator('[data-testid="app-offline-open"]').isVisible()) && (await sgate.locator('[data-testid="app-offline-retry"]').isVisible()) && !(await sgate.locator('[data-testid="app-required-steps"]').isVisible()) && (await sp.evaluate(() => document.querySelector('.win').inert)) === true);
+    const grpHidden = () => sp.evaluate(() => { const g = document.querySelector('[data-testid="settings-profile-picker"]').closest('.group'); return { hidden: g.hidden, visible: g.offsetParent !== null }; });
+    const gh = await grpHidden();
+    check('settings: a group whose rows are all hidden (profile picker, app offline) is hidden itself', gh.hidden && !gh.visible, JSON.stringify(gh));
+    check('v2.7: panel gate shown with Open Stile.app and Retry (has connected before)', (await gate.isVisible()) && /isn't running/.test(await gate.innerText()) && (await panel.locator('[data-testid="app-offline-open"]').isVisible()) && (await panel.locator('[data-testid="app-offline-retry"]').isVisible()) && (await panel.locator('[data-testid="app-required-get"]').isVisible()) && !(await panel.locator('[data-testid="app-required-steps"]').isVisible()) && !(await panel.locator('[data-testid="app-required-download"]').isVisible()));
+    check('gate: the lists and footer behind it are inert and the gate covers the panel', await panel.evaluate(() => ['view-main', 'footer'].every((id) => document.getElementById(id).inert) && document.getElementById('app-required').getBoundingClientRect().height >= document.getElementById('app').getBoundingClientRect().height - 1));
+    // Never-installed variant (simulated: no appEverConnected, native host manifest "missing")
+    {
+      await swEval(async () => { await chrome.storage.local.set({ appEverConnected: false }); await chrome.storage.session.set({ helper: { status: 'not_installed', profiles: [], currentProfileDir: null } }); });
+      await sleep(600);
+      check('gate (never installed): panel shows the install steps, Download and Check again', (await gate.isVisible()) && /needs the Stile app/.test(await gate.innerText()) && (await panel.locator('[data-testid="app-required-steps"]').isVisible()) && (await panel.locator('[data-testid="app-required-download"]').isVisible()) && (await panel.locator('[data-testid="app-offline-retry"]').isVisible()) && !(await panel.locator('[data-testid="app-offline-open"]').isVisible()));
+      check('gate (never installed): settings shows the same gate', (await sgate.isVisible()) && /needs the Stile app/.test(await sgate.innerText()) && (await sgate.locator('[data-testid="app-required-download"]').isVisible()));
+      await swEval(async () => { await chrome.storage.local.set({ appEverConnected: true }); });
+      await sleep(400);
+    }
     // Retry reconnects (the reference host is still listening)
     await panel.locator('[data-testid="app-offline-retry"]').click();
     d = await untilSt((x) => x?.helper?.status === 'connected' && x.badge?.text === '');
     check('v2.7: Retry reconnects, badge cleared, menu back', d.helper?.status === 'connected' && d.badge?.text === '' && !!menu(), JSON.stringify([d.helper?.status, d.badge]));
     await sleep(400);
-    check('v2.7: offline card hidden after reconnect', (await card.isVisible()) === false);
+    check('v2.7: gate gone after reconnect (panel and settings), content no longer inert', (await gate.isVisible()) === false && (await sgate.isVisible()) === false && (await panel.evaluate(() => !document.getElementById('view-main').inert && !document.getElementById('footer').inert)));
+    await openSettings('little'); await sleep(300);
+    check('settings: app-only Little windows rows come back live once the app is connected', (await sp.locator('[data-testid="little-default-browser"]').isVisible()) && (await sp.locator('[data-testid="little-hotkey-note"]').isVisible()));
+    await openSettings('app'); await sleep(300);
+    check('settings: App section rows come back once the app is connected', (await sp.locator('[data-testid="app-launch-login"]').isVisible()));
+    const gh2 = await sp.evaluate(() => { const g = document.querySelector('[data-testid="settings-profile-picker"]').closest('.group'); return { hidden: g.hidden, visible: g.offsetParent !== null }; });
+    check('settings: the Troubleshooting group (Chrome profile) is shown again once the app is connected', !gh2.hidden && gh2.visible, JSON.stringify(gh2));
+    await closeSettings();
+
+    // The app refuses the identify ("duplicate profile"): the extension forgets the profile and asks "Which profile is this?"
+    {
+      const real = host.byProfile.get('Default');
+      const now = Date.now();
+      host.byProfile.set('Default', { sock: { end() {}, write() {}, destroy() {} }, profileDir: 'Default', fake: true });   // another live claim on Default
+      host.replacements.set('Default', [now, now, now]);                                                                       // already 3 replacements within 60 s
+      const r = await cmd({ cmd: 'setProfileDir', dir: 'Default' });
+      const dd = await untilSt((x) => x?.helper?.currentProfileDir == null);
+      host.byProfile.set('Default', real); host.replacements.delete('Default');
+      check('duplicate profile: the identify reply is refused and the extension drops its profile choice', r?.ok === true && dd.helper?.currentProfileDir == null && dd.settings?.profileDir == null, JSON.stringify([dd.helper?.currentProfileDir, dd.settings?.profileDir]));
+      await sleep(600);
+      const ask = panel.locator('[data-testid="profile-identify"]');
+      check('duplicate profile: the sidebar shows "Which profile is this?"', (await ask.count()) === 1 && /Which profile is this/.test(await panel.locator('[data-testid="profile-switcher"]').innerText()));
+      check('duplicate profile: the extension did not retry by itself (still unidentified)', (await untilSt((x) => x?.helper?.currentProfileDir != null, 1500)).helper?.currentProfileDir == null);
+      await ask.selectOption('Default'); await sleep(900);
+      const d3 = await dbg();
+      check('duplicate profile: choosing a profile identifies again', d3.helper?.currentProfileDir === 'Default' && d3.settings?.profileDir === 'Default' && host.isConnected('Default'), JSON.stringify([d3.helper?.currentProfileDir, d3.settings?.profileDir]));
+    }
   }
 
   check('no page errors in panel', errors.length === 0, errors.slice(0, 3).join(' | '));
@@ -1069,7 +1410,8 @@ async function main() {
   await ctx.close();
   await host.close();
   server.kill();
+  dlSrv.close();
   console.log(`\n${pass} passed, ${fail} failed. Screenshots in ${OUT}`);
   process.exit(fail ? 1 : 0);
 }
-main().catch((e) => { console.error(e); server.kill(); process.exit(2); });
+main().catch((e) => { console.error(e); server.kill(); dlSrv.close(); process.exit(2); });

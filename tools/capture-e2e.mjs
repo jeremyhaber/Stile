@@ -4,12 +4,12 @@
 import { createRequire } from 'module';
 import fs from 'fs'; import path from 'path'; import os from 'os'; import http from 'http'; import crypto from 'crypto';
 const require = createRequire(import.meta.url);
-const { chromium } = require('/opt/npm-tools/node_modules/playwright');
+const { chromium } = require(process.env.PLAYWRIGHT_PATH || 'playwright');
 const aws4 = createRequire(path.join(path.dirname(new URL(import.meta.url).pathname), 'capture-build', 'package.json'))('aws4');
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const EXT = path.join(ROOT, 'extension');
-const SHOTS = process.env.SHOTS || '/tmp/claude-0/-home-claude/e0605526-dcdb-5d20-aaac-918c6d6e8268/scratchpad/overlay-shots';
+const SHOTS = process.env.SHOTS || path.join(os.tmpdir(), 'overlay-shots');
 fs.mkdirSync(SHOTS, { recursive: true });
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'capture-e2e-'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -135,7 +135,7 @@ const readClip = async () => {
   const cmds = await helper.evaluate(() => chrome.commands.getAll());
   const byName = Object.fromEntries(cmds.map((c) => [c.name, c]));
   check('manifest commands: capture-visible/full/region', !!byName['capture-visible'] && !!byName['capture-full'] && !!byName['capture-region']);
-  check('only capture-region has a suggested key', byName['capture-region'].shortcut === 'Alt+Shift+3' && !byName['capture-visible'].shortcut && !byName['capture-full'].shortcut, JSON.stringify(cmds.map((c) => [c.name, c.shortcut])));
+  check('only capture-region has a suggested key', ['Alt+Shift+3', '⌥⇧3'].includes(byName['capture-region'].shortcut) && !byName['capture-visible'].shortcut && !byName['capture-full'].shortcut, JSON.stringify(cmds.map((c) => [c.name, c.shortcut])));
   await sleep(300);
   const st = await send({ cmd: 'debugState' });
   check('page right-click menu "Screenshot ▸ Visible area / Full page / Region" registered', ['sbcap', 'sbcap-visible', 'sbcap-full', 'sbcap-region'].every((i) => (st.captureMenus || []).includes(i)), JSON.stringify(st.captureMenus));
@@ -160,7 +160,7 @@ let capVisible;
     await ed.waitForSelector('[data-testid=annotate-stage]');
     check('editor: status line shows size, mode and page title link', (await ed.textContent('[data-testid=capture-status]')).includes(`${VW} × ${VH} px`) && (await ed.textContent('[data-testid=capture-mode]')) === 'Visible area' && (await ed.textContent('[data-testid=capture-page-link]')) === 'Plain page');
     const tools = await ed.locator('[data-testid^=annotate-tool-]').count();
-    check('editor: 12 annotation tools from AnnotateToolbar', tools === 12, String(tools));
+    check('editor: 16 annotation tools from AnnotateToolbar', tools === 16, String(tools));
     check('editor: export actions + drag handle + zoom', await ed.locator('[data-testid=capture-copy]').count() === 1 && await ed.locator('[data-testid=capture-save]').count() === 1 && await ed.locator('[data-testid=capture-drag]').count() === 1 && await ed.locator('[data-testid=capture-fit]').count() === 1);
     check('editor: no Upload button until configured', await ed.locator('[data-testid=capture-upload]').count() === 0);
     check('editor: properties bar hidden with the Select tool', await ed.locator('[data-testid=capture-props]').count() === 0);
@@ -205,6 +205,34 @@ let capVisible;
   check('Escape with unsaved annotations asks "Discard changes?"', await ed.locator('[data-testid=capture-dialog]').count() === 1);
   await ed.locator('[data-testid=annotate-keep]').click();
   check('Keep editing closes the dialog and keeps the editor', await ed.locator('[data-testid=capture-dialog]').count() === 0 && !ed.isClosed());
+  // Shottr-style tools in real Chromium (the sampler reads the picture's pixels): probe + smart measure, magnifier, padding
+  {
+    const bb = await ed.locator('[data-testid=annotate-stage]').boundingBox();
+    const at = (fx, fy) => [bb.x + bb.width * fx, bb.y + bb.height * fy];
+    await ed.locator('[data-testid=annotate-tool-measure]').click();
+    await ed.mouse.move(...at(0.5, 0.6));
+    await ed.mouse.move(...at(0.5, 0.6).map((v) => v + 2));
+    await sleep(150);
+    const hex = await ed.textContent('[data-testid=capture-color] b');
+    check('tools: hovering reads the color under the pointer', /^#[0-9a-f]{6}$/.test(hex), hex);
+    check('tools: the measure probe shows the edges around the pointer', await ed.locator('[data-testid=annotate-measure-probe]').count() === 1);
+    const m0 = await ed.locator('[data-measure]').count();
+    await ed.mouse.click(...at(0.5, 0.6).map((v) => v + 2));
+    await sleep(100);
+    check('tools: a click keeps the smart measurement', await ed.locator('[data-measure]').count() > m0, `${m0} -> ${await ed.locator('[data-measure]').count()}`);
+    await ed.locator('[data-testid=annotate-tool-magnify]').click();
+    await ed.mouse.move(...at(0.15, 0.2)); await ed.mouse.down(); await ed.mouse.move(...at(0.2, 0.25), { steps: 4 }); await ed.mouse.up();
+    await sleep(100);
+    check('tools: dragging places a magnifier', await ed.locator('[data-magnify]').count() === 1);
+    const sizeBefore = await ed.textContent('[data-testid=capture-size]');
+    await ed.locator('[data-testid=annotate-tool-canvas]').click();
+    await ed.locator('[data-testid=annotate-pad-white]').click();
+    await sleep(150);
+    const sizeAfter = await ed.textContent('[data-testid=capture-size]');
+    check('tools: padding draws on the stage and grows the export size', await ed.locator('[data-testid=annotate-pad]').count() === 1 && sizeAfter !== sizeBefore, `${sizeBefore} -> ${sizeAfter}`);
+    await ed.screenshot({ path: path.join(SHOTS, 'capture-editor-tools.png') });
+    await ed.locator('[data-testid=annotate-canvas-reset]').click();
+  }
   // drag-out handle publishes the PNG as DownloadURL
   const du = await ed.evaluate(() => new Promise((res) => { const h = document.querySelector('[data-testid=capture-drag]'); h.addEventListener('dragstart', (e) => setTimeout(() => res(e.dataTransfer.getData('DownloadURL')), 0), { once: true }); h.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: new DataTransfer() })); }));
   check('drag-out: DownloadURL = image/png:<Screenshot name>:blob:', /^image\/png:Screenshot \d{4}-\d\d-\d\d at \d\d\.\d\d\.\d\d\.png:blob:/.test(du), du.slice(0, 90));
@@ -255,7 +283,112 @@ let capVisible;
   const ed = await waitEditor(cap.id);
   await ed.waitForSelector('[data-testid=capture-status]');
   check('tall page: the editor notes that it was capped', /first 20000 px/.test(await ed.locator('[data-testid=capture-status]').textContent()));
+  // annotation sizes follow the page width, not its 20 000 px height (a number badge was ~280 px across)
+  await ed.waitForSelector('[data-testid=annotate-stage]');
+  await ed.locator('[data-testid=annotate-tool-badge]').click(); await ed.locator('[data-testid=annotate-add]').click();
+  const r = await ed.evaluate(() => Number(document.querySelector('[data-testid=annotate-stage] svg circle')?.getAttribute('r')));
+  check('tall page: a number badge is sized by the page width (radius ≤ 2% of the width)', r > 0 && r <= cap.width * 0.02, `r=${r} width=${cap.width}`);
   await ed.close();
+}
+
+// ------------------------------------------------------------------ screenshot of any app: the Mac app sends the PNG in parts
+{
+  const n0 = (await list()).length;
+  await helper.evaluate(async () => {
+    const c = new OffscreenCanvas(600, 400); const g = c.getContext('2d');
+    g.fillStyle = '#123456'; g.fillRect(0, 0, 600, 400); g.fillStyle = '#ffffff'; g.fillRect(100, 100, 200, 100);
+    const buf = new Uint8Array(await (await c.convertToBlob({ type: 'image/png' })).arrayBuffer());
+    let bin = ''; for (const b of buf) bin += String.fromCharCode(b);
+    const b64 = btoa(bin), size = Math.ceil(b64.length / 3 / 4) * 4;
+    const parts = [b64.slice(0, size), b64.slice(size, 2 * size), b64.slice(2 * size)];
+    const { receiveNativeCapture } = await import('/capture/capture-sw.js');
+    // out of order, with a duplicate: still one capture
+    for (const i of [2, 0, 0, 1]) await receiveNativeCapture({ type: 'nativeCapture', id: 'n1', part: i, parts: 3, data: parts[i], mode: 'area', title: 'Finder', dpr: 2 });
+  });
+  const cap = await freshAfter(n0);
+  check('app capture: reassembled and stored (size, mode, app name, dpr)', cap && cap.mode === 'area' && cap.width === 600 && cap.height === 400 && cap.title === 'Finder' && cap.dpr === 2 && cap.url === '', JSON.stringify(cap && { ...cap, thumb: '…' }));
+  const px = await pixels(cap.id, [[10, 10], [150, 150]]);
+  check('app capture: pixels intact', near(px.pts[0], '#123456') && near(px.pts[1], '#ffffff'), JSON.stringify(px.pts));
+  const ed = await waitEditor(cap.id);
+  check('app capture: opens the editor', !!ed);
+  if (ed) {
+    await ed.waitForSelector('[data-testid=capture-status]');
+    check('app capture: status shows "Area" and the app name, no page link', (await ed.textContent('[data-testid=capture-mode]')) === 'Area' && (await ed.textContent('[data-testid=capture-app]')) === 'Finder' && await ed.locator('[data-testid=capture-page-link]').count() === 0);
+    // blur is a real blur: preview uses an SVG Gaussian filter, the export has no hard edge left inside the box
+    await ed.locator('[data-testid=annotate-tool-blur]').click(); await ed.locator('[data-testid=annotate-add]').click();
+    check('blur: preview is a Gaussian blur of the picture (no pattern)', await ed.locator('[data-testid=annotate-stage] feGaussianBlur').count() === 1 && await ed.locator('[data-testid=annotate-stage] pattern').count() === 0);
+    await ed.close();
+  }
+}
+
+// ------------------------------------------------------------------ v3.5c: every mode the Mac app can send has a label
+{
+  const labels = { screen: 'Screen', area: 'Area', window: 'Window', activeWindow: 'Active window', repeatArea: 'Repeated area', delayed: 'Delayed screen', file: 'Opened image', clipboard: 'Clipboard', scroll: 'Scrolling capture' };
+  const sendNative = (id, mode) => helper.evaluate(async ([id, mode]) => {
+    const c = new OffscreenCanvas(40, 30); const g = c.getContext('2d'); g.fillStyle = '#336699'; g.fillRect(0, 0, 40, 30);
+    const buf = new Uint8Array(await (await c.convertToBlob({ type: 'image/png' })).arrayBuffer());
+    let bin = ''; for (const b of buf) bin += String.fromCharCode(b);
+    const { receiveNativeCapture } = await import('/capture/capture-sw.js');
+    await receiveNativeCapture({ type: 'nativeCapture', id, part: 0, parts: 1, data: btoa(bin), mode, title: 'Mode test', dpr: 1, open: false });
+  }, [id, mode]);
+  const n0 = (await list()).length;
+  for (const m of Object.keys(labels)) await sendNative('mode-' + m, m);
+  await sendNative('mode-bogus', 'bogus');
+  await sleep(500);
+  const got = (await list()).filter((c) => c.id.startsWith('mode-'));
+  check('native modes: all nine are accepted and stored under their own name', Object.keys(labels).every((m) => got.some((c) => c.id === 'mode-' + m && c.mode === m)), got.map((c) => c.mode).join());
+  check('native modes: an unknown mode is still refused', !got.some((c) => c.id === 'mode-bogus') && (await list()).length === n0 + 9);
+  const same = await helper.evaluate(async () => { const a = (await import('/capture/common.js')).MODE_LABEL, b = (await import('/capture/capture-view.js')).MODE_LABEL; return JSON.stringify(a) === JSON.stringify(b) ? a : null; });
+  check('native modes: the recent-captures list and the common module share the same labels', !!same && Object.entries(labels).every(([m, l]) => same[m] === l), JSON.stringify(same));
+  await send({ cmd: 'captureOpen', id: 'mode-activeWindow' });
+  const ed = await waitEditor('mode-activeWindow');
+  if (ed) {
+    await ed.waitForSelector('[data-testid=capture-mode]');
+    check('native modes: the editor status line says "Active window"', (await ed.textContent('[data-testid=capture-mode]')) === 'Active window');
+    await ed.close();
+  } else check('native modes: editor opened for the active window capture', false);
+  await send({ cmd: 'captureOpen', id: 'mode-scroll' });
+  const ed2 = await waitEditor('mode-scroll');
+  if (ed2) {
+    await ed2.waitForSelector('[data-testid=capture-mode]');
+    check('native modes: the editor status line says "Scrolling capture"', (await ed2.textContent('[data-testid=capture-mode]')) === 'Scrolling capture');
+    await ed2.close();
+  } else check('native modes: editor opened for the scrolling capture', false);
+  for (const m of Object.keys(labels)) await send({ cmd: 'captureDelete', id: 'mode-' + m });
+}
+
+// ------------------------------------------------------------------ v3.5c: settings without the app, and the app-owned view (the app is simulated through session storage)
+{
+  const sp = await ctx.newPage(); await sp.setViewportSize({ width: 860, height: 700 });
+  await sp.goto(`chrome-extension://${extId}/settings.html#screenshots`);
+  await sp.waitForSelector('[data-testid=capture-settings]');
+  await sleep(300);
+  const box = sp.locator('[data-testid=capture-settings]');
+  check('v3.5c settings: with no app the extension keeps its own settings (data-source=extension)', (await box.getAttribute('data-source')) === 'extension');
+  check('v3.5c settings: no app-only rows and no Recording group without the app', !(await sp.locator('[data-testid=capture-folder]').isVisible()) && !(await sp.locator('[data-testid=capture-pattern]').isVisible()) && !(await sp.locator('[data-testid=capture-shadow]').isVisible()) && !(await sp.locator('[data-testid=recording-settings]').isVisible()) && await sp.locator('[data-testid=capture-after]').isVisible());
+  // pretend the app is connected and owns the settings
+  await helper.evaluate(() => chrome.storage.session.set({
+    helper: { status: 'connected', profiles: [], currentProfileDir: 'Default' },
+    appState: { accessibility: true, useChrome: true, microphones: [{ id: 'mic-a', name: 'Studio Mic' }], capture: {
+      screenshotFolder: '/Users/x/Pictures/Shots', recordingFolder: '/Users/x/Movies/Stile', recordingFolderFollowsScreenshots: false, filenamePattern: 'Pic {hh}', windowShadow: false, annotate: false, askWhere: true,
+      s3: { endpoint: 'https://s3.app.test', region: 'auto', regionAuto: false, bucket: 'appbucket', accessKeyId: 'APPAK', prefix: 'a/', style: 'auto', naming: 'random', linkType: 'presigned', publicBase: '', expiry: 3600, v: 2, secretSet: true },
+      recording: { micDeviceId: 'mic-a', systemAudio: true, countdown: false, fps: 60, codec: 'hevc', maxResolution: '1440p', showCursor: false } } },
+  }));
+  await sp.waitForFunction(() => document.querySelector('[data-testid=capture-settings]').dataset.source === 'app', null, { timeout: 6000 });
+  check('v3.5c settings: the page shows the app\'s values (folder, pattern, shadow off, annotate off, ask on)',
+    (await sp.locator('[data-testid=capture-folder]').innerText()) === '/Users/x/Pictures/Shots' && (await sp.locator('[data-testid=capture-pattern]').inputValue()) === 'Pic {hh}' && !(await sp.locator('[data-testid=capture-shadow]').isChecked()) && !(await sp.locator('[data-testid=capture-annotate]').isChecked()) && await sp.locator('[data-testid=capture-ask-where]').isChecked());
+  check('v3.5c settings: S3 fields come from the app; the secret field is empty and says it is in the Keychain',
+    (await sp.locator('[data-testid=capture-s3-bucket]').inputValue()) === 'appbucket' && (await sp.locator('[data-testid=capture-s3-key]').inputValue()) === 'APPAK' && (await sp.locator('[data-testid=capture-s3-secret]').inputValue()) === '' && /Keychain/.test(await sp.locator('[data-testid=capture-s3-secret]').getAttribute('placeholder')));
+  check('v3.5c settings: recording defaults come from the app (60 fps, HEVC, microphone listed and chosen, cursor off)',
+    await sp.locator('[data-testid=recording-fps]').inputValue() === '60' && await sp.locator('[data-testid=recording-codec]').inputValue() === 'hevc' && await sp.locator('[data-testid=recording-mic]').inputValue() === 'mic-a' && /Studio Mic/.test(await sp.locator('[data-testid=recording-mic]').innerText()) && !(await sp.locator('[data-testid=recording-cursor]').isChecked()) && !(await sp.locator('[data-testid=recording-countdown]').isChecked()));
+  check('v3.5c settings: the extension\'s own copy is untouched by the app\'s values', await helper.evaluate(async () => (await chrome.storage.local.get('captureS3')).captureS3?.bucket !== 'appbucket'));
+  await sp.locator('[data-testid=capture-pattern]').fill('x');
+  await sp.waitForSelector('[data-testid=toast]', { timeout: 4000 }).catch(() => {});
+  check('v3.5c settings: an edit while the app is not really there says so instead of silently saving', /Stile\.app/.test(await sp.locator('[data-testid=toast]').first().textContent().catch(() => '')));
+  await helper.evaluate(() => chrome.storage.session.remove(['helper', 'appState']));
+  await sp.waitForFunction(() => document.querySelector('[data-testid=capture-settings]').dataset.source === 'extension', null, { timeout: 6000 });
+  check('v3.5c settings: the app going away puts the extension\'s own settings back', await sp.locator('[data-testid=capture-after]').isVisible());
+  await sp.close();
 }
 
 // ------------------------------------------------------------------ region (drive the overlay with the mouse)
@@ -339,7 +472,7 @@ await panel.waitForSelector('[data-testid=address-field]');
   check('side panel: camera button sits in the footer next to Boost', await panel.locator('#footer [data-testid=capture-button]').count() === 1 && await panel.locator('#footer [data-testid=boost-button]').count() === 1 && await panel.locator('.addr-row [data-testid=capture-button]').count() === 0);
   await panel.locator('[data-testid=capture-button]').click();
   const items = await panel.locator('[data-testid=context-menu-item]').allTextContents();
-  check('camera menu: Visible area / Full page / Region / Recent captures', items.length === 4 && /Visible/.test(items[0]) && /Full/.test(items[1]) && /Region/.test(items[2]) && /Recent/.test(items[3]), JSON.stringify(items));
+  check('camera menu: Visible area / Full page / Region / Pick color / Recent captures', items.length === 5 && /Visible/.test(items[0]) && /Full/.test(items[1]) && /Region/.test(items[2]) && /Pick color/.test(items[3]) && /Recent/.test(items[4]), JSON.stringify(items));
   await sleep(300); await panel.screenshot({ path: path.join(SHOTS, 'capture-menu.png') });
   const n0 = (await list()).length;
   await setSync({ captureAfter: 'editor' });
@@ -364,6 +497,45 @@ await panel.waitForSelector('[data-testid=address-field]');
   check('recent captures: delete removes one', (await list()).length === del0 - 1);
   await panel.locator('[data-testid=captures-view] [data-testid=back-button]').click();
   check('recent captures: back returns to the main view', await panel.locator('[data-testid=view-main]').isVisible());
+  // v3.6: recordings made by the Mac app are listed beside recent captures (metadata + thumbnail; the app keeps the video)
+  {
+    const jpeg = await helper.evaluate(async () => {
+      const c = new OffscreenCanvas(48, 30); const g = c.getContext('2d'); g.fillStyle = '#c04040'; g.fillRect(0, 0, 48, 30);
+      const buf = new Uint8Array(await (await c.convertToBlob({ type: 'image/jpeg', quality: 0.7 })).arrayBuffer());
+      let bin = ''; for (const b of buf) bin += String.fromCharCode(b);
+      return btoa(bin);
+    });
+    const recv = (m) => helper.evaluate(async (m) => { const { receiveNativeRecording } = await import('/capture/capture-sw.js'); await receiveNativeRecording(m); }, m);
+    const stored = () => helper.evaluate(async () => (await chrome.storage.local.get('nativeRecordings')).nativeRecordings || []);
+    const t0 = Date.now();
+    await recv({ type: 'nativeRecording', id: 'r1', title: 'Recording — Slack — Oct 24', duration: 65.2, time: t0 - 5000, link: '', thumb: jpeg });
+    await recv({ type: 'nativeRecording', id: 'r2', title: 'Demo <b>bold</b>', duration: 3725, time: t0, link: 'https://cdn.example.com/r2.mp4', thumb: jpeg });
+    await recv({ type: 'nativeRecording', id: 'r1', title: 'Recording — Slack — Oct 24', duration: 65.2, time: t0 - 5000, link: 'https://cdn.example.com/r1.mp4' });   // link added later, no thumb: keeps the old one
+    await recv({ type: 'nativeRecording', id: 'bad id!', title: 'x' });
+    await recv({ type: 'nativeRecording', id: 'r3', title: 'js link', link: 'javascript:alert(1)', thumb: '<img onerror=1>' });
+    let rs = await stored();
+    check('native recordings: stored newest first, upserted by id (link added later keeps the thumbnail)', rs.length === 3 && rs[0].id === 'r3' && rs.find((r) => r.id === 'r1').link === 'https://cdn.example.com/r1.mp4' && rs.find((r) => r.id === 'r1').thumb === jpeg, JSON.stringify(rs.map((r) => [r.id, r.link, r.thumb.length])));
+    check('native recordings: an invalid id, a non-http link and a non-base64 thumbnail are refused', !rs.some((r) => r.id === 'bad id!') && rs.find((r) => r.id === 'r3').link === '' && rs.find((r) => r.id === 'r3').thumb === '', JSON.stringify(rs.find((r) => r.id === 'r3')));
+    await recv({ type: 'nativeRecording', id: 'r3', removed: true });
+    rs = await stored();
+    check('native recordings: removed:true deletes the entry', rs.length === 2 && !rs.some((r) => r.id === 'r3'));
+    for (let i = 0; i < 12; i++) await recv({ type: 'nativeRecording', id: 'bulk' + i, title: 'bulk ' + i, time: t0 - 100000 - i });
+    check('native recordings: only the 10 newest are kept', (await stored()).length === 10);
+    for (let i = 0; i < 12; i++) await recv({ type: 'nativeRecording', id: 'bulk' + i, removed: true });
+    await panel.locator('[data-testid=capture-button]').click();
+    await panel.locator('[data-action=capture-recent]').click();
+    await panel.waitForSelector('[data-testid=capture-recording-item]');
+    const items = panel.locator('[data-testid=capture-recording-item]');
+    check('recent view: recordings listed with thumbnail, title and duration (newest first)', await items.count() === 2 && await items.first().getAttribute('data-id') === 'r2'
+      && (await items.first().locator('img').evaluate((i) => i.complete && i.naturalWidth > 0)) && /1:02:05/.test(await items.first().textContent()) && /1:05/.test(await items.nth(1).textContent()), (await items.allTextContents()).join(' | '));
+    check('recent view: the title is text, not HTML', await items.first().locator('b').evaluate((b) => b.textContent === 'Demo <b>bold</b>' && !b.querySelector('b')));
+    check('recent view: a recording with a link opens it in a new tab and has a Copy link button', await items.first().locator('a.cap-open').getAttribute('href') === 'https://cdn.example.com/r2.mp4' && await items.first().locator('a.cap-open').getAttribute('target') === '_blank' && await items.first().locator('[data-testid=capture-recording-copy]').count() === 1);
+    check('recent view: screenshots still listed under their own heading', await panel.locator('[data-testid=capture-recent-item]').count() >= 1 && (await panel.locator('.cap-sub').allTextContents()).join() === 'Recordings,Screenshots');
+    await panel.screenshot({ path: path.join(SHOTS, 'capture-recent-recordings.png') });
+    await recv({ type: 'nativeRecording', id: 'r1', removed: true }); await recv({ type: 'nativeRecording', id: 'r2', removed: true });
+    await panel.locator('[data-testid=captures-view] [data-testid=back-button]').click();
+    check('recent view: back to the main view', await panel.locator('[data-testid=view-main]').isVisible());
+  }
   // the unsupported-page toast shows in the panel
   const w3 = await sw.evaluate(async () => (await chrome.windows.create({ url: 'chrome://version', focused: false })).id);
   await sleep(500);
@@ -573,8 +745,10 @@ await panel.waitForSelector('[data-testid=address-field]');
   await ed.locator('[data-testid=capture-copy]').click(); await ed.waitForSelector('[data-testid=capture-toast]');
   const clip = await readClip();
   check('annotation off: Copy still works', clip.size > 1000, JSON.stringify(clip));
-  await ed.close();
   await setSync({ captureAnnotate: true });
+  await ed.waitForSelector('[data-testid^=annotate-tool-]', { timeout: 3000 }).catch(() => {});
+  check('live settings: turning annotation on reaches the open editor', await ed.locator('[data-testid^=annotate-tool-]').count() > 0);
+  await ed.close();
 }
 
 // ------------------------------------------------------------------ store: keeps the last 30
@@ -589,6 +763,31 @@ await panel.waitForSelector('[data-testid=address-field]');
   check('store: only the last 30 captures are kept (older removed)', r.n === 30 && r.first === 'bulk33' && !r.hasOld, JSON.stringify(r));
   await send({ cmd: 'captureClear' });
   check('store: Clear all empties Recent', (await list()).length === 0);
+}
+
+// ------------------------------------------------------------------ Stile.app connected: the editor opens in an app window
+{
+  await page.goto(`${SITE}/plain`); await page.bringToFront();
+  const n0 = (await list()).length;
+  await send({ cmd: 'captureStart', mode: 'visible', windowId: mainWin });
+  const id = (await freshAfter(n0)).id;
+  await closeEditors();
+  const r = await helper.evaluate(async (id) => {
+    const sw = await import('/capture/capture-sw.js');
+    const posted = [], asked = [];
+    const fake = (ok) => ({ connected: () => true, post: (m) => posted.push(m), request: async (m) => { asked.push(m); return { type: 'openCaptureEditor', id: m.id, ok, requestId: 'x' }; } });
+    sw.setCaptureApp(fake(true));
+    const a = await sw.openEditor(id);
+    sw.setCaptureApp(fake(false));
+    const b = await sw.openEditor(id);
+    sw.setCaptureApp(null);
+    const last = asked[0];
+    return { a, b, nAsked: asked.length, nPosted: posted.length, part: last.part, parts: last.parts, hasData: last.data.length > 100, meta: last.meta, cfg: last.config };
+  }, id);
+  check('app editor: with the app connected the capture goes to it (one message, answered ok) and no popup opens', r.a.ok && r.a.app === true && r.nPosted === 0 && r.part === 0 && r.parts === 1 && r.hasData, JSON.stringify({ ...r, meta: undefined, cfg: undefined }));
+  check('app editor: the message carries the meta (no thumbnail) and the profile’s settings', r.meta.id === id && !('thumb' in r.meta) && typeof r.cfg.annotate === 'boolean' && 's3' in r.cfg, JSON.stringify(r.cfg));
+  check('app editor: when the app refuses, the Chrome popup opens instead', r.b.ok && !r.b.app && !!(await waitEditor(id)), JSON.stringify(r.b));
+  await closeEditors();
 }
 
 // ------------------------------------------------------------------ editor in dark mode + screenshots

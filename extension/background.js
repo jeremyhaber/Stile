@@ -1,12 +1,12 @@
-// Sidebar service worker. All listeners are registered synchronously at top level.
+// Stile service worker. All listeners are registered synchronously at top level.
 // Nothing here relies on in-memory state surviving a restart (the only module-level
 // state is the live native port and its pending-request table, which die with the worker).
 import { registerBoostListeners, handleBoostCommand } from './boosts-sw.js';
-import { registerCaptureListeners, handleCaptureCommand, createCaptureMenus, captureMenuIds } from './capture/capture-sw.js';
+import { registerCaptureListeners, handleCaptureCommand, createCaptureMenus, captureMenuIds, receiveNativeCapture, receiveNativeCaptureLink, receiveNativeRecording, startCapture, setCaptureApp, pushCaptureConfig } from './capture/capture-sw.js';
 import { registerBridgeListeners, handleBridgeMessage, emitBridgeEvent } from './bridge-sw.js';
 import { getRoots, isBlankUrl, DEFAULT_ARCHIVE_MINUTES, GROUP_COLORS, hashStr } from './shared.js';
 
-const HOST = 'com.sidebar.helper';
+const HOST = 'com.stile.helper';
 const ARCHIVE_CAP = 1000;
 // Feature detection: split view arrived in newer Chrome builds; tab groups need the tabGroups permission.
 const SPLIT_OK = typeof chrome.tabs.createSplit === 'function';
@@ -151,7 +151,7 @@ async function updateBadge(status) {
   if (status === 'connected') {
     await chrome.storage.local.set({ appEverConnected: true });
     await chrome.action.setBadgeText({ text: '' });
-    await chrome.action.setTitle({ title: 'Sidebar' });
+    await chrome.action.setTitle({ title: 'Stile' });
     await syncMenu(true);
     return;
   }
@@ -159,7 +159,7 @@ async function updateBadge(status) {
   if (await sget('local', 'appEverConnected', false)) {
     await chrome.action.setBadgeText({ text: '!' });
     await chrome.action.setBadgeBackgroundColor({ color: '#f59e0b' });
-    await chrome.action.setTitle({ title: "Sidebar.app isn't running \u2014 click for details" });
+    await chrome.action.setTitle({ title: "Stile.app isn't running \u2014 click for details" });
   }
 }
 
@@ -307,7 +307,8 @@ async function sweep() {
   } catch { return { archived: 0, closed: 0 }; }
   const archiveGrouped = await sget('sync', 'archiveGrouped', false);
   const little = await littleIds();
-  const normal = new Set(wins.filter((w) => w.type === 'normal' && !w.incognito && !little.has(w.id)).map((w) => w.id));
+  const pres = await presentationId();   // v3.3: tabs in the presentation window are never archived
+  const normal = new Set(wins.filter((w) => w.type === 'normal' && !w.incognito && !little.has(w.id) && w.id !== pres).map((w) => w.id));
   const bindings = await getBindings();
   const locks = await getLocks();
   const stored = await getLast();
@@ -372,10 +373,11 @@ async function resolveProfileDir(profiles) {
 
 // The app refused our identify because other connections keep claiming the same profile dir: forget it and let the
 // user pick ("Which profile is this?"). No automatic retry.
-async function onDuplicateProfile(p, dir) {
+// `queued`: the caller already runs inside the command queue (enqueue from inside the queue would wait for itself forever).
+async function onDuplicateProfile(p, dir, queued = false) {
   console.warn(`profile '${dir}' is claimed by another connection (duplicate profile); asking which profile this is`);
   try { await chrome.storage.local.remove('profileDir'); } catch { /* ignore */ }
-  if (port === p) await enqueue(() => setHelper({ currentProfileDir: null }));
+  if (port === p) await (queued ? setHelper({ currentProfileDir: null }) : enqueue(() => setHelper({ currentProfileDir: null })));
 }
 
 async function handshake(p) {
@@ -390,6 +392,7 @@ async function handshake(p) {
     if (r.settings && typeof r.settings.defaultBrowser === 'boolean') await chrome.storage.local.set({ defaultBrowser: r.settings.defaultBrowser });
     const dir = await resolveProfileDir(profiles);
     await enqueue(() => setHelper({ status: 'connected', error: undefined, profiles, currentProfileDir: dir }));
+    pushCaptureConfig().catch(() => {});   // the app's screenshot editor uses this profile's settings
     if (dir) {
       try {
         const ir = await nreq({ type: 'identify', profileDir: dir });
@@ -434,12 +437,19 @@ function onHelperMessage(m) {
   }
   if (m.type === 'bridge' || m.type === 'overlayStatus') handleBridgeMessage(m).catch(() => {});
   else if (m.type === 'activate') activateWindow(m.bounds).catch(() => {});
-  else if (m.type === 'openSettings') commands.openSettings({}).catch(() => {});   // menu bar "Settings…"
+  else if (m.type === 'openSettings') commands.openSettingsPage({}).catch(() => {});   // the app asks for the in-Chrome page itself: don't loop back to the app
+  else if (m.type === 'recordTabRequest') recordActiveTab().catch(() => {});   // menu bar "Record Chrome Tab"
+  else if (m.type === 'recordingTab') setRecordingTab(m.tabId == null ? null : Number(m.tabId)).catch(() => {});   // the app says which tab it records
+  else if (m.type === 'nativeCapture') receiveNativeCapture(m).catch((e) => console.warn('native capture', e));   // screenshot of any app (menu bar / hotkeys)
+  else if (m.type === 'nativeCaptureLink') receiveNativeCaptureLink(m).catch(() => {});
+  else if (m.type === 'nativeRecording') receiveNativeRecording(m);   // a recording made by the app (metadata + thumbnail for the recent list)
+  else if (m.type === 'capture' && ['visible', 'full', 'region'].includes(m.mode)) startCapture(m.mode, null).catch(() => {});   // menu bar "Chrome page"
   else if (m.type === 'profiles' && Array.isArray(m.profiles)) {
     enqueue(() => setHelper({ profiles: m.profiles })).catch(() => {});
   }
   else if (m.type === 'overlayEnabled' && !m.requestId) storeOverlayEnabled(m.enabled).catch(() => {});
   else if (m.type === 'appState' && m.state && typeof m.state === 'object') chrome.storage.session.set({ appState: m.state }).catch(() => {});
+  else if (m.type === 'clearArchiveOverride') chrome.storage.sync.remove('archiveMinutes').catch(() => {});   // "Apply to all profiles" from another profile's settings
   else if (m.type === 'defaultBrowser' && typeof m.enabled === 'boolean') chrome.storage.local.set({ defaultBrowser: m.enabled }).catch(() => {});
   else if (m.type === 'settings' && m.settings && typeof m.settings.archiveDefaultMinutes === 'number') {
     chrome.storage.local.set({ globalDefaultMinutes: m.settings.archiveDefaultMinutes }).catch(() => {});
@@ -472,6 +482,7 @@ async function activateWindow(bounds) {
 function helperConnected() {
   return !!port;
 }
+setCaptureApp({ connected: () => !!port, post: (m) => { try { port && port.postMessage(m); } catch { /* disconnected */ } }, request: nreq });
 
 // ---------------------------------------------------------------- v1.2: main window, snapshots, merging
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -479,11 +490,17 @@ const closingWindows = new Set();   // windows whose tabs are being removed beca
 const mergingWindows = new Set();   // windows we are emptying on purpose (no merge-back when they close)
 let snapTimer = null;
 
+// v3.3: presentation mode. session.presentation = { windowId, startedAt }; that window is never main / pop-out / merge candidate and its tabs are never archived.
+const getPresentation = () => sget('session', 'presentation', null);
+async function presentationId() { const p = await getPresentation(); return p ? p.windowId : null; }
+const setPresentation = (p) => (p ? chrome.storage.session.set({ presentation: p }) : chrome.storage.session.remove('presentation'));
+
 async function liveNormalIds() {
   try {
     const ws = await chrome.windows.getAll({ windowTypes: ['normal'] });
     const little = await littleIds();   // v2.8: regular-style little windows are normal windows, but never main / pop-out / merge candidates
-    return ws.filter((w) => w.type === 'normal' && !w.incognito && !little.has(w.id)).map((w) => w.id).sort((a, b) => a - b);
+    const pres = await presentationId();
+    return ws.filter((w) => w.type === 'normal' && !w.incognito && !little.has(w.id) && w.id !== pres).map((w) => w.id).sort((a, b) => a - b);
   } catch { return null; }
 }
 
@@ -1103,9 +1120,9 @@ async function restoreBoundTabs(final) {
 }
 
 // ---------------------------------------------------------------- commands
-const unqueued = new Set(['openSettings', 'appSetting', 'appState', 'isLittleTab', 'switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle', 'setOverlayEnabled', 'setDefaultBrowser', 'setGreenButtonAction']);
+const unqueued = new Set(['recordTab', 'openSettings', 'appSetting', 'appState', 'isLittleTab', 'switchProfile', 'setGlobalArchive', 'retryHelper', 'setProfileStyle', 'setOverlayEnabled', 'setDefaultBrowser', 'setGreenButtonAction', 'clearArchiveOverrides']);
 
-const APP_SETTINGS = new Set(['setPinned', 'setLockstep', 'setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'reviewPermissions', 'setShowMenuBarIcon', 'setOverlayEnabled', 'setDefaultBrowser']);
+const APP_SETTINGS = new Set(['setPinned', 'setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'reviewPermissions', 'setShowMenuBarIcon', 'setOverlayEnabled', 'setDefaultBrowser', 'setGreenButtonAction', 'setCaptureSettings', 'chooseCaptureFolder', 'setUseChrome']);
 
 const commands = {
   async ensureRoots() {
@@ -1358,6 +1375,17 @@ const commands = {
     } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
   },
 
+  // "Apply to all profiles": the app tells every connected profile (this one included) to drop its own archive time.
+  async clearArchiveOverrides() {
+    if (!helperConnected()) return { ok: false, error: 'helper unavailable' };
+    try {
+      const r = await nreq({ type: 'clearArchiveOverrides' });
+      if (!r || r.ok === false) return { ok: false, error: (r && r.error) || 'helper refused' };
+      await chrome.storage.sync.remove('archiveMinutes');   // don't wait for the app's broadcast to reach us
+      return { ok: true, count: r.count };
+    } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+  },
+
   async setProfileDir({ dir }) {
     if (dir) await chrome.storage.local.set({ profileDir: dir });
     else await chrome.storage.local.remove('profileDir');
@@ -1365,7 +1393,7 @@ const commands = {
     if (dir && helperConnected()) {
       try {
         const ir = await nreq({ type: 'identify', profileDir: dir });
-        if (ir && ir.error === 'duplicate profile') await onDuplicateProfile(port, dir);
+        if (ir && ir.error === 'duplicate profile') await onDuplicateProfile(port, dir, true);
       } catch { /* ignore */ }
     }
     return { ok: true };
@@ -1618,7 +1646,7 @@ const commands = {
     return { ok: false, error: 'helper unavailable' };
   },
 
-  // ---- v1.2: tab names (Arc-style rename). Empty name resets.
+  // ---- v1.2: tab names (rename in place). Empty name resets.
   async renameTab({ tabId, name }) {
     let tab;
     try { tab = await chrome.tabs.get(tabId); } catch { return { ok: false, error: 'No such tab' }; }
@@ -1686,7 +1714,7 @@ const commands = {
   // URL is reopened in the main window (scroll position carried over).
   async promoteLittle({ entryId, windowId, tabId }) {
     const temp = await getTemp();
-    // Sidebar.app only knows Chrome window ids (pill / ⌘O), and the page's own ⌘O handler only its tab id, so accept any of them.
+    // Stile.app only knows Chrome window ids (pill / ⌘O), and the page's own ⌘O handler only its tab id, so accept any of them.
     const e = temp.find((x) => (entryId != null && x.id === entryId) || (entryId == null && windowId != null && x.windowId === windowId) || (entryId == null && windowId == null && tabId != null && x.tabId === tabId));
     if (e) entryId = e.id;
     if (!e) return { ok: false, error: 'No such temporary link' };
@@ -1781,9 +1809,29 @@ const commands = {
     return { ok: true, entryId: temp[0].id };
   },
 
+  // ---- v3.6: Record Chrome Tab (sidebar tab menu "Record this tab"; the app does the recording)
+  async recordTab({ tabId } = {}) {
+    if (!port) return { ok: false, error: 'Stile isn’t connected' };
+    let tab;
+    try { tab = await chrome.tabs.get(tabId); } catch { return { ok: false, error: 'That tab is gone' }; }
+    sendApp({ type: 'recordTab', windowId: tab.windowId, tabId: tab.id, title: tab.title || tab.url || '' });
+    return { ok: true };
+  },
+
   // ---- v3.0: the settings window and the app-only settings it relays
   // One settings window per profile: reuse and focus it when it is open (optionally jumping to a section: "profiles" or "profiles:<dir>").
+  // Stile.app's own window is the settings UI when the app runs; the in-Chrome popup is the fallback (no app, old app, timeout).
   async openSettings({ section } = {}) {
+    if (helperConnected()) {
+      try {
+        const r = await nreq({ type: 'showSettings', section }, 1500);
+        if (r && r.ok === true) return { ok: true, app: true };
+      } catch { /* fall through to the Chrome page */ }
+    }
+    return commands.openSettingsPage({ section });
+  },
+
+  async openSettingsPage({ section } = {}) {
     const base = chrome.runtime.getURL('settings.html');
     const url = base + (section ? '#' + section : '');
     let tabs = [];
@@ -1795,7 +1843,8 @@ const commands = {
       try { await chrome.tabs.update(t.id, { active: true }); } catch { /* ignore */ }
       return { ok: true, windowId: t.windowId, reused: true };
     }
-    const o = { url, type: 'popup', width: 860, height: 640, focused: true };
+    // state 'normal': opened from a full-screen window, Chrome would otherwise make it full screen too.
+    const o = { url, type: 'popup', state: 'normal', width: 860, height: 640, focused: true };
     try {
       const lf = await chrome.windows.getLastFocused();
       if (lf && Number.isFinite(lf.left) && Number.isFinite(lf.width) && lf.state === 'normal') {
@@ -1804,15 +1853,18 @@ const commands = {
       }
     } catch { /* ignore */ }
     const w = await chrome.windows.create(o);
+    if (w.state === 'fullscreen') {
+      try { await chrome.windows.update(w.id, { state: 'normal' }); } catch { /* ignore */ }
+    }
     return { ok: true, windowId: w.id, reused: false };
   },
 
-  // Relay an app-only setting to Sidebar.app over the native connection. The app applies it and pushes a new `appState`.
+  // Relay an app-only setting to Stile.app over the native connection. The app applies it and pushes a new `appState`.
   async appSetting({ name, value }) {
     if (!APP_SETTINGS.has(name)) return { ok: false, error: 'Unknown setting' };
     if (name === 'setOverlayEnabled') return await commands.setOverlayEnabled({ enabled: !!value });
     if (name === 'setDefaultBrowser') return await commands.setDefaultBrowser({ enabled: !!value });
-    if (!port) return { ok: false, error: 'Sidebar.app isn’t running' };
+    if (!port) return { ok: false, error: 'Stile.app isn’t running' };
     try { port.postMessage({ type: 'appSetting', name, value }); } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
     return { ok: true };
   },
@@ -1832,7 +1884,7 @@ const commands = {
   },
 
   async setDefaultBrowser({ enabled }) {
-    if (!helperConnected()) return { ok: false, error: 'Sidebar.app isn’t running' };
+    if (!helperConnected()) return { ok: false, error: 'Stile.app isn’t running' };
     try {
       const r = await nreq({ type: 'setDefaultBrowser', enabled: !!enabled }, 20000);
       if (r && typeof r.enabled === 'boolean') await chrome.storage.local.set({ defaultBrowser: r.enabled });
@@ -1864,6 +1916,8 @@ const commands = {
   },
 
   async mergeWindow({ windowId }) {
+    // v3.3: the Mac app's close-button interception asks for mergeWindow; for the presentation window that means "stop presenting"
+    if (windowId != null && windowId === (await presentationId())) return await commands.stopPresenting();
     const { main } = await resolveMain();
     if (main == null) return { ok: false, error: 'No main window' };
     if (windowId === main) return { ok: false, error: 'That is already the main window' };
@@ -1871,6 +1925,110 @@ const commands = {
     if (!live || !live.includes(windowId)) return { ok: false, error: 'No such window' };
     const count = await mergeIntoMain(windowId, main);
     if (count) await setLastMerge({ count, fromClose: false });
+    return { ok: true, count };
+  },
+
+  // ---- v3.3: presentation mode
+  async startPresenting({ tabId } = {}) {
+    const cur = await getPresentation();
+    if (cur && await windowOrNull(cur.windowId)) {
+      try { await chrome.windows.update(cur.windowId, { focused: true }); } catch { /* ignore */ }
+      if (tabId != null) return await commands.addToPresentation({ tabId });
+      return { ok: true, windowId: cur.windowId, already: true };
+    }
+    let incog = false;
+    if (tabId != null) { try { incog = !!(await chrome.tabs.get(tabId)).incognito; } catch { return { ok: false, error: 'No such tab' }; } }
+    if (incog) return { ok: false, error: 'Incognito tabs can’t be presented' };
+    if (tabId != null) {   // the tab's old window closes when it was the last tab: that is not a pop-out close
+      const t = await chrome.tabs.get(tabId);
+      if ((await chrome.tabs.query({ windowId: t.windowId })).length === 1) { mergingWindows.add(t.windowId); setTimeout(() => mergingWindows.delete(t.windowId), 8000); }
+    }
+    const win = await chrome.windows.create(tabId != null ? { tabId, focused: true } : { focused: true });
+    await setPresentation({ windowId: win.id, startedAt: Date.now() });
+    const order = await sget('session', 'windowOrder', []);
+    if (order.includes(win.id)) await chrome.storage.session.set({ windowOrder: order.filter((id) => id !== win.id) });
+    await dropWindowSnapshot(win.id);   // not a pop-out whose tabs would be re-opened elsewhere
+    scheduleSnapshot();
+    return { ok: true, windowId: win.id };
+  },
+
+  async addToPresentation({ tabId, groupId, splitViewId }) {
+    let cur = await getPresentation();
+    if (!cur || !(await windowOrNull(cur.windowId))) {
+      const r = await commands.startPresenting({});
+      if (!r.ok) return r;
+      cur = await getPresentation();
+    }
+    const pw = cur.windowId;
+    const before = (await chrome.tabs.query({ windowId: pw })).map((t) => t.id);
+    if (groupId != null) {
+      if (!chrome.tabGroups) return { ok: false, error: 'tab groups unavailable' };
+      const g = await chrome.tabGroups.get(groupId);
+      if (g.windowId === pw) return { ok: true, windowId: pw };
+      if (await windowIsIncognito(g.windowId)) return { ok: false, error: 'Incognito tabs can’t be presented' };
+      await chrome.tabGroups.move(groupId, { windowId: pw, index: -1 });
+    } else {
+      let ids = [];
+      if (splitViewId != null && splitViewId >= 0) {
+        ids = (await chrome.tabs.query({})).filter((t) => splitId(t) === splitViewId).sort((a, b) => a.index - b.index).map((t) => t.id);
+      } else if (tabId != null) {
+        const tab = await chrome.tabs.get(tabId);
+        ids = [tabId];
+        if (splitId(tab) >= 0) {
+          const sib = (await chrome.tabs.query({ windowId: tab.windowId })).filter((t) => splitId(t) === splitId(tab)).sort((a, b) => a.index - b.index);
+          if (sib.length) ids = sib.map((t) => t.id);
+        }
+      }
+      if (!ids.length) return { ok: false, error: 'nothing to add' };
+      const moving = [];
+      for (const id of ids) { const t = await chrome.tabs.get(id); if (t.windowId !== pw) { if (t.incognito) return { ok: false, error: 'Incognito tabs can’t be presented' }; moving.push(id); } }
+      if (!moving.length) return { ok: true, windowId: pw };
+      // Moving a window's last tab closes that window (nothing to merge back on close).
+      const srcWins = new Set((await Promise.all(moving.map((id) => chrome.tabs.get(id)))).map((t) => t.windowId));
+      for (const w of srcWins) {
+        const all = await chrome.tabs.query({ windowId: w });
+        if (all.every((t) => moving.includes(t.id))) { mergingWindows.add(w); setTimeout(() => mergingWindows.delete(w), 8000); }
+      }
+      await chrome.tabs.move(moving, { windowId: pw, index: -1 });
+    }
+    // the blank page the presentation started with is no longer needed
+    const now = await chrome.tabs.query({ windowId: pw });
+    const blanks = now.filter((t) => before.includes(t.id) && isBlankUrl(t.url || t.pendingUrl));
+    if (blanks.length && now.length > blanks.length) await removeTabs(blanks.map((t) => t.id));
+    scheduleSnapshot();
+    return { ok: true, windowId: pw };
+  },
+
+  async removeFromPresentation({ tabId }) {
+    const cur = await getPresentation();
+    const { main } = await resolveMain();
+    if (!cur) return { ok: false, error: 'Not presenting' };
+    if (main == null) return { ok: false, error: 'No main window' };
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.windowId !== cur.windowId) return { ok: false, error: 'That tab isn’t in the presentation' };
+    return await commands.bringTab({ tabId, windowId: main });
+  },
+
+  async stopPresenting() {
+    const cur = await getPresentation();
+    if (!cur) return { ok: false, error: 'Not presenting' };
+    const pw = cur.windowId;
+    const { main } = await resolveMain();
+    let count = 0;
+    if (await windowOrNull(pw) && main != null) {
+      const tabs = await chrome.tabs.query({ windowId: pw });
+      const blanks = tabs.filter((t) => isBlankUrl(t.url || t.pendingUrl));
+      if (blanks.length && blanks.length < tabs.length) { await removeTabs(blanks.map((t) => t.id)); }
+      count = await mergeIntoMain(pw, main);
+      if (count) await setLastMerge({ count, fromClose: false });
+    }
+    await setPresentation(null);
+    if (await windowOrNull(pw)) {   // nowhere to merge into: it simply becomes a normal window
+      const order = await sget('session', 'windowOrder', []);
+      if (!order.includes(pw)) await chrome.storage.session.set({ windowOrder: [...order, pw] });
+      await resolveMain();
+    }
+    scheduleSnapshot();
     return { ok: true, count };
   },
 
@@ -1913,6 +2071,7 @@ const commands = {
       splitSupported: SPLIT_OK,
       temporary: await getTemp(),
       littleWindows: await getLittleMap(),
+      presentation: await getPresentation(),
       boundTabs: await sget('local', 'boundTabs', []),
       tabNames: await getTabNames(),
       lockedTabs: await getLocks(),
@@ -2079,7 +2238,7 @@ if (chrome.tabGroups) {
 chrome.windows.onCreated.addListener((win) => {
   if (!win || win.type !== 'normal' || win.incognito) return;
   enqueue(async () => {
-    if ((await littleIds()).has(win.id)) return;
+    if ((await littleIds()).has(win.id) || win.id === (await presentationId())) return;
     const order = await sget('session', 'windowOrder', []);
     if (!order.includes(win.id)) await chrome.storage.session.set({ windowOrder: [...order, win.id] });
     await resolveMain();
@@ -2090,6 +2249,7 @@ chrome.windows.onCreated.addListener((win) => {
 chrome.windows.onRemoved.addListener((windowId) => {
   enqueue(async () => {
     if ((await littleIds()).has(windowId)) { closingWindows.delete(windowId); return onLittleClosed(windowId); }
+    if (windowId === (await presentationId())) await setPresentation(null);   // closed by hand: the role ends with the window
     return onWindowClosed(windowId);
   }).catch((e) => console.warn('[sidebar] window close failed', e));
   enqueue(async () => {
@@ -2111,10 +2271,58 @@ chrome.bookmarks.onRemoved.addListener((id, info) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'archive-sweep') enqueue(sweep).catch(() => {});
-  // Reconnect to the Mac app if it was restarted (the connector won't relaunch it after "Quit Sidebar").
+  // Reconnect to the Mac app if it was restarted (the connector won't relaunch it after "Quit Stile").
   if (alarm.name === 'helper-retry' && !port) connectHelper();
 });
 chrome.alarms.get('helper-retry').then((a) => { if (!a) chrome.alarms.create('helper-retry', { periodInMinutes: 1 }); }).catch(() => {});
+
+// ---------------------------------------------------------------- v3.6: Record Chrome Tab
+// The app records the page area of one tab's window. It tells us which tab ({type:'recordingTab', tabId|null}); we keep
+// {tabId, windowId} in session storage (the sidebar shows a red dot on it) and report back when that tab stops / starts
+// being the active tab of its window (the app auto-pauses), is closed (the app stops) or moves to another window (retarget).
+function sendApp(m) { if (port) { try { port.postMessage(m); } catch { /* disconnected */ } } }
+
+async function setRecordingTab(tabId) {
+  if (tabId == null || !Number.isFinite(tabId)) { await chrome.storage.session.remove('recordingTab'); return; }
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch { /* gone */ }
+  if (!tab) { sendApp({ type: 'recordTabClosed', tabId }); return; }
+  await chrome.storage.session.set({ recordingTab: { tabId, windowId: tab.windowId } });
+  // the state at the moment the recording starts (the user may have switched tabs while the bar was up)
+  if (!tab.active) sendApp({ type: 'recordTabState', tabId, active: false });
+}
+
+// Menu bar "Record Chrome Tab": the active tab of the last focused Chrome window.
+async function recordActiveTab() {
+  let win = null;
+  try { win = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }); } catch { /* none */ }
+  if (win && (await littleIds()).has(win.id)) win = await pickNormalWindow();
+  if (!win || win.type !== 'normal') return;
+  const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
+  if (tab) sendApp({ type: 'recordTab', windowId: tab.windowId, tabId: tab.id, title: tab.title || tab.url || '' });
+}
+
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  sget('session', 'recordingTab', null).then((r) => {
+    if (r && r.windowId === windowId) sendApp({ type: 'recordTabState', tabId: r.tabId, active: tabId === r.tabId });
+  }).catch(() => {});
+});
+chrome.tabs.onRemoved.addListener((tabId) => {
+  sget('session', 'recordingTab', null).then((r) => {
+    if (!r || r.tabId !== tabId) return;
+    chrome.storage.session.remove('recordingTab').catch(() => {});
+    sendApp({ type: 'recordTabClosed', tabId });
+  }).catch(() => {});
+});
+chrome.tabs.onAttached.addListener((tabId, info) => {
+  sget('session', 'recordingTab', null).then(async (r) => {
+    if (!r || r.tabId !== tabId) return;
+    await chrome.storage.session.set({ recordingTab: { tabId, windowId: info.newWindowId } });
+    sendApp({ type: 'recordTabMoved', tabId, windowId: info.newWindowId });
+    const [a] = await chrome.tabs.query({ active: true, windowId: info.newWindowId });
+    sendApp({ type: 'recordTabState', tabId, active: !!a && a.id === tabId });
+  }).catch(() => {});
+});
 
 // Runs a side-panel command (also used by the overlay bridge's sidebar.cmd). Resolves to the response object.
 function dispatchCommand(msg, sender) {

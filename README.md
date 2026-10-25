@@ -1,6 +1,60 @@
 # Stile
 
-An Arc-style side panel for Chrome on Mac: favourites, pinned folders, today's tabs, auto-archive, and profile switching.
+A vertical side panel for Chrome on Mac: favourites, pinned folders, today's tabs, auto-archive, and profile switching.
+
+## What it does
+
+**Favourites and pinned folders**
+Drag a tab from Today onto the favourites area, or into a pinned folder, to keep it.
+
+![Dragging tabs into favourites and a pinned folder](docs/demos/favourites.gif)
+
+**Archive**
+Tabs you haven't used for a while (12 hours by default) move to the Archive. Search it and click to bring one back.
+
+![Searching the archive and restoring a tab](docs/demos/archive.gif)
+
+**Tab groups**
+Groups are coloured, collapsible sections. Drag a tab onto a group to add it.
+
+![Collapsing a tab group and dragging a tab into it](docs/demos/groups.gif)
+
+**Little windows**
+Links from other apps open in a small window and wait in the Temporary list. Make one a full tab to keep it.
+
+![A link in a little window, made a full tab from the Temporary list](docs/demos/little.gif)
+
+**Tidy and Clear**
+Tidy groups tabs by website, Clear archives the whole list. Both have Undo.
+
+![Tidy, Clear and Undo](docs/demos/tidy.gif)
+
+**Boosts: Zap**
+Click elements on a page to hide them, for that site only.
+
+![Hiding page elements with Zap](docs/demos/zap.gif)
+
+**Boosts: custom CSS**
+Add your own CSS to a site and it applies straight away.
+
+![Restyling a site with custom CSS](docs/demos/boost-css.gif)
+
+**Downloads**
+Hover Archive to see recent downloads and the progress of the ones in flight.
+
+![The downloads popover](docs/demos/downloads.gif)
+
+**Screenshots**
+Capture a page, then mark it up with boxes, arrows and text.
+
+![Annotating a screenshot](docs/demos/capture.gif)
+
+**Screen recording**
+Record a tab, a window or an area of the screen, then trim it and save, copy or upload.
+
+![Recording a tab and trimming the clip](docs/demos/recording.gif)
+
+(Regenerate these with `node tools/demos/build.mjs`; see Development.)
 
 ## 1. Install the extension (in each Chrome profile)
 
@@ -19,7 +73,7 @@ Stile.app draws the sidebar over Chrome's vertical tabs and also handles profile
 
 To do it by hand instead, in each profile: right-click Chrome's tab bar → **Show tabs vertically**. If you turned on "Expand on hover" for the tabs, turn it off.
 
-Without Stile.app the extension still works as a normal Chrome side panel, minus profile switching and the shared archive default.
+The extension needs Stile.app. Until the app is installed and running, the side panel and the settings window show a "Stile.app required" screen with a download link (or, if the app was set up before, Open Stile.app and Retry). They switch back on by themselves once the app connects.
 
 ## 3. Optional: allow custom JavaScript in Boosts
 
@@ -45,7 +99,6 @@ Zap and custom CSS work straight away. To run your own JavaScript on a site, ope
 
 ## Known limits
 
-- Without Stile.app, Chrome's own tab strip stays visible (an extension alone can't hide it).
 - Profile switching is two windows trading places, so there's a brief flicker.
 - Typed searches open in Chrome's last-focused window.
 - Boosts can't run on Chrome's own pages or the Chrome Web Store.
@@ -57,4 +110,5 @@ Zap and custom CSS work straight away. To run your own JavaScript on a site, ope
 - `node tools/boost-e2e.mjs` — Boost (Zap/Code) tests.
 - `node tools/fake-app/test-host.mjs` — host protocol tests against the Node reference of Stile.app's host.
 - `node tools/overlay-e2e.mjs` — the sidebar UI in overlay mode, driven like Stile.app does.
+- `node tools/demos/build.mjs [scene ...]` — rebuilds the README demo GIFs in `docs/demos/` (headless Chromium, fake data only, needs ffmpeg); see `tools/demos/README.md`.
 - `SPEC*.md` — design notes and the extension ⇄ app protocol.

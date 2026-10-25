@@ -1,5 +1,5 @@
 'use strict';
-// Reference implementation of the Sidebar app's `HostServer` (SPEC-v2.1-overlay.md, "Merge the helper
+// Reference implementation of the Stile app's `HostServer` (SPEC-v2.1-overlay.md, "Merge the helper
 // into the Mac app"). It speaks exactly the protocol the old Perl helper spoke, but over ONE Unix
 // socket (`<appDir>/host.sock`) shared by every Chrome profile: each accepted connection is one
 // profile's extension (Chrome starts the connector once per profile; the connector is a byte pipe).
@@ -18,6 +18,7 @@ const net = require('net');
 const os = require('os');
 const path = require('path');
 const { EventEmitter } = require('events');
+const { CaptureSettings } = require('./capture-settings');
 const { spawn } = require('child_process');
 
 const HOST_VERSION = '2.1.0';
@@ -29,7 +30,7 @@ const MAX_FRAME = 64 * 1024 * 1024;
 const HANDOFF_SECONDS = 60;
 const DEFAULT_ARCHIVE_MINUTES = 720;
 // v3.0: app-only settings the extension relays from the settings window ({type:"appSetting", name, value}).
-const APP_SETTINGS = new Set(['setPinned', 'setLockstep', 'setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'reviewPermissions', 'setShowMenuBarIcon', 'setGreenButtonAction']);
+const APP_SETTINGS = new Set(['setPinned','setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'reviewPermissions', 'setShowMenuBarIcon', 'setGreenButtonAction', 'setCaptureSettings', 'chooseCaptureFolder', 'setUseChrome']);
 const ICONS = new Set('picture initial home briefcase code star heart book music camera palette rocket leaf coffee game globe bolt moon'.split(' '));
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -113,7 +114,7 @@ class HostServer extends EventEmitter {
   constructor(o = {}) {
     super();
     const home = os.homedir();
-    this.appDir = o.appDir || process.env.SIDEBAR_APP_DIR || path.join(home, 'Library/Application Support/Sidebar');
+    this.appDir = o.appDir || process.env.SIDEBAR_APP_DIR || path.join(home, 'Library/Application Support/Stile');
     this.localState = o.localState || process.env.SIDEBAR_LOCAL_STATE || path.join(home, 'Library/Application Support/Google/Chrome/Local State');
     this.chromeBin = o.chromeBin || process.env.SIDEBAR_CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
     this.legacyStateFile = o.legacyStateFile || null;
@@ -132,6 +133,13 @@ class HostServer extends EventEmitter {
     this.server = null;
     /** the app's latest host state (what the sidebar page receives as `hostState`), pushed to every extension as {type:"appState", state} */
     this.appState = null;
+    /** v3.5c: the app-owned capture settings (state.json `capture`, the secret in a Keychain stand-in) and the mode */
+    this.capture = new CaptureSettings(this);
+    this.useChrome = o.useChrome !== false;
+    this.microphones = [];
+    /** v3.7: does the app have its own settings window? (`showSettings` replies ok only then) and the requests it got: [{ profileDir, section }] */
+    this.settingsWindow = o.settingsWindow === true;
+    this.showSettingsCalls = [];
   }
 
   // ---- lifecycle
@@ -157,6 +165,19 @@ class HostServer extends EventEmitter {
 
   /** Write a `bridge` envelope to a profile's extension. Returns false if that profile isn't connected. */
   sendBridge(profileDir, msg) { return this.sendToProfile(profileDir, msg); }
+
+  /**
+   * v3.6: the app lists its recent recordings in the extension: metadata and a small JPEG thumbnail only (the video stays on
+   * the Mac). Mirrors `RecentRecordings.send` in Swift: the message is dropped when it would exceed Chrome's 1 MB limit.
+   * `rec` = { id, title, duration (s), time (ms), link, thumb (base64 JPEG) } or { id, removed: true }.
+   */
+  sendNativeRecording(profileDir, rec) {
+    const m = rec.removed
+      ? { type: 'nativeRecording', id: rec.id, removed: true }
+      : { type: 'nativeRecording', id: rec.id, title: rec.title || '', duration: rec.duration || 0, time: rec.time || Date.now(), link: rec.link || '', ...(rec.thumb ? { thumb: rec.thumb } : {}) };
+    if (Buffer.byteLength(JSON.stringify(m)) > 1024 * 1024 - 64) return false;
+    return this.sendToProfile(profileDir, m);
+  }
 
   sendToProfile(profileDir, msg) {
     const c = this.byProfile.get(profileDir);
@@ -214,7 +235,10 @@ class HostServer extends EventEmitter {
     const handlers = {
       hello: this.doHello, identify: this.doIdentify, getProfiles: this.doGetProfiles,
       setProfileStyle: this.doSetStyle, switchProfile: this.doSwitch, setGlobalSettings: this.doSetSettings, setOverlayEnabled: this.doSetOverlayEnabled, setDefaultBrowser: this.doSetDefaultBrowser,
-      appSetting: this.doAppSetting, getAppState: this.doGetAppState,
+      showSettings: this.doShowSettings, clearArchiveOverrides: this.doClearArchiveOverrides,
+      appSetting: this.doAppSetting, getAppState: this.doGetAppState, getCaptureSettings: this.doGetCaptureSettings,
+      captureConfig: this.doCaptureConfig, openCaptureEditor: this.doOpenCaptureEditor,
+      recordTab: this.doRecordMessage, recordTabState: this.doRecordMessage, recordTabClosed: this.doRecordMessage, recordTabMoved: this.doRecordMessage,
     };
     const h = Object.hasOwn(handlers, m.type) ? handlers[m.type] : null;
     if (!h) { this.log(`unknown message type '${m.type}'`); return this.reply(conn, m, { type: 'error', error: `unknown message type '${m.type}'` }); }
@@ -229,13 +253,24 @@ class HostServer extends EventEmitter {
   }
 
   /**
-   * v3.0: the app reports its host state (pinned, lockstep, launchAtLogin, accessibility, ...). Remembered, pushed to every identified
+   * v3.0: the app reports its host state (pinned, launchAtLogin, accessibility, ...). Remembered, pushed to every identified
    * extension now, and replayed to each extension that identifies later.
    */
   setAppState(state) {
     this.appState = isObject(state) ? { ...state } : null;
     if (!this.appState) return;
-    for (const c of this.conns) if (c.profileDir) this.send(c, { type: 'appState', state: this.appState });
+    for (const c of this.conns) if (c.profileDir) this.send(c, { type: 'appState', state: this.appStateOut() });
+  }
+
+  /** v3.5c: the app state as the extension receives it: the reported state plus the mode and the capture settings (no secret) */
+  appStateOut() {
+    return this.appState ? { ...this.appState, useChrome: this.useChrome, capture: this.capture.publicDict(), microphones: this.microphones } : null;
+  }
+
+  /** capture settings or the mode changed: tell every identified extension (once the app has reported a state) and listeners */
+  captureChanged() {
+    if (this.appState) for (const c of this.conns) if (c.profileDir) this.send(c, { type: 'appState', state: this.appStateOut() });
+    this.emit('captureSettings', this.capture.publicDict());
   }
 
   // ---- state.json
@@ -368,7 +403,7 @@ class HostServer extends EventEmitter {
       else this.log(`ignoring stale pending handoff for '${dir}'`);
     }
     if (this.overlay) this.send(conn, { type: 'overlayStatus', connected: true });
-    if (this.appState) this.send(conn, { type: 'appState', state: this.appState });
+    if (this.appState) this.send(conn, { type: 'appState', state: this.appStateOut() });
     this.emit('identify', { profileDir: dir });
   }
 
@@ -436,6 +471,23 @@ class HostServer extends EventEmitter {
     this.emit('defaultBrowser', { enabled: m.enabled });
   }
 
+  // v3.7: the extension asks the app to show ITS settings window, scoped to the sending profile. Only the app really has one;
+  // here the reply says ok only when `settingsWindow` is on, so by default the extension falls back to its Chrome page.
+  doShowSettings(conn, m) {
+    const call = { profileDir: conn.profileDir, section: typeof m.section === 'string' ? m.section : null };
+    this.showSettingsCalls.push(call);
+    this.emit('showSettings', call);
+    this.reply(conn, m, this.settingsWindow ? { type: 'showSettings', ok: true } : { type: 'showSettings', ok: false, error: 'no settings window' });
+  }
+
+  // v3.7: "Apply to all profiles": every identified extension (the sender included) drops its own archive time.
+  doClearArchiveOverrides(conn, m) {
+    let count = 0;
+    for (const c of this.conns) if (c.profileDir) { this.send(c, { type: 'clearArchiveOverride' }); count++; }
+    this.emit('clearArchiveOverrides', { profileDir: conn.profileDir, count });
+    this.reply(conn, m, { type: 'clearArchiveOverrides', ok: true, count });
+  }
+
   // v3.0: Settings window -> app. Unknown names are refused; the app applies the setting and then calls setAppState with the result.
   doAppSetting(conn, m) {
     if (typeof m.name !== 'string' || !APP_SETTINGS.has(m.name)) {
@@ -444,11 +496,58 @@ class HostServer extends EventEmitter {
       return;
     }
     this.emit('appSetting', { profileDir: conn.profileDir, name: m.name, value: m.value });
+    // v3.5c: the capture settings and the mode are owned by the app itself (the Swift OverlayManager does the same)
+    if (m.name === 'setCaptureSettings') this.capture.apply(m.value);
+    else if (m.name === 'setUseChrome') { this.useChrome = m.value === true; this.captureChanged(); }
     if ('requestId' in m) this.reply(conn, m, { type: 'appSetting', name: m.name, ok: true });
   }
 
+  // v3.6: Record Chrome Tab messages from the extension (recordTab {windowId, tabId, title}, recordTabState {tabId, active},
+  // recordTabClosed {tabId}, recordTabMoved {tabId, windowId}); no reply. The Swift app starts / pauses / stops the recording.
+  doRecordMessage(conn, m) {
+    this.emit('record', { profileDir: conn.profileDir, type: m.type, msg: m });
+  }
+
+  /** Menu bar "Record Chrome Tab": asks a profile's extension for its active tab ({type:'recordTabRequest'}). */
+  requestRecordTab(profileDir) { return this.sendToProfile(profileDir, { type: 'recordTabRequest' }); }
+
+  /** The app tells the extension which tab it records (null = none any more). */
+  setRecordingTab(profileDir, tabId) { return this.sendToProfile(profileDir, { type: 'recordingTab', tabId: tabId ?? null }); }
+
+  // v3.4: the profile's screenshot settings for the app's editor window (kept per connection, in memory only: it holds S3 keys)
+  doCaptureConfig(conn, m) {
+    if (!isObject(m.config)) return;
+    conn.captureConfig = m.config;
+    this.capture.adoptIfEmpty(m.config);
+    this.emit('captureConfig', { profileDir: conn.profileDir, config: m.config });
+  }
+
+  // v3.4: a Chrome capture for the app's editor window, base64 in parts ({id, part, parts, data, meta, config}). The last
+  // part carries a requestId; the reply {type:'openCaptureEditor', id, ok} tells the extension not to open its popup.
+  doOpenCaptureEditor(conn, m) {
+    const fail = (error) => this.reply(conn, m, { type: 'openCaptureEditor', id: m.id, ok: false, error });
+    const parts = Number.isInteger(m.parts) ? m.parts : 0, part = Number.isInteger(m.part) ? m.part : -1;
+    if (typeof m.id !== 'string' || !m.id || typeof m.data !== 'string' || parts < 1 || parts > 64 || part < 0 || part >= parts) return fail('invalid part');
+    conn.captureParts ??= new Map();
+    let e = conn.captureParts.get(m.id);
+    if (!e) { e = { parts: new Array(parts).fill(null), got: 0 }; conn.captureParts.set(m.id, e); }
+    if (e.parts[part] === null) { e.parts[part] = m.data; e.got++; }
+    if (part !== parts - 1) return;
+    conn.captureParts.delete(m.id);
+    if (e.got < parts || !isObject(m.meta)) return fail('missing parts');
+    const png = Buffer.from(e.parts.join(''), 'base64');
+    if (isObject(m.config)) { conn.captureConfig = m.config; this.capture.adoptIfEmpty(m.config); }
+    this.emit('openCaptureEditor', { profileDir: conn.profileDir, id: m.id, meta: m.meta, png, config: this.capture.editorConfig(conn.captureConfig && conn.captureConfig.sidebarColor) });
+    this.reply(conn, m, { type: 'openCaptureEditor', id: m.id, ok: true });
+  }
+
   doGetAppState(conn, m) {
-    this.reply(conn, m, { type: 'appState', state: this.appState });
+    this.reply(conn, m, { type: 'appState', state: this.appStateOut() });
+  }
+
+  // v3.5c: the capture settings; `full: true` adds the S3 secret (the connection test and uploads from the extension)
+  doGetCaptureSettings(conn, m) {
+    this.reply(conn, m, { type: 'captureSettings', settings: this.capture.publicDict(m.full === true) });
   }
 
   doSetStyle(conn, m) {
@@ -478,9 +577,9 @@ class HostServer extends EventEmitter {
 /** Write the Chrome native messaging host manifest (what the Mac app does on every launch). */
 function writeHostManifest(nmhDir, executable) {
   fs.mkdirSync(nmhDir, { recursive: true });
-  const file = path.join(nmhDir, 'com.sidebar.helper.json');
+  const file = path.join(nmhDir, 'com.stile.helper.json');
   fs.writeFileSync(file, JSON.stringify({
-    name: 'com.sidebar.helper', description: 'Sidebar', path: executable, type: 'stdio', allowed_origins: [EXTENSION_ORIGIN],
+    name: 'com.stile.helper', description: 'Stile', path: executable, type: 'stdio', allowed_origins: [EXTENSION_ORIGIN],
   }, null, 2));
   return file;
 }
@@ -490,5 +589,5 @@ module.exports = { APP_SETTINGS, HostServer, writeHostManifest, colorHex, readCh
 // `node host-server.js` runs a standalone host using the SIDEBAR_* environment variables.
 if (require.main === module) {
   const host = new HostServer({ log: (m) => console.error(m) });
-  host.listen().then((p) => console.error(`Sidebar reference host on ${p}`));
+  host.listen().then((p) => console.error(`Stile reference host on ${p}`));
 }

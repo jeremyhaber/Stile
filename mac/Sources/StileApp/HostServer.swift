@@ -19,12 +19,12 @@ enum BridgeError: Error, LocalizedError {
 /// The socket carries native-messaging frames (4-byte native-endian length + JSON) in both directions.
 /// All state is touched on the main queue only: the dispatch sources run on `.main` and async entry
 /// points hop to it explicitly.
-final class ProfileBridge {
+final class ProfileBridge: @unchecked Sendable {
     let id = UUID()
     fileprivate let fd: Int32
     private weak var server: HostServer?
     private var source: DispatchSourceRead?
-    private let writeQueue = DispatchQueue(label: "ca.simplistics.sidebar.bridge.write")
+    private let writeQueue = DispatchQueue(label: "ca.simplistics.stile.bridge.write")
     private var inbox = Data()
     private var pending: [String: CheckedContinuation<Any, Error>] = [:]
     private var subscribers: [UUID: ([String: Any]) -> Void] = [:]
@@ -35,6 +35,11 @@ final class ProfileBridge {
     private(set) var closed = false
 
     var identified: Bool { !profileDir.isEmpty }
+    /// v3.4: this profile's screenshot settings (annotate, askWhere, s3, sidebarColor), pushed by the extension.
+    /// Memory only: it holds the S3 keys.
+    var captureConfig: [String: Any] = [:]
+    /// v3.4: `openCaptureEditor` parts being received, per capture id.
+    fileprivate var captureParts: [String: (parts: [String?], got: Int)] = [:]
 
     fileprivate init(fd: Int32, server: HostServer) {
         self.fd = fd
@@ -226,11 +231,20 @@ final class HostServer {
     /// v3.0: `appSetting` (app-wide settings relayed by the extension) and `getAppState`. Set by the OverlayManager
     /// at creation; the closure must hop to the main actor itself. Arguments: message type, message, origin.
     var onAppMessage: ((String, [String: Any], ProfileBridge) -> Void)?
+    /// v3.4: a Chrome capture to show in the app's editor window (id, PNG, meta, theme, origin); true once it is open.
+    /// Called on the main thread.
+    var onOpenCaptureEditor: ((String, Data, [String: Any], String?, ProfileBridge) -> Bool)?
+    /// the extension's screenshot settings changed: open editor windows apply them right away
+    var onCaptureConfig: (([String: Any], ProfileBridge) -> Void)?
+    /// v3.6: Record Chrome Tab messages from the extension (`recordTab`, `recordTabState`, `recordTabClosed`, `recordTabMoved`).
+    /// The closure must hop to the main actor itself.
+    var onRecordMessage: ((String, [String: Any], ProfileBridge) -> Void)?
 
     /// Names accepted in `appSetting {name, value}` (also accepted as top-level message types).
     static let appSettingNames: Set<String> = [
-        "setLockstep", "setLaunchAtLogin", "requestScreenCapture", "openAccessibilitySettings", "rescanRail",
+        "setLaunchAtLogin", "requestScreenCapture", "openAccessibilitySettings", "rescanRail",
         "quitApp", "setOverlayEnabled", "setDefaultBrowser", "reviewPermissions", "setPinned", "setShowMenuBarIcon",
+        "setGreenButtonAction", "setCaptureSettings", "chooseCaptureFolder", "setUseChrome",
     ]
 
     func start() {
@@ -387,8 +401,28 @@ final class HostServer {
             doAppSetting(m, c)
         case "getAppState":
             onAppMessage?("getAppState", m, c)
+        case "getCaptureSettings":
+            onAppMessage?("getCaptureSettings", m, c)
+        case "captureConfig":
+            if let cfg = m["config"] as? [String: Any] {
+                c.captureConfig = cfg
+                onCaptureConfig?(cfg, c)
+            }
+        case "openCaptureEditor":
+            doOpenCaptureEditor(m, c)
+        case "showSettings":
+            // the extension asks for its settings: always the app window, scoped to the asking profile
+            let section = m["section"] as? String
+            runOnMain { [weak c] in AppSettingsWindow.shared.show(section: section, bridge: c) }
+            c.reply(m, ["type": "showSettings", "ok": true])
+        case "clearArchiveOverrides":
+            let all = identified
+            for b in all { b.sendToExt(["type": "clearArchiveOverride"]) }
+            c.reply(m, ["type": "clearArchiveOverrides", "ok": true, "count": all.count])
+        case "recordTab", "recordTabState", "recordTabClosed", "recordTabMoved":
+            onRecordMessage?(type, m, c)
         case _ where Self.appSettingNames.contains(type):
-            // Top-level form of an app setting: {type: "setLockstep", value|enabled: ...}.
+            // Top-level form of an app setting: {type: "setLaunchAtLogin", value|enabled: ...}.
             var wrapped: [String: Any] = ["type": "appSetting", "name": type]
             if let rid = m["requestId"] { wrapped["requestId"] = rid }
             if let v = m["value"] ?? m["enabled"] { wrapped["value"] = v }
@@ -396,6 +430,35 @@ final class HostServer {
         default:
             Log.write("host: unknown message type '\(type)'")
             c.reply(m, ["type": "error", "error": "unknown message type '\(type)'"])
+        }
+    }
+
+    /// v3.4: base64 parts {id, part, parts, data, meta, config, theme}; the last one has a requestId and is answered
+    /// {type: "openCaptureEditor", id, ok} (not ok: the extension opens its own popup instead).
+    private func doOpenCaptureEditor(_ m: [String: Any], _ c: ProfileBridge) {
+        let id = m["id"] as? String ?? ""
+        func fail(_ error: String) {
+            Log.write("capture: openCaptureEditor refused (\(error))")
+            c.reply(m, ["type": "openCaptureEditor", "id": id, "ok": false, "error": error])
+        }
+        let parts = (m["parts"] as? NSNumber)?.intValue ?? 0
+        let part = (m["part"] as? NSNumber)?.intValue ?? -1
+        guard !id.isEmpty, let data = m["data"] as? String, parts >= 1, parts <= 64, part >= 0, part < parts else {
+            return fail("invalid part")
+        }
+        var e = c.captureParts[id] ?? (parts: Array(repeating: nil, count: parts), got: 0)
+        if e.parts.count == parts, e.parts[part] == nil { e.parts[part] = data; e.got += 1 }
+        c.captureParts[id] = e
+        guard part == parts - 1 else { return }
+        c.captureParts[id] = nil
+        guard e.got == parts, let meta = m["meta"] as? [String: Any],
+              let png = Data(base64Encoded: e.parts.compactMap { $0 }.joined()) else { return fail("missing parts") }
+        if let cfg = m["config"] as? [String: Any] { c.captureConfig = cfg }
+        let ok = onOpenCaptureEditor?(id, png, meta, m["theme"] as? String, c) ?? false
+        if ok {
+            c.reply(m, ["type": "openCaptureEditor", "id": id, "ok": true])
+        } else {
+            fail("no editor")
         }
     }
 

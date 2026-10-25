@@ -4,7 +4,12 @@ import { act, renderHook } from '@testing-library/react'
 import type { KeyboardEvent } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import { useAnnotator } from '../../../extension/capture/src/annotate/useAnnotator'
-import type { BoxShape, TextShape } from '../../../extension/capture/src/annotate/model'
+import {
+  SELECTION_GAP,
+  selectionPad,
+  type BoxShape,
+  type TextShape,
+} from '../../../extension/capture/src/annotate/model'
 
 const IMG = { w: 1000, h: 600 }
 const setup = (scale = 1) => renderHook(() => useAnnotator({ img: IMG, scale })).result
@@ -42,6 +47,8 @@ const drag = (
 }
 const shapes = (r: Api) => r.current.doc.shapes
 const box = (r: Api, i = 0) => shapes(r)[i] as BoxShape
+/** how far the selection handles sit outside the box (clear of its stroke), at scale 1 */
+const pad = (r: Api) => selectionPad(box(r), SELECTION_GAP)
 
 describe('drawing with the pointer', () => {
   it('drags out a rectangle, selects it and returns to the Select tool', () => {
@@ -84,6 +91,44 @@ describe('drawing with the pointer', () => {
     }
     expect(shapes(r).map((s) => s.kind === 'badge' && s.n)).toEqual([1, 2, 3])
     expect(r.current.tool).toBe('badge')
+  })
+
+  it('count badges: reset, override, undo restores the counter, no shortcuts while typing', () => {
+    const r = setup()
+    const nums = () => shapes(r).map((s) => s.kind === 'badge' && s.n)
+    const place = (x: number) => {
+      act(() => r.current.pointer.down({ x, y: 100 }, 'mouse'))
+      act(() => r.current.pointer.up({ x, y: 100 }))
+    }
+    act(() => r.current.setTool('badge'))
+    place(100)
+    place(200)
+    expect(r.current.nextBadge).toBe(3)
+    act(() => r.current.resetBadgeCounter())
+    expect(r.current.nextBadge).toBe(1)
+    place(300)
+    expect(nums()).toEqual([1, 2, 1])
+    expect(r.current.nextBadge).toBe(2)
+    act(() => r.current.undo())
+    expect(r.current.nextBadge).toBe(1)
+    act(() => r.current.undo())
+    expect(r.current.nextBadge).toBe(3)
+    // override the selected badge: the count continues from it, typing coalesces into one undo step
+    act(() => r.current.select(shapes(r)[0]!.id))
+    act(() => r.current.setBadgeNumber(1))
+    act(() => r.current.setBadgeNumber(12))
+    expect(nums()).toEqual([12, 2])
+    expect(r.current.nextBadge).toBe(13)
+    act(() => r.current.setBadgeNumber(5000))
+    expect(nums()[0]).toBe(999)
+    act(() => r.current.undo())
+    expect(nums()).toEqual([1, 2])
+    expect(r.current.nextBadge).toBe(3)
+    // keys typed in a field are not shortcuts
+    act(() => r.current.select(shapes(r)[0]!.id))
+    const input = document.createElement('input')
+    expect(press(r, 'Delete', { target: input } as never)).toBe(false)
+    expect(shapes(r)).toHaveLength(2)
   })
 
   it('cancelling a drag (pointercancel) leaves no shape behind', () => {
@@ -154,10 +199,11 @@ describe('touch and pen (a finger is not a mouse)', () => {
   it('a handle is grabbed from 22 screen px away by a finger, not by a mouse', () => {
     const r = setup()
     act(() => r.current.setTool('rect'))
-    drag(r, [100, 100], [300, 200]) // se handle at (300, 200)
-    drag(r, [318, 200], [360, 230], 'touch')
+    drag(r, [100, 100], [300, 200]) // se handle at (300 + p, 200 + p)
+    const p = pad(r)
+    drag(r, [318 + p, 200 + p], [360 + p, 230 + p], 'touch')
     expect(box(r)).toMatchObject({ w: 260, h: 130 })
-    drag(r, [378, 230], [400, 260], 'mouse') // 18px off: the mouse misses (and moves nothing: empty space)
+    drag(r, [378 + p, 230 + p], [400, 260], 'mouse') // 18px off: the mouse misses (and moves nothing: empty space)
     expect(box(r)).toMatchObject({ w: 260, h: 130 })
   })
 
@@ -195,10 +241,11 @@ describe('select, move, resize', () => {
 
   it('a handle drag resizes; the tolerance grows on touch', () => {
     const r = withRect()
-    drag(r, [300, 200], [400, 260]) // the se handle of the selected rectangle
+    const p = pad(r)
+    drag(r, [300 + p, 200 + p], [400 + p, 260 + p]) // the se handle, just outside the selected rectangle
     expect(box(r)).toMatchObject({ x: 100, y: 100, w: 300, h: 160 })
-    // 15 image px away from the nw corner: a touch grabs the handle, a mouse would not
-    drag(r, [112, 112], [90, 90], 'touch')
+    // 15 image px away from the nw handle: a touch grabs it, a mouse would not
+    drag(r, [112 - p, 112 - p], [90 - p, 90 - p], 'touch')
     expect(box(r)).toMatchObject({ x: 90, y: 90 })
   })
 
@@ -444,13 +491,23 @@ describe('crop', () => {
     expect(r.current.doc.crop).toBeNull()
   })
 
-  it('shows the cropped area once the crop tool is closed', () => {
+  it('Enter with a crop in place applies it and returns to the Select tool', () => {
+    const r = setup()
+    act(() => r.current.setTool('crop'))
+    press(r, 'Enter')
+    expect(r.current.tool).toBe('crop')
+    press(r, 'Enter')
+    expect(r.current.tool).toBe('select')
+    expect(r.current.doc.crop).toEqual({ x: 100, y: 60, w: 800, h: 480 })
+  })
+
+  it('dragging out a crop applies it: back to Select, showing the cropped area', () => {
     const r = setup()
     act(() => r.current.setTool('crop'))
     expect(r.current.view).toEqual({ x: 0, y: 0, w: 1000, h: 600 })
     drag(r, [200, 100], [600, 400])
     expect(r.current.doc.crop).toEqual({ x: 200, y: 100, w: 400, h: 300 })
-    act(() => r.current.setTool('select'))
+    expect(r.current.tool).toBe('select')
     expect(r.current.view).toEqual({ x: 200, y: 100, w: 400, h: 300 })
   })
 

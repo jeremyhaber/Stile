@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Build Stile.app (release), bundle the web UI and the extension folder, sign, zip to mac/dist/Stile.zip.
 # Set UNIVERSAL=1 for an arm64+x86_64 binary. Set VERSION=x.y.z to override the version string.
-# Signing: SIGN_IDENTITY="<name>" picks a code-signing certificate; unset, the first valid one in the keychain is used,
-# else ad-hoc. A certificate keeps the app's identity stable across rebuilds, so macOS keeps its Accessibility grant.
+# Signing: SIGN_IDENTITY="<name>" picks a code-signing certificate; unset, "Stile Developer" (the release certificate,
+# self-signed, need not be trusted) is used if it is in the keychain, else the first valid one, else ad-hoc. Releases must
+# always be signed with the same certificate: macOS ties the Accessibility and Screen Recording grants to it, so a stable
+# certificate keeps them across updates and a different one makes every user grant them again.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXT="$(cd "$HERE/../extension" && pwd)"
 DIST="$HERE/dist"
 APP="$DIST/Stile.app"
-VERSION="${VERSION:-3.3.0}"
+VERSION="${VERSION:-1.0.0}"
 BUILD="${GITHUB_RUN_NUMBER:-1}"
 
 # Files that must exist in extension/ (the web UI copied to Contents/Resources/web is every top-level
@@ -54,6 +56,9 @@ cp -R "$EXT" "$APP/Contents/Resources/extension"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 IDENTITY="${SIGN_IDENTITY:-}"
+if [ -z "$IDENTITY" ] && security find-identity -p codesigning 2>/dev/null | grep -q '"Stile Developer"'; then
+  IDENTITY="Stile Developer"
+fi
 if [ -z "$IDENTITY" ]; then
   IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/^ *[0-9]+\)/ { print $2; exit }')"
 fi

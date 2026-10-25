@@ -4,6 +4,7 @@ export const SIDEBAR_TITLE = 'Sidebar';
 export const FAV_TITLE = 'Favourites';
 export const PINNED_TITLE = 'Pinned';
 export const DEFAULT_ARCHIVE_MINUTES = 720;
+export const STILE_APP_URL = 'https://example.com/stile';   // TODO placeholder: replace with the real Stile.app download page
 // Choices for the archive selects (minutes). 0 = never.
 export const ARCHIVE_CHOICES = [60, 360, 720, 1440, 4320, 10080, 43200, 0];
 

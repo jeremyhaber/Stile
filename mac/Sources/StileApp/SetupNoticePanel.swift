@@ -168,6 +168,8 @@ final class SetupNoticePanel: NSPanel {
         switch obj["action"] as? String {
         case "openExtensions":
             if let dir = obj["value"] as? String, !dir.isEmpty { HostActions.openExtensionsPage(profileDir: dir) }
+        case "openStore":
+            if let dir = obj["value"] as? String, !dir.isEmpty { HostActions.openStorePage(profileDir: dir) }
         case "revealExtension":
             HostActions.revealExtensionFolder()
         default:

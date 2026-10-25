@@ -80,7 +80,7 @@ enum LittleLinks {
     static func openChromeApp() {
         if let app = NSRunningApplication.runningApplications(withBundleIdentifier: chromeBundleID)
             .first(where: { !$0.isTerminated }) {
-            app.activate(options: [.activateIgnoringOtherApps])
+            app.activate()
         } else if let chrome = chromeURL() {
             NSWorkspace.shared.openApplication(at: chrome, configuration: NSWorkspace.OpenConfiguration()) { _, error in
                 if let e = error { Log.write("little: launching Chrome failed: \(e.localizedDescription)") }
@@ -211,7 +211,7 @@ final class LinkRouter {
     private func openLittle(url: URL?, on bridge: ProfileBridge) {
         if let app = NSRunningApplication.runningApplications(withBundleIdentifier: LittleLinks.chromeBundleID)
             .first(where: { !$0.isTerminated }) {
-            app.activate(options: [.activateIgnoringOtherApps])
+            app.activate()
         }
         let urlValue: Any = url.map { $0.absoluteString as Any } ?? NSNull()
         let cmd: [String: Any] = ["cmd": "openLittle", "url": urlValue, "bounds": LittleLinks.littleBounds()]

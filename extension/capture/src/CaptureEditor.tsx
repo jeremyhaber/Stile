@@ -3,12 +3,13 @@ import { AnnotateStage, hintFor, type StageControls } from './annotate/AnnotateS
 import { AnnotateProps, AnnotateTools } from './annotate/AnnotateToolbar'
 import { flattenToFile } from './annotate/flatten'
 import { measureText } from './annotate/measure'
-import { FIT_VIEW, type StageView } from './annotate/model'
+import { FIT_VIEW, outputSize, type StageView } from './annotate/model'
+import { createSampler } from './annotate/pixels'
 import { useAnnotator } from './annotate/useAnnotator'
 import { Button, Dialog, Toasts, type ToastMsg } from './ui'
 import { Icon } from './icons'
 import { loadImage, type LoadedImage } from './loadImage'
-import { sw, ext } from './chromeApi'
+import type { EditorHost } from './host'
 import s from './editor.module.css'
 
 export interface CaptureMeta {
@@ -16,7 +17,7 @@ export interface CaptureMeta {
   time: number
   url: string
   title: string
-  mode: 'visible' | 'full' | 'region'
+  mode: keyof typeof MODE_LABEL
   width: number
   height: number
   dpr: number
@@ -30,10 +31,19 @@ export interface EditorProps {
   annotate: boolean
   askWhere: boolean
   uploadReady: boolean
+  /** a Chrome popup or a Stile.app window */
+  host: EditorHost
   /** called by the shell to close the editor window */
   onClose: () => void
+  /** the shell's own close button (the app window's red button) asks through this: a dirty editor confirms first */
+  closeRequests?: { current: (() => void) | null }
 }
-const MODE_LABEL = { visible: 'Visible area', full: 'Full page', region: 'Region' } as const
+const MODE_LABEL = {
+  visible: 'Visible area', full: 'Full page', region: 'Region', screen: 'Screen', area: 'Area', window: 'Window',
+  // taken by Stile.app (v3.5c)
+  activeWindow: 'Active window', repeatArea: 'Repeated area', delayed: 'Delayed screen', file: 'Opened image',
+  clipboard: 'Clipboard', scroll: 'Scrolling capture',
+} as const
 
 const pad = (n: number) => String(n).padStart(2, '0')
 export function screenshotName(d = new Date()) {
@@ -42,7 +52,7 @@ export function screenshotName(d = new Date()) {
 const mac = /Mac/i.test(navigator.platform)
 const modKey = mac ? '⌘' : 'Ctrl+'
 
-export function CaptureEditor({ meta, blob, annotate, askWhere, uploadReady, onClose }: EditorProps) {
+export function CaptureEditor({ meta, blob, annotate: annotateSetting, askWhere, uploadReady, host, onClose, closeRequests }: EditorProps) {
   const url = useMemo(() => URL.createObjectURL(blob), [blob])
   useEffect(() => () => URL.revokeObjectURL(url), [url])
   const [loaded, setLoaded] = useState<LoadedImage | null>(null)
@@ -77,7 +87,26 @@ export function CaptureEditor({ meta, blob, annotate, askWhere, uploadReady, onC
   }, [url])
 
   const img = { w: loaded?.width ?? meta.width ?? 1, h: loaded?.height ?? meta.height ?? 1 }
-  const annot = useAnnotator({ img, scale: fit * stageView.zoom, measure: measureText })
+  const sampler = useMemo(() => (loaded ? createSampler(loaded.source, loaded.width, loaded.height) : null), [loaded])
+  const copyColor = useCallback(
+    (hex: string) => {
+      host.copyText(hex).then(
+        () => toast(`Copied ${hex}`),
+        () => toast('Couldn’t copy the color'),
+      )
+    },
+    [host, toast],
+  )
+  const annot = useAnnotator({
+    img,
+    scale: fit * stageView.zoom,
+    measure: measureText,
+    sampler,
+    unit: dpr,
+    onCopyColor: copyColor,
+  })
+  // settings apply live; turning annotation off mid-edit keeps the tools until the drawing is saved or discarded
+  const annotate = annotateSetting || annot.dirty
   useEffect(() => setStageView(FIT_VIEW), [annot.view.w, annot.view.h])
 
   // a tall full-page capture opens at width-fit, top first (Fit shows the whole picture)
@@ -90,9 +119,7 @@ export function CaptureEditor({ meta, blob, annotate, askWhere, uploadReady, onC
     return () => clearTimeout(t)
   }, [loaded, annotate])
 
-  const crop = annot.doc.crop
-  const outW = Math.round(crop ? crop.w : img.w)
-  const outH = Math.round(crop ? crop.h : img.h)
+  const { w: outW, h: outH } = outputSize(annot.doc, img)
 
   // ---------------------------------------------------------------- export
   const exportBlob = useCallback(async (): Promise<Blob> => {
@@ -142,56 +169,48 @@ export function CaptureEditor({ meta, blob, annotate, askWhere, uploadReady, onC
 
   const copy = useCallback(async () => {
     try {
-      await navigator.clipboard.write([new ClipboardItem({ 'image/png': exportRef.current() })])
+      await host.copyImage(exportRef.current())
       toast('Copied to the clipboard')
       annot.say('Copied to the clipboard')
     } catch (e) {
       toast('Couldn’t copy: ' + ((e as Error).message || 'clipboard unavailable'))
     }
-  }, [toast, annot])
+  }, [toast, annot, host])
 
   const save = useCallback(async () => {
     try {
-      const b = await exportRef.current()
-      const u = URL.createObjectURL(b)
-      await ext.downloads.download({ url: u, filename: `Screenshots/${screenshotName()}`, saveAs: askWhere, conflictAction: 'uniquify' })
-      setTimeout(() => URL.revokeObjectURL(u), 60_000)
-      toast('Saved to Downloads')
+      const done = await host.save(await exportRef.current(), screenshotName(), askWhere)
+      if (done) toast(done)
     } catch (e) {
-      const m = (e as Error).message || ''
-      if (!/cancel/i.test(m)) toast('Couldn’t save: ' + m)
+      toast('Couldn’t save: ' + ((e as Error).message || ''))
     }
-  }, [askWhere, toast])
+  }, [askWhere, toast, host])
 
   const copyLink = useCallback(
     async (l: string) => {
       try {
-        await navigator.clipboard.writeText(l)
+        await host.copyText(l)
         toast('Link copied')
       } catch {
         toast('Couldn’t copy the link')
       }
     },
-    [toast],
+    [toast, host],
   )
   const upload = useCallback(async () => {
     if (uploading) return
     setUploading(true)
     try {
-      const b = await exportRef.current()
-      // the editor page does the upload itself: the (possibly annotated) picture is too big to message around
-      const { uploadPng } = await import('../s3.js')
-      const { getS3Config } = await import('../common.js')
-      const r = await uploadPng(await getS3Config(), b)
-      setLink(r.url)
-      await sw({ cmd: 'captureSetLink', id: meta.id, link: r.url })
-      await copyLink(r.url)
+      const url = await host.upload(await exportRef.current())
+      setLink(url)
+      await host.setLink(meta.id, url)
+      await copyLink(url)
     } catch (e) {
       toast('Upload failed: ' + ((e as Error).message || 'unknown error'))
     } finally {
       setUploading(false)
     }
-  }, [uploading, meta.id, toast, copyLink])
+  }, [uploading, meta.id, toast, copyLink, host])
 
   // ---------------------------------------------------------------- closing + keys
   const requestClose = useCallback(() => {
@@ -200,6 +219,7 @@ export function CaptureEditor({ meta, blob, annotate, askWhere, uploadReady, onC
   }, [annotate, annot.dirty, onClose])
   const closeRef = useRef(requestClose)
   closeRef.current = requestClose
+  if (closeRequests) closeRequests.current = () => closeRef.current()
   const annotRef = useRef(annot)
   annotRef.current = annot
   const confirmingRef = useRef(confirming)
@@ -279,6 +299,26 @@ export function CaptureEditor({ meta, blob, annotate, askWhere, uploadReady, onC
     e.dataTransfer.setData('DownloadURL', `image/png:${screenshotName()}:${outUrl}`)
     e.dataTransfer.effectAllowed = 'copy'
   }
+  // the app window has no DownloadURL drag: a few pixels of movement with the button down start the app's native drag
+  const dragFrom = useRef<{ x: number; y: number } | null>(null)
+  const appDrag = host.dragOut
+    ? {
+        onPointerDown: (e: React.PointerEvent) => {
+          dragFrom.current = { x: e.clientX, y: e.clientY }
+        },
+        onPointerUp: () => {
+          dragFrom.current = null
+        },
+        onPointerMove: (e: React.PointerEvent) => {
+          const f = dragFrom.current
+          if (!f || !e.buttons || Math.hypot(e.clientX - f.x, e.clientY - f.y) < 4) return
+          dragFrom.current = null
+          void fetch(outUrl)
+            .then((r) => r.blob())
+            .then((b) => host.dragOut!(b, screenshotName()))
+        },
+      }
+    : { draggable: true, onDragStart: dragStart }
 
   let body
   if (loadError) body = <p className={s.message} role="alert">This screenshot can’t be opened.</p>
@@ -331,14 +371,31 @@ export function CaptureEditor({ meta, blob, annotate, askWhere, uploadReady, onC
             role="img"
             aria-label="Drag the picture into another app"
             title="Drag the picture into another app"
-            draggable
-            onDragStart={dragStart}
+            {...appDrag}
           >
             <Icon name="grip" />
           </span>
         </div>
         {annotate && <span className={s.vsep} role="separator" />}
         <div className={s.centre}>{annotate && <AnnotateTools annot={annot} />}</div>
+        {annotate && (
+          <button
+            type="button"
+            className={s.readout}
+            data-testid="capture-color"
+            aria-label={annot.probe?.color ? `Color ${annot.probe.color}, copy` : 'Color under the pointer'}
+            title={annot.tool === 'picker' ? 'Copy (Tab)' : 'Copy this color'}
+            aria-disabled={!annot.probe?.color || undefined}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => annot.copyProbeColor()}
+          >
+            <i style={{ background: annot.probe?.color ?? 'transparent' }} />
+            <span>
+              <b>{annot.probe?.color ?? '#——————'}</b>
+              <small>{annot.tool === 'picker' ? 'Tab to copy' : 'Color'}</small>
+            </span>
+          </button>
+        )}
         {annotate && (
           <div className={s.zoom} role="group" aria-label="Zoom">
             <button type="button" className={`${s.ebtn} ${s.zbtn}`} data-testid="capture-zoom-out" aria-label="Zoom out" title="Zoom out" aria-disabled={stageView.zoom <= 1 || undefined} onClick={() => controls.current?.zoomBy(1 / 1.5)}>
@@ -371,16 +428,21 @@ export function CaptureEditor({ meta, blob, annotate, askWhere, uploadReady, onC
       <footer className={s.status} data-testid="capture-status">
         <span data-testid="capture-size">{outW} × {outH} px</span>
         <i className={s.dot} />
-        <span data-testid="capture-mode">{MODE_LABEL[meta.mode]}</span>
+        <span data-testid="capture-mode">{MODE_LABEL[meta.mode] ?? meta.mode}</span>
         {meta.note && (<><i className={s.dot} /><span title={meta.note}>{meta.note}</span></>)}
-        {meta.url && (
+        {meta.url ? (
           <>
             <i className={s.dot} />
             <span className={s.t}>
               <a href={meta.url} target="_blank" rel="noreferrer" data-testid="capture-page-link" title={meta.url}>{meta.title || meta.url}</a>
             </span>
           </>
-        )}
+        ) : meta.title ? (
+          <>
+            <i className={s.dot} />
+            <span className={s.t} data-testid="capture-app">{meta.title}</span>
+          </>
+        ) : null}
         <span className={s.spacer} />
         {link && (
           <span className={s.link} data-testid="capture-link">

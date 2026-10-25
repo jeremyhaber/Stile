@@ -10,6 +10,16 @@ final class OverlayManager {
     let dragger = DragController()
     private(set) var controllers: [Int: OverlayController] = [:]
 
+    /// v3.6.1: Stile's panels over each Chrome window, by the Chrome window's id (see `Screenshotter.overlayPanels`).
+    func capturePanels() -> [CGWindowID: [CGWindowID]] {
+        var out: [CGWindowID: [CGWindowID]] = [:]
+        for c in controllers.values where c.window.cgID != 0 {
+            let ids = c.capturePanelIDs
+            if !ids.isEmpty { out[c.window.cgID] = ids }
+        }
+        return out
+    }
+
     private var followTimer: Timer?
     private var displayLink: AnyObject?     // CADisplayLink on macOS 14+
     private var followActive = false
@@ -17,6 +27,7 @@ final class OverlayManager {
     private var railTimer: Timer?
     private var lastFocusedKey: Int?
     private var tickCount = 0
+    private var downLocation: NSPoint?
     private var monitors: [Any] = []
     private var bridgeSubscriptions: [UUID: (ProfileBridge, UUID)] = [:]
     private var observers: [NSObjectProtocol] = []
@@ -66,6 +77,11 @@ final class OverlayManager {
         closer.ensureTap()
 
         tracker.onUpdate = { [weak self] in self?.trackerUpdated() }
+        tracker.onFocusedElementChanged = { [weak self] in
+            // Keyboard reveals of the full-screen toolbar (⌘L, ⌘T) come without any pointer movement.
+            guard let self = self else { return }
+            for c in self.controllers.values { c.chromeFocusChanged() }
+        }
         tracker.start()
 
         let nc = NotificationCenter.default
@@ -113,6 +129,37 @@ final class OverlayManager {
         bridgesChanged()
     }
 
+    /// v3.5c: capture-only mode. Everything `start()` set up goes away (tracker, follow loop, event taps, monitors,
+    /// timers, overlay panels); the appState relay and the app-message hub keep working. `start()` can run again.
+    func stop() {
+        guard started else { return }
+        started = false
+        if followActive { stopFollowing() }
+        for m in monitors { NSEvent.removeMonitor(m) }
+        monitors.removeAll()
+        for o in observers {
+            NotificationCenter.default.removeObserver(o)
+            DistributedNotificationCenter.default().removeObserver(o)
+        }
+        observers.removeAll()
+        railTimer?.invalidate()
+        railTimer = nil
+        for (_, e) in bridgeSubscriptions { e.0.removeSubscriber(e.1) }
+        bridgeSubscriptions.removeAll()
+        tracker.onUpdate = nil
+        tracker.onFocusedElementChanged = nil
+        tracker.stop()
+        closer.stop()
+        closer.refreshTargets([])
+        for c in controllers.values { c.teardown() }
+        controllers.removeAll()
+        anyConnectedSince = nil
+        dragger.syncTap()   // lockstep drags need Chrome mode: the tap goes away
+        dragger.updateSnapshot()
+        scheduleAppState()
+        Log.write("overlay: stopped (capture-only mode)")
+    }
+
     /// Once a second: re-validate rails (and re-scan while unmatched), host state, missing-extension cards.
     @objc private func secondTick() {
         if followActive { return }   // nothing expensive while following
@@ -145,7 +192,7 @@ final class OverlayManager {
             }
             c.pushHostState()
         }
-        if supportChanged { closer.refreshTargets(supportedWindows()) }
+        if supportChanged { refreshTaps() }
         scheduleAppState()
     }
 
@@ -182,7 +229,7 @@ final class OverlayManager {
             overlayEnabled = on
             Log.write("overlay: \(on ? "enabled" : "disabled")")
             for c in controllers.values { c.setOverlayEnabled(on) }
-            closer.refreshTargets(supportedWindows())
+            refreshTaps()
         }
         for c in controllers.values { c.settingsChanged() }
         dragger.syncTap()
@@ -210,6 +257,8 @@ final class OverlayManager {
                 c.onWindowDrag = { [weak self] key, doubleClick in
                     self?.dragger.beginFromPanel(windowKey: key, doubleClick: doubleClick)
                 }
+                c.onTopBarClose = { [weak self] key, el in self?.closer.performClose(key: key, window: el) }
+                c.onLayoutSettled = { [weak self] in self?.dragger.updateSnapshot() }
                 c.onHostStatePushed = { [weak self] in self?.scheduleAppState() }
                 c.overlayEnabled = overlayEnabled
                 controllers[w.key] = c
@@ -223,7 +272,7 @@ final class OverlayManager {
             c.teardown()
             controllers.removeValue(forKey: k)
         }
-        closer.refreshTargets(supportedWindows())
+        refreshTaps()
         mapper.schedule()
         if Date().timeIntervalSince(tracker.lastGeometryEvent) < 0.3 {
             followLastActivity = Date()
@@ -243,7 +292,13 @@ final class OverlayManager {
             c.setLittle(closer.isLittle(mapper.map[k]))
             c.attach(mapper.map[k])
         }
+        refreshTaps()
+    }
+
+    /// Re-publishes what both event taps (tap thread) decide from.
+    private func refreshTaps() {
         closer.refreshTargets(supportedWindows())
+        dragger.updateSnapshot()
     }
 
     /// Windows eligible for close interception: everything except unsupported (unmapped incognito etc.) windows
@@ -270,18 +325,23 @@ final class OverlayManager {
     private func mouseButtonEvent(_ type: NSEvent.EventType, at loc: NSPoint) {
         switch type {
         case .leftMouseDown:
+            // A plain click must stay cheap: no follow loop, no AX, no window-server queries. Just remember where
+            // the press began; following starts once the pointer actually drags.
+            downLocation = loc
             if overlayEnabled && tracker.chromeFrontmost {
-                followLastActivity = Date()
-                startFollowing()
                 for c in controllers.values { c.dragBegan(mouse: loc) }
             }
         case .leftMouseDragged:
             if overlayEnabled && tracker.chromeFrontmost {
+                if !followActive {
+                    guard let d = downLocation, hypot(loc.x - d.x, loc.y - d.y) > 3 else { return }
+                }
                 followLastActivity = Date()
                 startFollowing()
                 for c in controllers.values { c.dragMoved(mouse: loc) }
             }
         case .leftMouseUp:
+            downLocation = nil
             for c in controllers.values { c.dragEnded() }
         default:
             break
@@ -371,7 +431,8 @@ final class OverlayManager {
             "launchAtLogin": LoginItem.enabled, "accessibility": Permissions.isTrusted,
             "appVersion": AppInfo.version, "peekWidth": Int(Settings.peekWidth),
             "screenCapture": Permissions.screenCaptureGranted, "compact": true, "railWidth": 48,
-            "overlayEnabled": overlayEnabled, "lockstep": Settings.lockstepDrag, "showMenuBarIcon": Settings.showMenuBarIcon, "chromeColor": NSNull(),
+            "topBar": false, "greenButtonAction": Settings.greenButtonAction,
+            "overlayEnabled": overlayEnabled, "showMenuBarIcon": Settings.showMenuBarIcon, "chromeColor": NSNull(),
         ]
         // App-wide fields (the same for every profile).
         obj["defaultBrowser"] = defaultBrowserNow()
@@ -380,8 +441,24 @@ final class OverlayManager {
         obj["windowCount"] = mine.count
         obj["mapped"] = c != nil
         obj["connectedProfiles"] = server.identified.map { $0.profileDir }.sorted()
+        // v3.5c: the mode, and the app-owned capture settings (no secret; `secretSet` says whether there is one)
+        obj["useChrome"] = Settings.useChrome
+        obj["capture"] = CaptureSettings.shared.publicDict()
+        obj["microphones"] = microphonesNow()
+        obj["microphone"] = Permissions.microphoneGranted
         return obj
     }
+
+    private var micCache: (list: [[String: String]], at: Date)?
+    private func microphonesNow() -> [[String: String]] {
+        if let c = micCache, Date().timeIntervalSince(c.at) < 15 { return c.list }
+        let l = CaptureSettings.microphones()
+        micCache = (l, Date())
+        return l
+    }
+
+    /// Queues an `appState` push to every connected extension (capture settings or the mode changed).
+    func pushAppState() { scheduleAppState() }
 
     private func broadcastAppState() {
         let live = server.identified
@@ -405,15 +482,20 @@ final class OverlayManager {
             b.reply(m, ["type": "appState", "state": obj])
             return
         }
+        if type == "getCaptureSettings" {
+            b.reply(m, ["type": "captureSettings", "settings": CaptureSettings.shared.publicDict(full: (m["full"] as? Bool) == true)])
+            return
+        }
         guard type == "appSetting", let name = m["name"] as? String else { return }
         let value = m["value"]
         let on = (value as? Bool) ?? ((value as? NSNumber)?.boolValue ?? false)
         let mine = controllers.values.filter { $0.mappedBridge === b }.sorted { $0.key < $1.key }
         switch name {
-        case "setLockstep":
-            Settings.lockstepDrag = on   // posts; settingsChanged installs/removes the tap
         case "setShowMenuBarIcon":
             Settings.showMenuBarIcon = on   // posts; the menu bar controller adds or removes the status item
+        case "setGreenButtonAction":
+            Settings.greenButtonAction = (value as? String) == "fill" ? "fill" : "full"   // posts
+            Settings.greenButtonNotePending = false
         case "setPinned":
             // Same effect as the page's `setPinned` host message: the focused window of this profile, else its
             // first visible one.
@@ -439,6 +521,12 @@ final class OverlayManager {
             quitApp()
         case "reviewPermissions":
             NotificationCenter.default.post(name: .sidebarReviewPermissions, object: nil)
+        case "setCaptureSettings":
+            if let patch = value as? [String: Any] { CaptureSettings.shared.apply(patch) }   // posts; pushed back as appState
+        case "chooseCaptureFolder":
+            CaptureSettings.shared.chooseFolder(key: (value as? String) == "recordings" ? "recordingFolder" : "screenshotFolder")
+        case "setUseChrome":
+            Settings.useChrome = on   // posts .stileModeChanged; the app delegate starts or stops the Chrome side
         default:
             Log.write("host: appSetting '\(name)' not handled by the overlay manager")
         }
@@ -466,18 +554,21 @@ final class OverlayManager {
         c.setPinned(c.state != .pinned)
     }
 
-    /// Menu bar "Settings…": asks the extension of the focused window's profile (else the first connected one) to
-    /// open its settings window; with no extension connected, opens the permissions window instead.
-    func openExtensionSettings() {
-        let bridge: ProfileBridge? = {
-            if let b = focusedController()?.mappedBridge, !b.closed { return b }
-            return server.identified.first
-        }()
-        if let b = bridge {
-            b.sendToExt(["type": "openSettings"])
-        } else {
-            NotificationCenter.default.post(name: .sidebarReviewPermissions, object: nil)
+    /// The connection that receives screenshots: the focused Chrome window's profile, else the first one.
+    func captureBridge() -> ProfileBridge? {
+        if let b = preferredBridge() { return b }
+        if let b = focusedController()?.mappedBridge, !b.closed { return b }
+        return server.identified.first
+    }
+
+    /// Menu bar / Control+Option+6: the extension's full-page capture of the last focused Chrome window.
+    func captureChromePage() {
+        guard let b = captureBridge() else {
+            Log.write("capture: no extension connected for a Chrome page capture")
+            NSSound.beep()
+            return
         }
+        b.sendToExt(["type": "capture", "mode": "full"])
     }
 
     /// Writes the quit flag (so the connector doesn't relaunch the app) and terminates.

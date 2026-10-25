@@ -74,7 +74,7 @@ class Client {
     return found;
   }
   async request(m, type) {
-    const rt = { getProfiles: 'profiles', identify: 'identified', switchProfile: 'switchResult', setGlobalSettings: 'settings', setProfileStyle: 'profiles', setOverlayEnabled: 'overlayEnabled', setDefaultBrowser: 'defaultBrowser', getAppState: 'appState', appSetting: 'appSetting' };
+    const rt = { getProfiles: 'profiles', identify: 'identified', switchProfile: 'switchResult', setGlobalSettings: 'settings', setProfileStyle: 'profiles', setOverlayEnabled: 'overlayEnabled', setDefaultBrowser: 'defaultBrowser', getAppState: 'appState', appSetting: 'appSetting', getCaptureSettings: 'captureSettings' };
     this.send(m);
     return this.recv(type ?? rt[m.type] ?? m.type);
   }
@@ -195,6 +195,25 @@ check('invalid value leaves state unchanged', readJson(path.join(appDir, 'state.
 await A.request({ type: 'setGlobalSettings', settings: { archiveDefaultMinutes: 720 } });
 for (const c of [B, C, D0]) c.msgs.length = 0;
 A.msgs.length = 0;
+// showSettings / clearArchiveOverrides (v3.7)
+{
+  const calls = [];
+  host.on('showSettings', (c) => calls.push(c));
+  r = await A.request({ type: 'showSettings', section: 'tabs', requestId: 21 });
+  check('showSettings: no settings window -> ok:false + error', r?.type === 'showSettings' && r.ok === false && !!r.error && r.requestId === 21, j(r));
+  check('showSettings: the request is recorded with profile and section', host.showSettingsCalls.length === 1 && host.showSettingsCalls[0].profileDir === 'Default' && host.showSettingsCalls[0].section === 'tabs' && calls.length === 1, j(host.showSettingsCalls));
+  host.settingsWindow = true;
+  r = await B.request({ type: 'showSettings' });
+  check('showSettings: settingsWindow on -> ok:true', r?.type === 'showSettings' && r.ok === true, j(r));
+  check('showSettings: section defaults to null, profile is the sender\'s', host.showSettingsCalls[1]?.profileDir === 'Profile 1' && host.showSettingsCalls[1].section === null, j(host.showSettingsCalls));
+  host.settingsWindow = false;
+  const nIdent = host.byProfile.size;
+  r = await A.request({ type: 'clearArchiveOverrides', requestId: 22 });
+  check('clearArchiveOverrides: reply ok with the count of identified connections', r?.type === 'clearArchiveOverrides' && r.ok === true && r.count === nIdent && nIdent >= 3 && r.requestId === 22, j(r));
+  for (const [n, c] of [['A (the sender)', A], ['B', B], ['C', C]]) check(`clearArchiveOverrides: broadcast reaches ${n}`, !!(await c.recv('clearArchiveOverride', 2000)));
+  check('clearArchiveOverrides: an unidentified connection is not told', await D0.quiet(300));
+  for (const c of [A, B, C, D0]) c.msgs.length = 0;
+}
 // setOverlayEnabled (v2.7)
 r = await A.request({ type: 'setOverlayEnabled', enabled: false, requestId: 11 });
 check('setOverlayEnabled: reply', r?.type === 'overlayEnabled' && r.enabled === false && r.requestId === 11, j(r));
@@ -529,9 +548,9 @@ check('SIGTERM: connection removed from host', await wait(() => !host.isConnecte
   await T.recv('overlayStatus');
   const seen = [];
   host.on('appSetting', (x) => seen.push(x));
-  r = await T.request({ type: 'appSetting', name: 'setLockstep', value: false, requestId: 32 });
-  check('appSetting: reply {type, name, ok, requestId}', r?.type === 'appSetting' && r.name === 'setLockstep' && r.ok === true && r.requestId === 32, j(r));
-  check('appSetting: emitted to the app with profile, name and value', seen.length === 1 && seen[0].profileDir === 'Default' && seen[0].name === 'setLockstep' && seen[0].value === false, j(seen));
+  r = await T.request({ type: 'appSetting', name: 'setLaunchAtLogin', value: false, requestId: 32 });
+  check('appSetting: reply {type, name, ok, requestId}', r?.type === 'appSetting' && r.name === 'setLaunchAtLogin' && r.ok === true && r.requestId === 32, j(r));
+  check('appSetting: emitted to the app with profile, name and value', seen.length === 1 && seen[0].profileDir === 'Default' && seen[0].name === 'setLaunchAtLogin' && seen[0].value === false, j(seen));
   for (const name of ['setLaunchAtLogin', 'requestScreenCapture', 'openAccessibilitySettings', 'rescanRail', 'quitApp', 'setPinned', 'reviewPermissions', 'setShowMenuBarIcon', 'setGreenButtonAction']) {
     r = await T.request({ type: 'appSetting', name, value: true, requestId: 'n-' + name });
     check(`appSetting: ${name} accepted`, r?.ok === true && seen.at(-1)?.name === name, j(r));
@@ -539,14 +558,14 @@ check('SIGTERM: connection removed from host', await wait(() => !host.isConnecte
   const n = seen.length;
   r = await T.request({ type: 'appSetting', name: 'formatDisk', value: 1, requestId: 33 });
   check('appSetting: unknown name refused and not emitted', r?.ok === false && !!r.error && seen.length === n, j(r));
-  T.send({ type: 'appSetting', name: 'setLockstep', value: true });
+  T.send({ type: 'appSetting', name: 'setLaunchAtLogin', value: true });
   await wait(() => seen.length === n + 1);
   check('appSetting: works without a requestId (fire and forget), no reply', seen.length === n + 1 && await T.quiet(200));
   r = await T.request({ type: 'getAppState', requestId: 34 });
   check('getAppState: null before the app reported anything', r?.type === 'appState' && r.state === null && r.requestId === 34, j(r));
-  host.setAppState({ state: 'pinned', lockstep: false, launchAtLogin: true, accessibility: true });
+  host.setAppState({ state: 'pinned', showMenuBarIcon: false, launchAtLogin: true, accessibility: true });
   r = await T.recv('appState');
-  check('setAppState: pushed to identified extensions as {type:"appState", state} without requestId', r?.state?.lockstep === false && r.state.state === 'pinned' && !('requestId' in r), j(r));
+  check('setAppState: pushed to identified extensions as {type:"appState", state} without requestId', r?.state?.showMenuBarIcon === false && r.state.state === 'pinned' && !('requestId' in r), j(r));
   r = await T.request({ type: 'getAppState', requestId: 35 });
   check('getAppState: returns the latest state', r?.state?.launchAtLogin === true && r.requestId === 35, j(r));
   const T2 = spawnClient();
@@ -575,12 +594,191 @@ check('SIGTERM: connection removed from host', await wait(() => !host.isConnecte
   I.closeStdin(); await imp.close();
 }
 
+// ------------------------------------------------------------ 13b. v3.4: screenshot editor in the app
+{
+  const T = spawnClient();
+  await T.request({ type: 'hello' });
+  await T.request({ type: 'identify', profileDir: 'Default', requestId: 61 });
+  await T.recv('overlayStatus');
+  const cfgs = [], opened = [];
+  host.on('captureConfig', (x) => cfgs.push(x));
+  host.on('openCaptureEditor', (x) => opened.push(x));
+  T.send({ type: 'captureConfig', config: { annotate: true, askWhere: false, s3: { bucket: 'b' } } });
+  await wait(() => cfgs.length === 1);
+  check('captureConfig: kept for the connection, no reply', cfgs[0]?.profileDir === 'Default' && cfgs[0].config.s3.bucket === 'b' && await T.quiet(200), j(cfgs));
+  const png = Buffer.from('not really a png but bytes \x00\x01\x02 all the same');
+  const b64 = png.toString('base64'), cut = 8;
+  const head = { type: 'openCaptureEditor', id: 'cap1', parts: 2, meta: { id: 'cap1', mode: 'full', width: 10, height: 20, dpr: 2 }, config: {} };
+  T.send({ ...head, part: 0, data: b64.slice(0, cut) });
+  check('openCaptureEditor: no reply before the last part', await T.quiet(200));
+  r = await T.request({ ...head, part: 1, data: b64.slice(cut), requestId: 62 });
+  check('openCaptureEditor: last part answered {type, id, ok, requestId}', r?.ok === true && r.id === 'cap1' && r.requestId === 62, j(r));
+  check('openCaptureEditor: the picture is reassembled byte for byte, with its meta', opened.length === 1 && opened[0].png.equals(png) && opened[0].meta.mode === 'full', j(opened.map((o) => o.png.length)));
+  r = await T.request({ ...head, id: 'cap2', part: 1, data: b64.slice(cut), requestId: 63 });
+  check('openCaptureEditor: a missing part is refused (the extension falls back to its popup)', r?.ok === false && !!r.error && opened.length === 1, j(r));
+  r = await T.request({ ...head, part: 5, data: 'x', requestId: 64 });
+  check('openCaptureEditor: an out-of-range part is refused', r?.ok === false, j(r));
+  T.closeStdin();
+  await wait(() => T.exited, 3000);
+}
+
+// ------------------------------------------------------------ 13b2. v3.6: Record Chrome Tab messages
+{
+  const T = spawnClient();
+  await T.request({ type: 'hello' });
+  await T.request({ type: 'identify', profileDir: 'Default', requestId: 65 });
+  await T.recv('overlayStatus');
+  const rec = [];
+  host.on('record', (x) => rec.push(x));
+  T.send({ type: 'recordTab', windowId: 7, tabId: 42, title: 'Docs' });
+  T.send({ type: 'recordTabState', tabId: 42, active: false });
+  T.send({ type: 'recordTabState', tabId: 42, active: true });
+  T.send({ type: 'recordTabMoved', tabId: 42, windowId: 9 });
+  T.send({ type: 'recordTabClosed', tabId: 42 });
+  await wait(() => rec.length === 5);
+  check('recordTab: reaches the app with window, tab and title, no reply', rec[0]?.profileDir === 'Default' && rec[0].type === 'recordTab'
+    && rec[0].msg.windowId === 7 && rec[0].msg.tabId === 42 && rec[0].msg.title === 'Docs' && await T.quiet(200), j(rec[0]));
+  check('recordTabState: inactive then active (auto-pause / resume)', rec[1]?.msg.active === false && rec[2]?.msg.active === true && rec[1].msg.tabId === 42, j(rec.slice(1, 3)));
+  check('recordTabMoved / recordTabClosed: delivered in order', rec[3]?.type === 'recordTabMoved' && rec[3].msg.windowId === 9 && rec[4]?.type === 'recordTabClosed' && rec[4].msg.tabId === 42, j(rec.slice(3)));
+  check('recordTabRequest: the app asks the extension for its active tab', host.requestRecordTab('Default') && (await T.recv('recordTabRequest'))?.type === 'recordTabRequest');
+  host.setRecordingTab('Default', 42);
+  check('recordingTab: the app names the tab it records', (await T.recv('recordingTab'))?.tabId === 42);
+  host.setRecordingTab('Default', null);
+  check('recordingTab: null when the recording ends', (await T.recv('recordingTab'))?.tabId === null);
+  check('recordingTab / recordTabRequest: refused for a profile that is not connected', host.setRecordingTab('Nope', 1) === false && host.requestRecordTab('Nope') === false);
+  T.closeStdin();
+  await wait(() => T.exited, 3000);
+}
+
+// ------------------------------------------------------------ 13c. v3.5c: app-owned capture settings, mode, migration
+{
+  const T = spawnClient();
+  await T.request({ type: 'hello' });
+  await T.request({ type: 'identify', profileDir: 'Default', requestId: 71 });
+  await T.recv('overlayStatus');
+  r = await T.request({ type: 'getCaptureSettings', requestId: 72 });
+  const d = r?.settings;
+  check('getCaptureSettings: defaults (folders, pattern, shadow, annotate, recording keys)', r?.type === 'captureSettings' && r.requestId === 72
+    && d.screenshotFolder.endsWith(path.join('Downloads', 'Screenshots')) && d.recordingFolder === d.screenshotFolder && d.recordingFolderFollowsScreenshots === true
+    && d.filenamePattern === 'Screenshot {yyyy}-{mm}-{dd} at {hh}.{min}.{ss}' && d.windowShadow === true && d.annotate === true && d.askWhere === false
+    && d.recording.fps === 30 && d.recording.codec === 'h264' && d.recording.countdown === true && d.recording.showCursor === true
+    && d.recording.systemAudio === false && d.recording.micDeviceId === '' && d.recording.maxResolution === '1080p' && d.s3.secretSet === false && d.s3.recordingShare === 'page', j(r));
+  const seen = [];
+  host.on('appSetting', (x) => seen.push(x));
+  const secret = 'SECRET-never-in-state-json-0123456789';
+  r = await T.request({ type: 'appSetting', name: 'setCaptureSettings', requestId: 73, value: {
+    screenshotFolder: '/tmp/shots', filenamePattern: '{app} {yyyy}{mm}{dd}', windowShadow: false, annotate: false, askWhere: true,
+    s3: { endpoint: ' https://s3.example.com ', bucket: 'b', accessKeyId: 'AKID', secretAccessKey: secret, prefix: 'x/{yyyy}/', linkType: 'public', publicBase: 'https://cdn.example.com/', expiry: 3600, naming: 'timestamp', recordingShare: 'file' },
+    recording: { fps: 60, codec: 'hevc', countdown: false, showCursor: false, systemAudio: true, micDeviceId: 'mic-1', maxResolution: '1440p' } } });
+  check('setCaptureSettings: accepted through the appSetting relay', r?.type === 'appSetting' && r.name === 'setCaptureSettings' && r.ok === true && seen.at(-1)?.name === 'setCaptureSettings', j(r));
+  r = await T.request({ type: 'getCaptureSettings', requestId: 74 });
+  const c = r?.settings;
+  check('setCaptureSettings: values stored and read back', c.screenshotFolder === '/tmp/shots' && c.filenamePattern === '{app} {yyyy}{mm}{dd}' && c.windowShadow === false && c.annotate === false && c.askWhere === true
+    && c.s3.endpoint === 'https://s3.example.com' && c.s3.bucket === 'b' && c.s3.accessKeyId === 'AKID' && c.s3.linkType === 'public' && c.s3.expiry === 3600 && c.s3.naming === 'timestamp' && c.s3.recordingShare === 'file'
+    && c.recording.fps === 60 && c.recording.codec === 'hevc' && c.recording.countdown === false && c.recording.showCursor === false && c.recording.systemAudio === true && c.recording.micDeviceId === 'mic-1' && c.recording.maxResolution === '1440p', j(c));
+  check('capture settings: the secret is never in the normal reply, only a secretSet flag', c.s3.secretSet === true && !('secretAccessKey' in c.s3) && !j(r).includes(secret), j(c.s3));
+  r = await T.request({ type: 'getCaptureSettings', full: true, requestId: 75 });
+  check('getCaptureSettings full:true adds the secret (for the connection test / uploads)', r?.settings?.s3?.secretAccessKey === secret, j(r?.settings?.s3));
+  check('capture settings: the secret is not written to state.json', !slurp(host.stateFile).includes(secret) && readJson(host.stateFile).capture?.s3?.bucket === 'b');
+  r = await T.request({ type: 'appSetting', name: 'setCaptureSettings', requestId: 76, value: { recording: { fps: 45, codec: 'vp9', maxResolution: '8k' }, screenshotFolder: 'relative/path', windowShadow: 'yes', s3: { expiry: 99999999, style: 'nonsense', recordingShare: 'bogus' } } });
+  r = await T.request({ type: 'getCaptureSettings', requestId: 77 });
+  check('setCaptureSettings: invalid values are ignored (fps, codec, resolution, relative folder, non-boolean, style) and expiry is capped',
+    r.settings.recording.fps === 60 && r.settings.recording.codec === 'hevc' && r.settings.recording.maxResolution === '1440p' && r.settings.screenshotFolder === '/tmp/shots'
+    && r.settings.windowShadow === false && r.settings.s3.style === 'auto' && r.settings.s3.recordingShare === 'file' && r.settings.s3.expiry === 604800, j(r.settings));
+  T.send({ type: 'appSetting', name: 'setCaptureSettings', value: { screenshotFolder: '' } });
+  r = await T.request({ type: 'getCaptureSettings', requestId: 78 });
+  check('setCaptureSettings: an empty folder goes back to the default', r.settings.screenshotFolder.endsWith(path.join('Downloads', 'Screenshots')), j(r.settings.screenshotFolder));
+  r = await T.request({ type: 'appSetting', name: 'chooseCaptureFolder', value: 'recordings', requestId: 79 });
+  check('chooseCaptureFolder is a known app setting (the Swift app shows the panel)', r?.ok === true && seen.at(-1)?.name === 'chooseCaptureFolder' && seen.at(-1).value === 'recordings', j(r));
+  check('fileName: pattern tokens, "/" and ":" made safe', host.capture.fileName('Fin/der', new Date(2026, 9, 24, 14, 3, 22)) === '{app} {yyyy}{mm}{dd}'.replace('{app}', 'Fin-der').replace('{yyyy}', '2026').replace('{mm}', '10').replace('{dd}', '24') + '.png', host.capture.fileName('Fin/der', new Date(2026, 9, 24, 14, 3, 22)));
+  host.capture.apply({ filenamePattern: '' });
+  check('fileName: empty pattern means the macOS-style default', host.capture.fileName('X', new Date(2026, 9, 24, 14, 3, 22)) === 'Screenshot 2026-10-24 at 14.03.22.png', host.capture.fileName('X', new Date(2026, 9, 24, 14, 3, 22)));
+
+  // appState carries the mode and the (secret-free) capture settings, and follows changes
+  T.msgs.length = 0;
+  host.setAppState({ state: 'pinned', accessibility: true });
+  r = await T.recv('appState');
+  check('appState: carries useChrome, capture (no secret) and microphones', r?.state?.useChrome === true && r.state.capture?.s3?.bucket === 'b' && r.state.capture.s3.secretSet === true && !j(r).includes(secret) && Array.isArray(r.state.microphones), j(r?.state?.capture?.s3));
+  T.send({ type: 'appSetting', name: 'setCaptureSettings', value: { filenamePattern: 'Shot {hh}' } });
+  r = await T.recv('appState');
+  check('appState: re-pushed when a capture setting changes', r?.state?.capture?.filenamePattern === 'Shot {hh}', j(r?.state?.capture?.filenamePattern));
+  T.send({ type: 'appSetting', name: 'setUseChrome', value: false });
+  r = await T.recv('appState');
+  check('setUseChrome: the mode is pushed in appState', r?.state?.useChrome === false && host.useChrome === false, j(r?.state?.useChrome));
+  T.send({ type: 'appSetting', name: 'setUseChrome', value: true });
+  r = await T.recv('appState');
+  check('setUseChrome: back on', r?.state?.useChrome === true);
+
+  // the editor's config comes from the app (with the profile's colour from its captureConfig)
+  const opened = [];
+  host.on('openCaptureEditor', (x) => opened.push(x));
+  const png = Buffer.from('png-bytes');
+  r = await T.request({ type: 'openCaptureEditor', id: 'cfg1', parts: 1, part: 0, data: png.toString('base64'), meta: { id: 'cfg1', mode: 'area' },
+    config: { annotate: true, askWhere: false, sidebarColor: { mode: 'custom', color: '#112233' }, s3: { bucket: 'EXT' } }, requestId: 80 });
+  const cfg = opened[0]?.config;
+  check('openCaptureEditor: the editor config is the app\'s (annotate/askWhere/S3 incl. secret) plus the profile colour, not the extension\'s',
+    r?.ok === true && cfg?.annotate === false && cfg.askWhere === true && cfg.s3.bucket === 'b' && cfg.s3.secretAccessKey === secret && cfg.sidebarColor?.color === '#112233', j(cfg));
+  // v3.6: recent recordings are pushed to the extension as small messages (metadata + thumbnail, never the video)
+  const thumb = Buffer.alloc(6000, 7).toString('base64');
+  const sent = host.sendNativeRecording('Default', { id: 'rec1', title: 'Recording — Slack — Oct 24', duration: 42.4, time: 1_792_000_000_000, link: 'https://cdn.example.com/r.mp4', thumb });
+  r = await T.recv('nativeRecording');
+  check('nativeRecording: id, title, duration, time, link and the thumbnail arrive intact', sent === true && r?.id === 'rec1' && r.title === 'Recording — Slack — Oct 24' && r.duration === 42.4
+    && r.time === 1_792_000_000_000 && r.link === 'https://cdn.example.com/r.mp4' && r.thumb === thumb && !('removed' in r), j({ ...r, thumb: r?.thumb?.length }));
+  host.sendNativeRecording('Default', { id: 'rec1', removed: true });
+  r = await T.recv('nativeRecording');
+  check('nativeRecording: a removal carries just the id', r?.id === 'rec1' && r.removed === true && !('thumb' in r), j(r));
+  check('nativeRecording: over Chrome\'s 1 MB message limit it is dropped, not sent', host.sendNativeRecording('Default', { id: 'big', title: 'x', thumb: 'A'.repeat(1_100_000) }) === false && await T.quiet(300));
+  check('nativeRecording: a profile that is not connected gets nothing', host.sendNativeRecording('Nobody', { id: 'rec2', title: 'x' }) === false);
+  T.closeStdin();
+  await wait(() => T.exited, 3000);
+  host.removeAllListeners('appSetting'); host.removeAllListeners('openCaptureEditor');
+  host.appState = null; host.useChrome = true;
+
+  // migration: a fresh app adopts the extension's S3 setup once
+  const mdir = path.join(tmp, 'app-migrate');
+  const mh = new HostServer({ appDir: mdir, localState, chromeBin: fakeChrome });
+  await mh.listen();
+  const M = spawnClient({ SIDEBAR_APP_DIR: mdir });
+  await M.request({ type: 'hello' });
+  await M.request({ type: 'identify', profileDir: 'Default', requestId: 81 });
+  await M.recv('overlayStatus');
+  M.send({ type: 'captureConfig', config: { annotate: false, askWhere: true, s3: { endpoint: 'https://r2.example.com', bucket: 'ext-bucket', accessKeyId: 'EXTKEY', secretAccessKey: 'EXTSECRET', prefix: 'p/', region: 'auto' } } });
+  await wait(() => mh.capture.s3Public.bucket === 'ext-bucket');
+  r = await M.request({ type: 'getCaptureSettings', full: true, requestId: 82 });
+  check('migration: the extension\'s S3 setup is adopted when the app has none (secret into the keychain stand-in)', r?.settings?.s3?.bucket === 'ext-bucket' && r.settings.s3.accessKeyId === 'EXTKEY' && r.settings.s3.secretAccessKey === 'EXTSECRET' && r.settings.s3.prefix === 'p/' && r.settings.annotate === false && r.settings.askWhere === true, j(r?.settings?.s3));
+  check('migration: the secret is not in state.json', !slurp(mh.stateFile).includes('EXTSECRET'));
+  M.send({ type: 'captureConfig', config: { s3: { endpoint: 'https://other', bucket: 'other', accessKeyId: 'O', secretAccessKey: 'OS' } } });
+  await M.quiet(300);
+  check('migration: adopted once, a later push does not overwrite the app\'s settings', mh.capture.s3Public.bucket === 'ext-bucket');
+  mh.capture.apply({ s3: { bucket: '', accessKeyId: '', secretAccessKey: '' } });
+  M.send({ type: 'captureConfig', config: { s3: { endpoint: 'https://other', bucket: 'other', accessKeyId: 'O', secretAccessKey: 'OS' } } });
+  await M.quiet(300);
+  check('migration: not adopted again after it happened once, even when the app was cleared', mh.capture.s3Public.bucket === '');
+  M.closeStdin();
+  await wait(() => M.exited, 3000);
+  await mh.close();
+  // an app that is already set up keeps its own
+  const kdir = path.join(tmp, 'app-keep');
+  const kh = new HostServer({ appDir: kdir, localState, chromeBin: fakeChrome });
+  await kh.listen();
+  kh.capture.apply({ s3: { endpoint: 'https://mine', bucket: 'mine', accessKeyId: 'MINE', secretAccessKey: 'MS' } });
+  const K = spawnClient({ SIDEBAR_APP_DIR: kdir });
+  await K.request({ type: 'hello' });
+  await K.request({ type: 'identify', profileDir: 'Default', requestId: 83 });
+  K.send({ type: 'captureConfig', config: { s3: { endpoint: 'https://ext', bucket: 'ext', accessKeyId: 'E', secretAccessKey: 'ES' } } });
+  await K.quiet(300);
+  check('migration: an app that already has an S3 setup is left alone', kh.capture.s3Public.bucket === 'mine' && kh.capture.keychainSecret === 'MS');
+  K.closeStdin();
+  await wait(() => K.exited, 3000);
+  await kh.close();
+}
+
 // ------------------------------------------------------------ 14. manifest
 {
   const f = writeHostManifest(path.join(tmp, 'nmh'), CONNECTOR);
   const m = readJson(f);
-  check('host manifest: name, stdio, path and allowed origin', m.name === 'com.sidebar.helper' && m.type === 'stdio' && m.path === CONNECTOR
-    && m.allowed_origins?.[0] === 'chrome-extension://ffblekellgdmlecjablfojaaadpkmdgg/' && path.basename(f) === 'com.sidebar.helper.json');
+  check('host manifest: name, stdio, path and allowed origin', m.name === 'com.stile.helper' && m.type === 'stdio' && m.path === CONNECTOR
+    && m.allowed_origins?.[0] === 'chrome-extension://ffblekellgdmlecjablfojaaadpkmdgg/' && path.basename(f) === 'com.stile.helper.json');
   check('connector.js is executable with a node shebang', (fs.statSync(CONNECTOR).mode & 0o111) !== 0 && slurp(CONNECTOR).startsWith('#!/usr/bin/env node\n'));
 }
 

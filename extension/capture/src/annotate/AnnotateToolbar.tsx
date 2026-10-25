@@ -2,6 +2,7 @@ import {
   useEffect,
   useLayoutEffect,
   useRef,
+  useState,
   type FocusEvent,
   type KeyboardEvent,
   type ReactNode,
@@ -18,9 +19,13 @@ import {
   MousePointer2,
   MoveUpRight,
   Pencil,
+  Pipette,
   Plus,
   Redo2,
   RotateCcw,
+  Ruler,
+  Scaling,
+  ScanSearch,
   Slash,
   Square,
   Trash2,
@@ -31,7 +36,18 @@ import {
 } from 'lucide-react'
 import { Select } from '../ui'
 import type { Annotator } from './useAnnotator'
-import { COLORS, FONT_LABELS, SIZE_LABELS, TOOL_LABEL, readableOn, type Tool } from './model'
+import {
+  COLORS,
+  FONT_LABELS,
+  SIZE_LABELS,
+  TOOL_LABEL,
+  canvasRect,
+  docScale,
+  outputSize,
+  padSize,
+  readableOn,
+  type Tool,
+} from './model'
 import s from './annotate.module.css'
 
 const ICONS: Record<Tool, ReactNode> = {
@@ -46,7 +62,11 @@ const ICONS: Record<Tool, ReactNode> = {
   text: <Type size={16} aria-hidden />,
   badge: <Hash size={16} aria-hidden />,
   blur: <Grid3x3 size={16} aria-hidden />,
+  measure: <Ruler size={16} aria-hidden />,
+  magnify: <ScanSearch size={16} aria-hidden />,
+  picker: <Pipette size={16} aria-hidden />,
   crop: <Crop size={16} aria-hidden />,
+  canvas: <Scaling size={16} aria-hidden />,
 }
 const TOOL_ORDER: Tool[] = [
   'select',
@@ -60,7 +80,11 @@ const TOOL_ORDER: Tool[] = [
   'text',
   'badge',
   'blur',
+  'measure',
+  'magnify',
+  'picker',
   'crop',
+  'canvas',
 ]
 
 /**
@@ -171,7 +195,24 @@ function Roving({
   )
 }
 
-const STROKE_TOOLS = new Set(['pen', 'highlight', 'arrow', 'line', 'rect', 'ellipse', 'badge'])
+const STROKE_TOOLS = new Set([
+  'pen',
+  'highlight',
+  'arrow',
+  'line',
+  'rect',
+  'ellipse',
+  'badge',
+  'measure',
+  'magnify',
+])
+const PAD_COLORS = [
+  { name: 'Transparent', value: 'transparent' },
+  { name: 'White', value: '#ffffff' },
+  { name: 'Light gray', value: '#ececf0' },
+  { name: 'Black', value: '#111111' },
+] as const
+const SCALES = [0.25, 0.5, 0.75, 1, 1.5, 2]
 const COLOR_TOOLS = new Set([...STROKE_TOOLS, 'fillrect', 'text'])
 
 /** Undo / Redo: in the tool bar (roving) on desktop, 44px icon buttons in the phone header */
@@ -270,7 +311,7 @@ export function AnnotateProps({
   annot: Annotator
   afterAction: () => void
   /** the stage zoom: pinch is the touch way, these buttons are the single-pointer / keyboard way.
-   *  (Sidebar: optional; the capture editor shows its own zoom group in the top bar.) */
+   *  (Stile: optional; the capture editor shows its own zoom group in the top bar.) */
   zoom?: { value: number; by: (factor: number) => void; fit: () => void }
 }) {
   const propsRef = useRef<HTMLDivElement>(null)
@@ -281,7 +322,15 @@ export function AnnotateProps({
   const showFont = rel === 'text'
   const canAdd = annot.canPlace
   const addLabel =
-    annot.tool === 'crop' ? 'Set crop area' : `Add ${TOOL_LABEL[annot.tool].toLowerCase()}`
+    annot.tool === 'crop'
+      ? 'Set crop area'
+      : annot.tool === 'measure'
+        ? 'Measure here'
+        : annot.tool === 'picker'
+          ? 'Pick color'
+          : `Add ${TOOL_LABEL[annot.tool].toLowerCase()}`
+  // a picked color is not one of the palette's: it gets a swatch of its own, checked
+  const custom = COLORS.some((c) => c.value === annot.color.toLowerCase()) ? null : annot.color
   return (
     <div ref={propsRef} className={s.props} role="group" aria-label="Properties">
       {showColor && (
@@ -308,8 +357,48 @@ export function AnnotateProps({
               </button>
             )
           })}
+          {custom && (
+            <button
+              type="button"
+              role="radio"
+              className={s.swatch}
+              data-roving=""
+              data-testid="annotate-color-custom"
+              aria-checked
+              aria-label={`Picked color ${custom}`}
+              title={custom}
+              onClick={() => annot.setColor(custom)}
+            >
+              <span className={s.dot} style={{ background: custom, color: readableOn(custom) }}>
+                <Check size={14} strokeWidth={3} aria-hidden />
+              </span>
+            </button>
+          )}
         </Roving>
       )}
+      {rel === 'measure' && (
+        <Roving role="radiogroup" label="Measure" follow className={s.sizes}>
+          {(['Line', 'Box'] as const).map((label) => {
+            const on = annot.measureBox === (label === 'Box')
+            return (
+              <button
+                key={label}
+                type="button"
+                role="radio"
+                className={s.size}
+                style={{ width: 'auto', padding: '0 8px' }}
+                data-roving=""
+                data-testid={`annotate-measure-${label.toLowerCase()}`}
+                aria-checked={on}
+                onClick={() => annot.setMeasureBox(label === 'Box')}
+              >
+                {label}
+              </button>
+            )
+          })}
+        </Roving>
+      )}
+      {annot.tool === 'canvas' && <CanvasProps annot={annot} />}
       {showSize && (
         <Roving role="radiogroup" label="Stroke width" follow className={s.sizes}>
           {SIZE_LABELS.map((label, i) => (
@@ -340,6 +429,7 @@ export function AnnotateProps({
           ))}
         </Roving>
       )}
+      {rel === 'badge' && <BadgeProps annot={annot} afterAction={afterAction} />}
       {showFont && (
         <label className={s.fontField}>
           <span>Text size</span>
@@ -392,6 +482,20 @@ export function AnnotateProps({
             <RotateCcw size={14} aria-hidden /> Reset crop
           </button>
         )}
+        {annot.tool === 'canvas' && (docScale(annot.doc) !== 1 || padSize(annot.doc) > 0) && (
+          <button
+            type="button"
+            className={s.action}
+            data-testid="annotate-canvas-reset"
+            onClick={() => {
+              annot.setScale(1)
+              annot.setPad({ size: 0, color: annot.doc.pad?.color ?? 'transparent' })
+              afterAction()
+            }}
+          >
+            <RotateCcw size={14} aria-hidden /> Reset
+          </button>
+        )}
         {annot.selected && (
           <button
             type="button"
@@ -440,5 +544,165 @@ export function AnnotateProps({
         </>)}
       </div>
     </div>
+  )
+}
+
+/**
+ * The count tool: the number the next badge gets, a Reset that starts a new count, and (with a badge selected) its
+ * number as an editable field. Typing applies as you go (one undo step); an empty or out-of-range value waits.
+ */
+function BadgeProps({ annot, afterAction }: { annot: Annotator; afterAction: () => void }) {
+  const sel = annot.selected?.kind === 'badge' ? annot.selected : null
+  const n = sel?.n
+  const [text, setText] = useState(n === undefined ? '' : String(n))
+  // follows the badge: another selection, undo / redo
+  useEffect(() => {
+    setText((t) => (n !== undefined && Number(t) !== n ? String(n) : t))
+  }, [n, sel?.id])
+  return (
+    <>
+      {sel ? (
+        <label className={s.numField}>
+          <span>Number</span>
+          <input
+            key={sel.id}
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            maxLength={3}
+            value={text}
+            aria-label="Badge number (1 to 999)"
+            title="Badge number (1 to 999); the next badge continues from it"
+            data-testid="annotate-badge-number"
+            onChange={(e) => {
+              const v = e.target.value.replace(/\D/g, '').slice(0, 3)
+              setText(v)
+              const num = Number(v)
+              if (v && num >= 1 && num <= 999) annot.setBadgeNumber(num)
+            }}
+            onBlur={() => setText(String(sel.n))}
+          />
+        </label>
+      ) : null}
+      <span className={s.numField} data-testid="annotate-badge-next">
+        Next: {annot.nextBadge}
+      </span>
+      <button
+          type="button"
+          className={s.action}
+          data-testid="annotate-badge-reset"
+          aria-label="Reset count: the next badge is number 1"
+          title="Reset count: the next badge is number 1"
+          aria-disabled={annot.nextBadge === 1 || undefined}
+          onClick={() => {
+            annot.resetBadgeCounter()
+            afterAction()
+          }}
+        >
+          <RotateCcw size={14} aria-hidden /> Reset
+        </button>
+    </>
+  )
+}
+
+/**
+ * The canvas tool: the export size (width / height in px, aspect kept, or a percentage) and the padding around the
+ * picture (px and color). Typed numbers apply on Enter or when the field loses focus.
+ */
+function CanvasProps({ annot }: { annot: Annotator }) {
+  const img = annot.img
+  const c = canvasRect(annot.doc, img)
+  const out = outputSize(annot.doc, img)
+  const k = docScale(annot.doc)
+  const pad = padSize(annot.doc)
+  const padColor = annot.doc.pad?.color ?? 'transparent'
+  const commit = (fn: (v: number) => void) => (e: FocusEvent<HTMLInputElement> | KeyboardEvent<HTMLInputElement>) => {
+    if ('key' in e && e.key !== 'Enter') return
+    const v = Number((e.currentTarget as HTMLInputElement).value)
+    if (Number.isFinite(v)) fn(v)
+  }
+  const pct = Math.round(k * 100)
+  return (
+    <>
+      <label className={s.numField}>
+        <span>Size</span>
+        <input
+          key={`w${out.w}`}
+          type="number"
+          min={1}
+          defaultValue={out.w}
+          aria-label="Export width in pixels"
+          data-testid="annotate-out-width"
+          onBlur={commit((v) => v > 0 && annot.setScale(v / c.w))}
+          onKeyDown={commit((v) => v > 0 && annot.setScale(v / c.w))}
+        />
+        <span className={s.times}>×</span>
+        <input
+          key={`h${out.h}`}
+          type="number"
+          min={1}
+          defaultValue={out.h}
+          aria-label="Export height in pixels"
+          data-testid="annotate-out-height"
+          onBlur={commit((v) => v > 0 && annot.setScale(v / c.h))}
+          onKeyDown={commit((v) => v > 0 && annot.setScale(v / c.h))}
+        />
+      </label>
+      <label className={s.fontField}>
+        <span className="sr-only">Scale</span>
+        <Select
+          value={SCALES.includes(k) ? String(k) : 'custom'}
+          onChange={(e) => e.target.value !== 'custom' && annot.setScale(Number(e.target.value))}
+          data-testid="annotate-scale"
+          aria-label="Export scale"
+        >
+          {!SCALES.includes(k) && <option value="custom">{pct}%</option>}
+          {SCALES.map((v) => (
+            <option key={v} value={String(v)}>
+              {Math.round(v * 100)}%{annot.unit > 1 && Math.abs(v - 1 / annot.unit) < 1e-6 ? ' (1×)' : ''}
+            </option>
+          ))}
+        </Select>
+      </label>
+      <label className={s.numField}>
+        <span>Padding</span>
+        <input
+          key={`p${pad}`}
+          type="number"
+          min={0}
+          defaultValue={pad}
+          aria-label="Padding in pixels"
+          data-testid="annotate-pad-size"
+          onBlur={commit((v) => annot.setPad({ size: v, color: padColor }))}
+          onKeyDown={commit((v) => annot.setPad({ size: v, color: padColor }))}
+        />
+      </label>
+      <Roving role="radiogroup" label="Padding color" follow className={s.swatches}>
+        {PAD_COLORS.map((p) => {
+          const on = padColor === p.value
+          return (
+            <button
+              key={p.value}
+              type="button"
+              role="radio"
+              className={s.swatch}
+              data-roving=""
+              data-testid={`annotate-pad-${p.name.toLowerCase().replace(' ', '-')}`}
+              aria-checked={on}
+              aria-label={`${p.name} padding`}
+              title={`${p.name} padding`}
+              onClick={() => annot.setPad({ size: pad || 40, color: p.value })}
+            >
+              <span
+                className={`${s.dot} ${p.value === 'transparent' ? s.checker : ''}`}
+                style={p.value === 'transparent' ? { color: '#111111' } : { background: p.value, color: readableOn(p.value) }}
+              >
+                {on && <Check size={14} strokeWidth={3} aria-hidden />}
+              </span>
+            </button>
+          )
+        })}
+      </Roving>
+    </>
   )
 }

@@ -28,8 +28,12 @@ export type Tool =
   | 'text'
   | 'badge'
   | 'blur'
+  | 'measure'
+  | 'magnify'
+  | 'picker'
   | 'crop'
-export type ShapeKind = Exclude<Tool, 'select' | 'crop'>
+  | 'canvas'
+export type ShapeKind = Exclude<Tool, 'select' | 'crop' | 'picker' | 'canvas'>
 
 interface Common {
   id: string
@@ -48,12 +52,39 @@ export type TextShape = Common & {
   fontSize: number
 }
 export type BadgeShape = Common & { kind: 'badge'; cx: number; cy: number; r: number; n: number }
-export type Shape = PenShape | SegmentShape | BoxShape | TextShape | BadgeShape
+/**
+ * A dimension: a line from a to b labelled with its length, or (box) the rectangle a..b labelled W x H. `unit` = image px
+ * per labelled px (the capture's devicePixelRatio, so a Retina screenshot measures in CSS px).
+ */
+export type MeasureShape = Common & { kind: 'measure'; a: Pt; b: Pt; box: boolean; unit: number }
+/** a magnifier: the square `src` of the picture, shown enlarged in the circular lens x / y / w / h (w === h) */
+export type MagnifyShape = Common & { kind: 'magnify'; src: Rect } & Rect
+export type Shape =
+  | PenShape
+  | SegmentShape
+  | BoxShape
+  | TextShape
+  | BadgeShape
+  | MeasureShape
+  | MagnifyShape
 
-/** what the history keeps: the shapes (z-order = array order) and the crop rectangle (null = whole image) */
+/** a margin around the exported picture, in image px; color 'transparent' leaves it clear */
+export interface Pad {
+  size: number
+  color: string
+}
+
+/**
+ * what the history keeps: the shapes (z-order = array order), the crop rectangle (null = whole image), the canvas padding
+ * and the export scale (1 = natural size)
+ */
 export interface AnnotDoc {
   shapes: Shape[]
   crop: Rect | null
+  pad?: Pad | null
+  scale?: number
+  /** the number the next count badge gets (part of the doc so undo / redo restore it); unset = highest + 1 */
+  nextBadge?: number
 }
 export const EMPTY_DOC: AnnotDoc = { shapes: [], crop: null }
 
@@ -69,7 +100,11 @@ export const TOOL_LABEL: Record<Tool, string> = {
   text: 'Text',
   badge: 'Number',
   blur: 'Blur',
+  measure: 'Measure',
+  magnify: 'Magnifier',
+  picker: 'Color picker',
   crop: 'Crop',
+  canvas: 'Resize and padding',
 }
 /** the tools that put a shape on the stage (Enter / "Add" places one without dragging); the pen is drag-only */
 export const PLACEABLE: ReadonlySet<Tool> = new Set([
@@ -82,6 +117,7 @@ export const PLACEABLE: ReadonlySet<Tool> = new Set([
   'text',
   'badge',
   'blur',
+  'magnify',
 ])
 export const KIND_NAME: Record<ShapeKind, string> = {
   pen: 'Freehand stroke',
@@ -94,6 +130,8 @@ export const KIND_NAME: Record<ShapeKind, string> = {
   text: 'Text',
   badge: 'Number',
   blur: 'Blur',
+  measure: 'Measurement',
+  magnify: 'Magnifier',
 }
 
 export const COLORS = [
@@ -120,15 +158,19 @@ const FONT_F = [0.018, 0.028, 0.045, 0.07]
 const FONT_MIN = [14, 18, 26, 38]
 const BADGE_F = [0.009, 0.014, 0.02]
 const BADGE_MIN = [9, 12, 16]
-const longSide = (w: number, h: number) => Math.max(w, h, 1)
+/**
+ * The length annotation sizes are relative to: the width (the long side of a landscape screenshot), capped at 2.5
+ * heights for panoramas. Not the long side: a tall full-page capture would get page-height-sized arrows and badges.
+ */
+export const sizeRef = (w: number, h: number) => Math.max(1, Math.min(w, h * 2.5))
 
 /** stroke width (image px) of size step 0..2: relative to the image so a screenshot and a thumbnail both read well */
 export const strokeFor = (i: number, w: number, h: number) =>
-  Math.max(STROKE_MIN[i] ?? 4, Math.round(longSide(w, h) * (STROKE_F[i] ?? 0.005)))
+  Math.max(STROKE_MIN[i] ?? 4, Math.round(sizeRef(w, h) * (STROKE_F[i] ?? 0.005)))
 export const fontSizeFor = (i: number, w: number, h: number) =>
-  Math.max(FONT_MIN[i] ?? 18, Math.round(longSide(w, h) * (FONT_F[i] ?? 0.028)))
+  Math.max(FONT_MIN[i] ?? 18, Math.round(sizeRef(w, h) * (FONT_F[i] ?? 0.028)))
 export const badgeRadiusFor = (i: number, w: number, h: number) =>
-  Math.max(BADGE_MIN[i] ?? 12, Math.round(longSide(w, h) * (BADGE_F[i] ?? 0.014)))
+  Math.max(BADGE_MIN[i] ?? 12, Math.round(sizeRef(w, h) * (BADGE_F[i] ?? 0.014)))
 
 export function nearestIndex(value: number, options: number[]) {
   let best = 0
@@ -215,7 +257,18 @@ export function boundsOf(s: Shape, measure?: TextMeasure): Rect {
     case 'highlight':
     case 'arrow':
     case 'line':
+    case 'measure':
       return rectOf(s.a, s.b)
+    case 'magnify': {
+      const x = Math.min(s.x, s.src.x)
+      const y = Math.min(s.y, s.src.y)
+      return {
+        x,
+        y,
+        w: Math.max(s.x + s.w, s.src.x + s.src.w) - x,
+        h: Math.max(s.y + s.h, s.src.y + s.src.h) - y,
+      }
+    }
     case 'text':
       return textBounds(s, measure)
     case 'badge':
@@ -234,6 +287,7 @@ export function translateShape<T extends Shape>(s: T, dx: number, dy: number): T
     case 'highlight':
     case 'arrow':
     case 'line':
+    case 'measure':
       return {
         ...s,
         a: { x: s.a.x + dx, y: s.a.y + dy },
@@ -241,20 +295,45 @@ export function translateShape<T extends Shape>(s: T, dx: number, dy: number): T
       }
     case 'badge':
       return { ...s, cx: s.cx + dx, cy: s.cy + dy }
+    case 'magnify':
+      return {
+        ...s,
+        x: s.x + dx,
+        y: s.y + dy,
+        src: { ...s.src, x: s.src.x + dx, y: s.src.y + dy },
+      }
     default:
       return { ...s, x: (s as BoxShape).x + dx, y: (s as BoxShape).y + dy }
   }
 }
 
-/** move by (dx, dy) but keep the shape's center inside the image, so it can always be found again */
-export function moveShape(s: Shape, dx: number, dy: number, img: { w: number; h: number }): Shape {
+/** the area shapes may move in: the image, or a padded canvas (x / y default to 0) */
+export type Area = { x?: number; y?: number; w: number; h: number }
+
+/** move by (dx, dy) but keep the shape's center inside the area, so it can always be found again */
+export function moveShape(s: Shape, dx: number, dy: number, area: Area): Shape {
   const c = centerOf(boundsOf(s))
-  const nx = clamp(c.x + dx, 0, img.w)
-  const ny = clamp(c.y + dy, 0, img.h)
+  const x0 = area.x ?? 0
+  const y0 = area.y ?? 0
+  const nx = clamp(c.x + dx, x0, x0 + area.w)
+  const ny = clamp(c.y + dy, y0, y0 + area.h)
   return translateShape(s, nx - c.x, ny - c.y)
 }
 
-export type Handle = 'a' | 'b' | 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
+/** a magnifier's lens or its source area moved on its own (the other part stays) */
+export function translateMagnifyPart(
+  s: MagnifyShape,
+  part: 'lens' | 'src',
+  dx: number,
+  dy: number,
+): MagnifyShape {
+  return part === 'lens'
+    ? { ...s, x: s.x + dx, y: s.y + dy }
+    : { ...s, src: { ...s.src, x: s.src.x + dx, y: s.src.y + dy } }
+}
+
+/** `src` = the magnifier's source-size handle (its bottom-right corner) */
+export type Handle = 'a' | 'b' | 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'src'
 export interface HandlePos {
   id: Handle
   x: number
@@ -278,11 +357,54 @@ export function rectHandles(r: Rect): HandlePos[] {
   ]
 }
 
-export function handlesOf(s: Shape, measure?: TextMeasure): HandlePos[] {
+/** how far a shape's ink (stroke, halo) reaches past its geometric bounds, in image px */
+export function inkReach(s: Shape): number {
+  switch (s.kind) {
+    case 'highlight':
+      return highlightWidth(s.width) / 2
+    case 'text':
+      return Math.max(2, s.fontSize * 0.14) / 2
+    case 'badge':
+      return Math.max(2, s.r * 0.12) / 2
+    case 'fillrect':
+    case 'blur':
+      return 0
+    default:
+      return s.width / 2
+  }
+}
+
+/** screen px between a selected shape's ink and its outline */
+export const SELECTION_GAP = 4
+
+/** the selection outline's distance from the geometric bounds: clear of the ink, plus `gap` (image px) */
+export const selectionPad = (s: Shape, gap: number) =>
+  // a magnifier's two parts get their own outlines, with the handles right on them
+  s.kind === 'magnify' ? 0 : inkReach(s) + gap
+
+/** where a handle sits when the outline is pushed out by `pad`: compass handles move outward, endpoints stay */
+export function handleOutset(handle: Handle, pad: number): Pt {
+  const x = handle.includes('e') ? pad : handle.includes('w') ? -pad : 0
+  const y = handle.includes('s') ? pad : handle.includes('n') ? -pad : 0
+  return { x, y }
+}
+
+export function padRect(r: Rect, pad: number): Rect {
+  return { x: r.x - pad, y: r.y - pad, w: r.w + pad * 2, h: r.h + pad * 2 }
+}
+
+/** the handles of `s`, pushed `pad` image px out from its bounds (see selectionPad) */
+export function handlesOf(s: Shape, measure?: TextMeasure, pad = 0): HandlePos[] {
+  if (pad)
+    return handlesOf(s, measure).map((h) => {
+      const o = handleOutset(h.id, pad)
+      return { ...h, x: h.x + o.x, y: h.y + o.y }
+    })
   switch (s.kind) {
     case 'highlight':
     case 'arrow':
     case 'line':
+    case 'measure':
       return [
         { id: 'a', ...s.a },
         { id: 'b', ...s.b },
@@ -291,6 +413,11 @@ export function handlesOf(s: Shape, measure?: TextMeasure): HandlePos[] {
       const b = boundsOf(s)
       return rectHandles(b).filter((h) => h.id.length === 2)
     }
+    case 'magnify':
+      return [
+        ...rectHandles(s).filter((h) => h.id.length === 2),
+        { id: 'src', x: s.src.x + s.src.w, y: s.src.y + s.src.h },
+      ]
     case 'text': {
       const b = textBounds(s, measure)
       return [{ id: 'se', x: b.x + b.w, y: b.y + b.h }]
@@ -333,10 +460,28 @@ export function applyHandle(orig: Shape, handle: Handle, pt: Pt): Shape {
     case 'highlight':
     case 'arrow':
     case 'line':
+    case 'measure':
       return handle === 'a' ? { ...orig, a: { ...pt } } : { ...orig, b: { ...pt } }
     case 'pen': {
       const from = boundsOf(orig)
       return scalePen(orig, from, dragRectHandle(from, handle, pt))
+    }
+    case 'magnify': {
+      if (handle === 'src') {
+        const side = Math.max(MIN_BOX, pt.x - orig.src.x, pt.y - orig.src.y)
+        return { ...orig, src: { ...orig.src, w: side, h: side } }
+      }
+      // the lens stays round: the opposite corner is fixed, the bigger of the two distances is the diameter
+      const ox = handle.includes('w') ? orig.x + orig.w : orig.x
+      const oy = handle.includes('n') ? orig.y + orig.h : orig.y
+      const side = Math.max(MIN_BOX * 2, Math.abs(pt.x - ox), Math.abs(pt.y - oy))
+      return {
+        ...orig,
+        x: handle.includes('w') ? ox - side : ox,
+        y: handle.includes('n') ? oy - side : oy,
+        w: side,
+        h: side,
+      }
     }
     case 'text': {
       const lines = textLines(orig.text).length
@@ -358,7 +503,12 @@ export function resizeShapeBy(s: Shape, dw: number, dh: number): Shape {
     case 'highlight':
     case 'arrow':
     case 'line':
+    case 'measure':
       return { ...s, b: { x: s.b.x + dw, y: s.b.y + dh } }
+    case 'magnify': {
+      const side = Math.max(MIN_BOX * 2, s.w + (dw !== 0 ? dw : dh))
+      return { ...s, w: side, h: side }
+    }
     case 'pen': {
       const from = boundsOf(s)
       if (from.w === 0 && from.h === 0) return s
@@ -426,7 +576,27 @@ export function hitShape(s: Shape, p: Pt, tol: number, measure?: TextMeasure): b
     }
     case 'badge':
       return Math.hypot(p.x - s.cx, p.y - s.cy) <= s.r + tol * 0.5
+    case 'measure': {
+      const m = measureParts(s)
+      const l = m.label
+      if (p.x >= l.x - tol && p.x <= l.x + l.w + tol && p.y >= l.y - tol && p.y <= l.y + l.h + tol)
+        return true
+      if (!s.box) return distToSegment(p, s.a, s.b) <= m.tick / 2 + tol
+      return hitShape({ id: s.id, color: s.color, width: m.line, kind: 'rect', ...rectOf(s.a, s.b) }, p, tol)
+    }
+    case 'magnify':
+      return magnifyPart(s, p, tol) !== null
   }
+}
+
+/** which part of a magnifier is at `p`: the lens wins where they overlap */
+export function magnifyPart(s: MagnifyShape, p: Pt, tol: number): 'lens' | 'src' | null {
+  const r = s.w / 2
+  if (Math.hypot(p.x - (s.x + r), p.y - (s.y + r)) <= r + tol) return 'lens'
+  const q = s.src
+  if (p.x >= q.x - tol && p.x <= q.x + q.w + tol && p.y >= q.y - tol && p.y <= q.y + q.h + tol)
+    return 'src'
+  return null
 }
 
 /** the topmost shape at `p` */
@@ -442,10 +612,16 @@ export function hitTest(
 }
 
 /** the handle of `s` under `p` (within `tol` image pixels), nearest first */
-export function handleAt(s: Shape, p: Pt, tol: number, measure?: TextMeasure): Handle | null {
+export function handleAt(
+  s: Shape,
+  p: Pt,
+  tol: number,
+  measure?: TextMeasure,
+  pad = 0,
+): Handle | null {
   let best: Handle | null = null
   let bestD = Infinity
-  for (const h of handlesOf(s, measure)) {
+  for (const h of handlesOf(s, measure, pad)) {
     const d = Math.hypot(p.x - h.x, p.y - h.y)
     if (d <= tol && d < bestD) {
       best = h.id
@@ -466,6 +642,14 @@ export interface Style {
 
 export const nextBadgeNumber = (shapes: readonly Shape[]) =>
   shapes.reduce((n, s) => (s.kind === 'badge' ? Math.max(n, s.n) : n), 0) + 1
+
+export const MAX_BADGE = 999
+export const clampBadge = (n: number) => Math.min(MAX_BADGE, Math.max(1, Math.round(n) || 1))
+/** the number the next badge gets: the explicit counter, else the highest existing + 1 */
+export const badgeCounter = (d: AnnotDoc) => clampBadge(d.nextBadge ?? nextBadgeNumber(d.shapes))
+/** badge text size: shrinks at 2 and 3 digits so the number stays inside the disc */
+export const badgeFontSize = (r: number, n: number) =>
+  Math.round(r * (n >= 100 ? 0.8 : n >= 10 ? 0.95 : 1.1))
 
 /** a default-size shape of this kind centered at `c` (kept inside the image) */
 export function defaultShape(
@@ -513,6 +697,23 @@ export function defaultShape(
       }
     case 'badge':
       return { ...base, kind, cx: c.x, cy: c.y, r: style.badgeRadius, n }
+    case 'measure': {
+      const half = Math.min(img.w * 0.1, 200)
+      const y = Math.floor(c.y) + 0.5
+      return {
+        ...base,
+        kind,
+        a: { x: clamp(c.x - half, 0, img.w), y },
+        b: { x: clamp(c.x + half, 0, img.w), y },
+        box: false,
+        unit: 1,
+      }
+    }
+    case 'magnify': {
+      const side = Math.max(24, Math.round(sizeRef(img.w, img.h) * 0.05))
+      const src = clampRect({ x: c.x - side / 2, y: c.y - side / 2, w: side, h: side }, img, MIN_BOX)
+      return { ...base, kind, src, ...placeLens(src, img) }
+    }
     case 'pen':
       return {
         ...base,
@@ -539,13 +740,33 @@ export function freeSpot(shapes: readonly Shape[], kind: ShapeKind, c: Pt, step:
   return p
 }
 
-/** the shape while dragging out from `start` to `to` (rects, ellipses, blur, arrows, lines, highlights) */
-export function dragCreate(orig: Shape, start: Pt, to: Pt): Shape {
+/**
+ * the shape while dragging out from `start` to `to` (rects, ellipses, blur, arrows, lines, highlights, measurements,
+ * magnifiers); `area` is where a magnifier's lens may go
+ */
+export function dragCreate(orig: Shape, start: Pt, to: Pt, area?: Area): Shape {
   switch (orig.kind) {
     case 'highlight':
     case 'arrow':
     case 'line':
       return { ...orig, a: { ...start }, b: { ...to } }
+    case 'measure': {
+      if (orig.box) return { ...orig, a: { ...start }, b: { ...to } }
+      // a nearly level or upright line snaps to the axis: what is measured is usually a width or a height
+      const dx = to.x - start.x
+      const dy = to.y - start.y
+      const snap = Math.tan((6 * Math.PI) / 180)
+      if (Math.abs(dy) <= Math.abs(dx) * snap) return { ...orig, a: { ...start }, b: { x: to.x, y: start.y } }
+      if (Math.abs(dx) <= Math.abs(dy) * snap) return { ...orig, a: { ...start }, b: { x: start.x, y: to.y } }
+      return { ...orig, a: { ...start }, b: { ...to } }
+    }
+    case 'magnify': {
+      // the source is the square around the dragged rectangle's center, its side the longer of the two
+      const r = rectOf(start, to)
+      const side = Math.max(r.w, r.h)
+      const src = { x: r.x + r.w / 2 - side / 2, y: r.y + r.h / 2 - side / 2, w: side, h: side }
+      return { ...orig, src, ...placeLens(src, area ?? { w: Infinity, h: Infinity }) }
+    }
     case 'rect':
     case 'fillrect':
     case 'ellipse':
@@ -561,6 +782,8 @@ export function dragCreate(orig: Shape, start: Pt, to: Pt): Shape {
 export function shapeLabel(s: Shape): string {
   if (s.kind === 'text') return s.text.trim() ? `Text “${s.text.trim().slice(0, 24)}”` : 'Text'
   if (s.kind === 'badge') return `Number ${s.n}`
+  if (s.kind === 'measure') return `Measurement ${measureLabel(s)}`
+  if (s.kind === 'magnify') return `Magnifier ${Math.round((s.w / Math.max(1, s.src.w)) * 10) / 10}x`
   return KIND_NAME[s.kind]
 }
 
@@ -632,9 +855,33 @@ export function cropOutput(crop: Rect | null, img: { w: number; h: number }): Re
   const h = clamp(Math.round(crop.h), 1, img.h - y)
   return x === 0 && y === 0 && w === img.w && h === img.h ? null : { x, y, w, h }
 }
-/** what the stage shows: the whole image while the crop tool is open, else the crop (or everything) */
-export const viewRect = (tool: Tool, crop: Rect | null, img: { w: number; h: number }): Rect =>
-  tool !== 'crop' && crop ? crop : { x: 0, y: 0, w: img.w, h: img.h }
+/** what the stage shows: the whole image while the crop tool is open, else the crop (or everything) plus the padding */
+export function viewRect(tool: Tool, crop: Rect | null, img: { w: number; h: number }, pad = 0): Rect {
+  if (tool === 'crop') return { x: 0, y: 0, w: img.w, h: img.h }
+  const r = crop ?? { x: 0, y: 0, w: img.w, h: img.h }
+  return pad > 0 ? padRect(r, pad) : r
+}
+
+// ---------------------------------------------------------------------------------------- canvas + scale
+
+export const MAX_PAD = 2000
+export const MIN_SCALE = 0.05
+export const MAX_SCALE = 4
+export const padSize = (d: AnnotDoc) => clamp(Math.round(d.pad?.size ?? 0), 0, MAX_PAD)
+export const docScale = (d: AnnotDoc) => clamp(d.scale ?? 1, MIN_SCALE, MAX_SCALE)
+
+/** the exported canvas in image px: the crop (or the image) grown by the padding */
+export function canvasRect(d: AnnotDoc, img: { w: number; h: number }): Rect {
+  const r = cropOutput(d.crop, img) ?? { x: 0, y: 0, w: img.w, h: img.h }
+  return padRect(r, padSize(d))
+}
+
+/** the exported picture's size in px: the canvas times the export scale */
+export function outputSize(d: AnnotDoc, img: { w: number; h: number }): { w: number; h: number } {
+  const c = canvasRect(d, img)
+  const k = docScale(d)
+  return { w: Math.max(1, Math.round(c.w * k)), h: Math.max(1, Math.round(c.h * k)) }
+}
 
 // ------------------------------------------------------------------------------------------ stage mapping
 
@@ -731,8 +978,145 @@ export function arrowParts(a: Pt, b: Pt, width: number): { shaftEnd: Pt; head: [
   }
 }
 
-/** pixelation block size for a blur box (large enough that text inside stays unreadable) */
-export const blockSizeFor = (w: number, h: number) => clamp(Math.round(Math.min(w, h) / 5), 8, 48)
+/** a measurement's label text: the length, or W x H for a box (in the shape's unit) */
+export function measureLabel(s: MeasureShape): string {
+  const u = s.unit > 0 ? s.unit : 1
+  const dx = Math.abs(s.b.x - s.a.x) / u
+  const dy = Math.abs(s.b.y - s.a.y) / u
+  return s.box ? `${Math.round(dx)} × ${Math.round(dy)}` : `${Math.round(Math.hypot(dx, dy))}`
+}
+
+/** the label's font size for a stroke width (image px) */
+export const measureFont = (width: number) => Math.max(12, Math.round(width * 2 + 10))
+
+/**
+ * Everything a measurement draws, the same for the SVG stage and the canvas export: the main line (or the box), the end
+ * ticks across a line, and the label pill (top-left corner, size; the text is centered in it). A line's label sits beside
+ * it (above a level line, right of an upright one); a box's label sits under the box.
+ */
+export function measureParts(s: MeasureShape): {
+  line: number
+  tick: number
+  ticks: [Pt, Pt][]
+  box: Rect | null
+  label: Rect & { text: string; fontSize: number; cx: number; cy: number }
+} {
+  const fontSize = measureFont(s.width)
+  const text = measureLabel(s)
+  const line = Math.max(1, s.width * 0.5)
+  const tick = fontSize * 0.7
+  const lw = estimateTextWidth(text, fontSize) * 0.98 + fontSize * 0.9
+  const lh = fontSize * 1.35
+  const gap = fontSize * 0.25
+  if (s.box) {
+    const b = rectOf(s.a, s.b)
+    const cx = b.x + b.w / 2
+    const cy = b.y + b.h + gap + lh / 2
+    return {
+      line,
+      tick,
+      ticks: [],
+      box: b,
+      label: { x: cx - lw / 2, y: cy - lh / 2, w: lw, h: lh, text, fontSize, cx, cy },
+    }
+  }
+  const dx = s.b.x - s.a.x
+  const dy = s.b.y - s.a.y
+  const len = Math.hypot(dx, dy) || 1
+  const ux = dx / len
+  const uy = dy / len
+  // the normal pointing up (or right, for an upright line)
+  let nx = -uy
+  let ny = ux
+  if (ny > 1e-9 || (Math.abs(ny) <= 1e-9 && nx < 0)) {
+    nx = -nx
+    ny = -ny
+  }
+  const t = tick / 2
+  const ticks: [Pt, Pt][] = [s.a, s.b].map((p) => [
+    { x: p.x + nx * t, y: p.y + ny * t },
+    { x: p.x - nx * t, y: p.y - ny * t },
+  ])
+  // far enough out along the normal that the pill clears the line whatever its angle
+  const reach = t + gap + Math.abs(nx) * (lw / 2) + Math.abs(ny) * (lh / 2)
+  const cx = (s.a.x + s.b.x) / 2 + nx * reach
+  const cy = (s.a.y + s.b.y) / 2 + ny * reach
+  return {
+    line,
+    tick,
+    ticks,
+    box: null,
+    label: { x: cx - lw / 2, y: cy - lh / 2, w: lw, h: lh, text, fontSize, cx, cy },
+  }
+}
+
+/**
+ * Where a new magnifier's lens goes: 3x the source (at least 1.25x, at most 60% of the shorter side of the area), beside
+ * it on the first side with room (right, left, below, above), kept inside the area.
+ */
+export function placeLens(src: Rect, area: Area): Rect {
+  const x0 = area.x ?? 0
+  const y0 = area.y ?? 0
+  const fin = (n: number) => (Number.isFinite(n) ? n : 1e9)
+  const aw = fin(area.w)
+  const ah = fin(area.h)
+  const side = Math.max(src.w * 1.25, clamp(src.w * 3, 48, Math.max(48, Math.min(aw, ah) * 0.6)))
+  const gap = Math.max(12, side * 0.2)
+  const cx = src.x + src.w / 2 - side / 2
+  const cy = src.y + src.h / 2 - side / 2
+  const spots = [
+    { x: src.x + src.w + gap, y: cy },
+    { x: src.x - gap - side, y: cy },
+    { x: cx, y: src.y + src.h + gap },
+    { x: cx, y: src.y - gap - side },
+  ]
+  const fits = (p: Pt) => p.x >= x0 && p.y >= y0 && p.x + side <= x0 + aw && p.y + side <= y0 + ah
+  const at = spots.find(fits) ?? spots[0]!
+  return {
+    x: clamp(at.x, x0, Math.max(x0, x0 + aw - side)),
+    y: clamp(at.y, y0, Math.max(y0, y0 + ah - side)),
+    w: side,
+    h: side,
+  }
+}
+
+/**
+ * The lens drawing: its circle, the transform that maps the picture into it (image point p -> p * k + (tx, ty)) and the
+ * connector from the source square's edge to the lens's rim (null when they overlap).
+ */
+export function lensParts(s: MagnifyShape): {
+  cx: number
+  cy: number
+  r: number
+  k: number
+  tx: number
+  ty: number
+  connector: [Pt, Pt] | null
+} {
+  const r = s.w / 2
+  const cx = s.x + r
+  const cy = s.y + r
+  const k = s.w / Math.max(1e-6, s.src.w)
+  const sx = s.src.x + s.src.w / 2
+  const sy = s.src.y + s.src.h / 2
+  const dx = cx - sx
+  const dy = cy - sy
+  const d = Math.hypot(dx, dy)
+  const half = s.src.w / 2
+  // the ray from the source's center leaves its square after `exit`
+  const exit = d > 0 ? half / Math.max(Math.abs(dx) / d, Math.abs(dy) / d) : 0
+  const connector: [Pt, Pt] | null =
+    d > exit + r + 1
+      ? [
+          { x: sx + (dx / d) * exit, y: sy + (dy / d) * exit },
+          { x: cx - (dx / d) * r, y: cy - (dy / d) * r },
+        ]
+      : null
+  return { cx, cy, r, k, tx: cx - sx * k, ty: cy - sy * k, connector }
+}
+
+/** Gaussian blur radius (standard deviation, px) for a blur box of w x h px: strong enough that text inside is unreadable */
+export const blurRadiusFor = (w: number, h: number) => clamp(Math.round(Math.min(w, h) / 4), 8, 40)
 
 let seq = 0
 export const newShapeId = () => `s${Date.now().toString(36)}${(seq++).toString(36)}`

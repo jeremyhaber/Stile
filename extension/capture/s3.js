@@ -74,10 +74,13 @@ export async function presign({ method = 'GET', url, region, service = 's3', acc
 
 // ------------------------------------------------------------------ configuration
 
+/** SigV4 caps a presigned link at 7 days (AWS, R2, B2, … refuse a longer X-Amz-Expires), so a link that never expires needs a public base URL. */
+export const PRESIGN_MAX = 604800;
+
 // v3.0: no provider presets. One S3-compatible form; region and addressing are worked out from the endpoint unless overridden.
 export const DEFAULT_S3 = {
   endpoint: '', region: '', regionAuto: true, bucket: '', accessKeyId: '', secretAccessKey: '',
-  prefix: 'screenshots/{yyyy}/{mm}/', style: 'auto', naming: 'random', linkType: 'public', publicBase: '', expiry: 86400,
+  prefix: 'screenshots/{yyyy}/{mm}/', style: 'auto', naming: 'random', linkType: 'presigned', publicBase: '', expiry: PRESIGN_MAX, v: 2,
 };
 
 const hostOfEndpoint = (endpoint) => { try { return new URL(String(endpoint || '').trim()).hostname.toLowerCase(); } catch { return ''; } };
@@ -106,8 +109,14 @@ export const effectiveStyle = (cfg) => (cfg && (cfg.style === 'path' || cfg.styl
 export function migrateS3(raw) {
   const r = raw && typeof raw === 'object' ? { ...raw } : {};
   const had = 'preset' in r || 'provider' in r;
+  const old = !(Number(r.v) >= 2);
   delete r.preset; delete r.provider;
   const cfg = { ...DEFAULT_S3, ...r };
+  // v2: presigned links are the default; a saved "public" choice with no public base URL could never upload, so it moves over (once)
+  if (old) {
+    if (cfg.linkType !== 'presigned' && !String(cfg.publicBase || '').trim()) { cfg.linkType = 'presigned'; cfg.expiry = PRESIGN_MAX; }
+    cfg.v = 2;
+  }
   if (/\{region\}/.test(String(cfg.endpoint))) cfg.endpoint = String(cfg.endpoint).replace(/\{region\}/g, cfg.region || 'us-east-1');
   if (/^https:\/\/<account-id>/.test(String(cfg.endpoint))) cfg.endpoint = '';
   if (had) {
@@ -115,7 +124,7 @@ export function migrateS3(raw) {
     if (cfg.style === autoStyle(cfg.endpoint)) cfg.style = 'auto';
   }
   if (cfg.style !== 'path' && cfg.style !== 'virtual') cfg.style = 'auto';
-  return { cfg, changed: had };
+  return { cfg, changed: had || (old && Object.keys(r).length > 0) };
 }
 
 export const s3Configured = (c) => !!(c && c.endpoint && c.bucket && c.accessKeyId && c.secretAccessKey);
@@ -160,47 +169,50 @@ async function xmlError(res) {
   return new Error(`${res.status} ${res.statusText}${detail ? ' – ' + detail : ''}`.trim());
 }
 
-async function put(cfg, key, body, contentType, extra = {}) {
+async function put(cfg, key, body, contentType, extra = {}, f = fetch) {
   const url = objectUrl(cfg, key);
   const payloadHash = await sha256Hex(body);
   const signed = await signHeaders({ method: 'PUT', url, headers: { 'content-type': contentType, ...extra }, payloadHash, region: effectiveRegion(cfg), accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey });
   const { host, ...send } = signed.headers; // the browser sets Host itself
   let res;
-  try { res = await fetch(url, { method: 'PUT', headers: send, body }); } catch (e) { throw new Error(`Couldn’t reach ${new URL(url).host}: ${e.message || e}`); }
+  try { res = await f(url, { method: 'PUT', headers: send, body }); } catch (e) { throw new Error(`Couldn’t reach ${new URL(url).host}: ${e.message || e}`); }
   if (!res.ok) throw await xmlError(res);
   return url;
 }
-async function del(cfg, key) {
+async function del(cfg, key, f = fetch) {
   const url = objectUrl(cfg, key);
   const signed = await signHeaders({ method: 'DELETE', url, payloadHash: await sha256Hex(''), region: effectiveRegion(cfg), accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey });
   const { host, ...send } = signed.headers;
   let res;
-  try { res = await fetch(url, { method: 'DELETE', headers: send }); } catch (e) { throw new Error(`Couldn’t reach ${new URL(url).host}: ${e.message || e}`); }
+  try { res = await f(url, { method: 'DELETE', headers: send }); } catch (e) { throw new Error(`Couldn’t reach ${new URL(url).host}: ${e.message || e}`); }
   if (!res.ok && res.status !== 404) throw await xmlError(res);
 }
 
-/** Uploads a PNG blob; resolves { key, url } where url is the link to share (public base or presigned). */
-export async function uploadPng(cfg, blob, { date = new Date() } = {}) {
+/**
+ * Uploads a PNG blob; resolves { key, url } where url is the link to share (public base or presigned). `fetch` can be
+ * replaced (Stile.app's editor window sends the request through the app).
+ */
+export async function uploadPng(cfg, blob, { date = new Date(), fetch: f = fetch } = {}) {
   if (!s3Configured(cfg)) throw new Error('Upload isn’t set up. Add your storage details in Settings → Screenshots.');
   if (cfg.linkType !== 'presigned' && !String(cfg.publicBase || '').trim()) throw new Error('Add a public base URL in Settings → Screenshots, or switch the link type to “Presigned link”.');
   const key = objectKey(cfg, date);
   const body = new Uint8Array(await blob.arrayBuffer());
-  await put(cfg, key, body, 'image/png', { 'cache-control': 'public, max-age=31536000' });
+  await put(cfg, key, body, 'image/png', { 'cache-control': 'public, max-age=31536000' }, f);
   let url;
   if (cfg.linkType === 'presigned') {
-    const expires = Math.min(604800, Math.max(1, Number(cfg.expiry) || 86400));
+    const expires = Math.min(PRESIGN_MAX, Math.max(1, Number(cfg.expiry) || PRESIGN_MAX));
     url = (await presign({ url: objectUrl(cfg, key), region: effectiveRegion(cfg), accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey, expires })).url;
   } else url = publicLink(cfg, key);
   return { key, url };
 }
 
 /** PUT a tiny text object, then DELETE it. Rejects with the server’s own error text. */
-export async function testConnection(cfg) {
+export async function testConnection(cfg, { fetch: f = fetch } = {}) {
   if (!s3Configured(cfg)) throw new Error('Fill in the endpoint, bucket and both keys first.');
   let prefix = expandPrefix(cfg.prefix).replace(/^\/+/, '');
   if (prefix && !prefix.endsWith('/')) prefix += '/';
   const key = `${prefix}sidebar-test.txt`;
-  await put(cfg, key, enc.encode('Sidebar connection test'), 'text/plain');
-  await del(cfg, key);
+  await put(cfg, key, enc.encode('Stile connection test'), 'text/plain', {}, f);
+  await del(cfg, key, f);
   return true;
 }

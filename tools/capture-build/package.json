@@ -2,7 +2,7 @@
   "name": "sidebar-capture-build",
   "private": true,
   "type": "module",
-  "description": "Build tooling for the Sidebar screenshot editor (extension/capture/dist). Run: npm install && npm run build",
+  "description": "Build tooling for the Stile screenshot editor (extension/capture/dist). Run: npm install && npm run build",
   "scripts": {
     "build": "node ../build-capture.mjs",
     "typecheck": "tsc -p ../../extension/capture/tsconfig.json --noEmit",

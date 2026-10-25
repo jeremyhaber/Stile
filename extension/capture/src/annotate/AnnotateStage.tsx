@@ -9,19 +9,27 @@ import {
 } from 'react'
 import type { Annotator } from './useAnnotator'
 import { measureText } from './measure'
+import type { Span } from './pixels'
 import {
   FONT_STACK,
   HIGHLIGHT_ALPHA,
   LINE_HEIGHT,
   arrowParts,
+  blurRadiusFor,
   clampPan,
   clientToImage,
   commandsToD,
   fitScale,
   boundsOf,
   handlesOf,
+  padRect,
+  selectionPad,
+  SELECTION_GAP,
   highlightWidth,
+  lensParts,
   MAX_ZOOM,
+  measureParts,
+  padSize,
   pinchView,
   readableOn,
   rectHandles,
@@ -29,11 +37,14 @@ import {
   textBounds,
   textLines,
   textOverlay,
+  type MagnifyShape,
+  type MeasureShape,
   type Pt,
   type Rect,
   type Shape,
   type StageView,
   zoomAround,
+  badgeFontSize,
 } from './model'
 import s from './annotate.module.css'
 
@@ -122,20 +133,12 @@ export function ShapeView({ shape, hidden }: { shape: Shape; hidden?: boolean })
         />
       )
     case 'blur':
-      // a preview only: the pixelation itself happens when the image is exported
-      return (
-        <rect
-          x={shape.x}
-          y={shape.y}
-          width={shape.w}
-          height={shape.h}
-          fill="url(#annot-blur)"
-          stroke="#ffffff"
-          strokeWidth={2}
-          strokeDasharray="6 4"
-          vectorEffect="non-scaling-stroke"
-        />
-      )
+      // drawn by BlurView, under every other shape (the export blurs the picture before drawing annotations)
+      return null
+    case 'measure':
+      return <MeasureView shape={shape} />
+    case 'magnify':
+      return <MagnifyView shape={shape} />
     case 'text': {
       const halo = readableOn(shape.color)
       return (
@@ -176,7 +179,7 @@ export function ShapeView({ shape, hidden }: { shape: Shape; hidden?: boolean })
             y={shape.cy + shape.r * 0.04}
             textAnchor="middle"
             dominantBaseline="central"
-            fontSize={Math.round(shape.r * 1.1)}
+            fontSize={badgeFontSize(shape.r, shape.n)}
             fontWeight={700}
             fontFamily={FONT_STACK}
             fill={ink}
@@ -187,6 +190,104 @@ export function ShapeView({ shape, hidden }: { shape: Shape; hidden?: boolean })
       )
     }
   }
+}
+
+/** id of the picture-plus-blur layer a magnifier's lens shows (one stage per page) */
+export const BASE_LAYER_ID = 'annot-base'
+
+function MeasureView({ shape }: { shape: MeasureShape }) {
+  const m = measureParts(shape)
+  const l = m.label
+  return (
+    <g data-measure={shape.id}>
+      {m.box ? (
+        <rect
+          x={m.box.x}
+          y={m.box.y}
+          width={m.box.w}
+          height={m.box.h}
+          fill="none"
+          stroke={shape.color}
+          strokeWidth={m.line}
+          strokeDasharray={`${m.line * 4} ${m.line * 3}`}
+        />
+      ) : (
+        <path
+          d={[`M${shape.a.x} ${shape.a.y}L${shape.b.x} ${shape.b.y}`, ...m.ticks.map(([p, q]) => `M${p.x} ${p.y}L${q.x} ${q.y}`)].join('')}
+          fill="none"
+          stroke={shape.color}
+          strokeWidth={m.line}
+        />
+      )}
+      <rect x={l.x} y={l.y} width={l.w} height={l.h} rx={l.h * 0.3} fill={shape.color} />
+      <text
+        x={l.cx}
+        y={l.cy + l.fontSize * 0.04}
+        textAnchor="middle"
+        dominantBaseline="central"
+        fontSize={l.fontSize}
+        fontWeight={600}
+        fontFamily={FONT_STACK}
+        fill={readableOn(shape.color)}
+      >
+        {l.text}
+      </text>
+    </g>
+  )
+}
+
+/** a magnifier: the source square, a connector and the lens showing the picture (with its blurs) enlarged */
+function MagnifyView({ shape }: { shape: MagnifyShape }) {
+  const g = lensParts(shape)
+  const clip = `annot-lens-${shape.id}`
+  const thin = Math.max(1, shape.width * 0.6)
+  return (
+    <g data-magnify={shape.id}>
+      <defs>
+        <clipPath id={clip}>
+          <circle cx={g.cx} cy={g.cy} r={g.r} />
+        </clipPath>
+      </defs>
+      <rect x={shape.src.x} y={shape.src.y} width={shape.src.w} height={shape.src.h} fill="none" stroke={shape.color} strokeWidth={thin} />
+      {g.connector && (
+        <line x1={g.connector[0].x} y1={g.connector[0].y} x2={g.connector[1].x} y2={g.connector[1].y} stroke={shape.color} strokeWidth={thin} />
+      )}
+      <g clipPath={`url(#${clip})`}>
+        <circle cx={g.cx} cy={g.cy} r={g.r} fill="#ffffff" />
+        <use href={`#${BASE_LAYER_ID}`} transform={`translate(${g.tx} ${g.ty}) scale(${g.k})`} />
+      </g>
+      <circle cx={g.cx} cy={g.cy} r={g.r} fill="none" stroke={shape.color} strokeWidth={shape.width} />
+    </g>
+  )
+}
+
+/** a blur box: the picture under it, Gaussian-blurred with the same radius the export uses */
+export function BlurView({ shape, imageUrl, img }: { shape: Rect & { id: string }; imageUrl: string; img: { w: number; h: number } }) {
+  const sd = blurRadiusFor(shape.w, shape.h)
+  const pad = sd * 3
+  const id = `annot-blur-${shape.id}`
+  return (
+    <g data-blur={shape.id}>
+      <defs>
+        <clipPath id={`${id}-clip`}>
+          <rect x={shape.x} y={shape.y} width={shape.w} height={shape.h} />
+        </clipPath>
+        <filter
+          id={id}
+          filterUnits="userSpaceOnUse"
+          x={shape.x - pad}
+          y={shape.y - pad}
+          width={shape.w + 2 * pad}
+          height={shape.h + 2 * pad}
+        >
+          <feGaussianBlur stdDeviation={sd} edgeMode="duplicate" />
+        </filter>
+      </defs>
+      <g clipPath={`url(#${id}-clip)`}>
+        <image href={imageUrl} x={0} y={0} width={img.w} height={img.h} filter={`url(#${id})`} />
+      </g>
+    </g>
+  )
 }
 
 const HINTS: Record<string, string> = {
@@ -201,8 +302,14 @@ const HINTS: Record<string, string> = {
   ellipse: 'Drag to draw an ellipse, or press Enter to place one in the center.',
   text: 'Click where the text goes, or press Enter to place a text box in the center.',
   badge: 'Click to place a numbered badge, or press Enter to place the next number in the center.',
-  blur: 'Drag over what to hide, or press Enter to place a blur box in the center. It is pixelated when you replace the image.',
-  crop: 'Drag to choose the part to keep, or press Enter for a default crop. Arrow keys move it, Alt with the arrow keys resizes it.',
+  blur: 'Drag over what to hide, or press Enter to place a blur box in the center. It is blurred in the saved image too.',
+  measure:
+    'Point at something to see the distance between the edges around it; click to keep that measurement. Drag to measure any distance (or a box). Arrow keys move the pointer, Enter measures there.',
+  magnify: 'Drag over the part to enlarge, or press Enter to place a magnifier in the center. Drag the lens to move it.',
+  picker:
+    'Point at a color: Tab copies its hex code, a click also makes it the drawing color. Arrow keys move the pointer, Enter picks there.',
+  canvas: 'Set the size the picture is exported at, and add padding around it.',
+  crop: 'Drag to choose the part to keep, or press Enter for a default crop. Arrow keys move it, Alt with the arrow keys resizes it, Enter applies it.',
 }
 export const hintFor = (tool: string) => HINTS[tool] ?? ''
 
@@ -222,17 +329,17 @@ interface StageProps {
   phone: boolean
   /** filled by the stage: the zoom buttons of the dialog call these */
   controls?: MutableRefObject<StageControls | null>
-  /** Sidebar: the largest fit scale (screen px per image px). Default 4; the capture editor passes 1 / devicePixelRatio. */
+  /** Stile: the largest fit scale (screen px per image px). Default 4; the capture editor passes 1 / devicePixelRatio. */
   maxUp?: number
 }
 
 export interface StageControls {
   zoomBy: (factor: number) => void
-  /** Sidebar: zoom about a client point (wheel / pinch on a trackpad) */
+  /** Stile: zoom about a client point (wheel / pinch on a trackpad) */
   zoomAt: (factor: number, clientX: number, clientY: number) => void
-  /** Sidebar: scroll the zoomed stage (wheel) */
+  /** Stile: scroll the zoomed stage (wheel) */
   panBy: (dx: number, dy: number) => void
-  /** Sidebar: zoom so the picture's width fills the box, top edge first (tall full-page captures) */
+  /** Stile: zoom so the picture's width fills the box, top edge first (tall full-page captures) */
   fitWidth: () => void
 }
 
@@ -396,7 +503,12 @@ export function AnnotateStage({
       moveGesture()
       return
     }
-    if (capturing.current !== e.pointerId) return
+    if (capturing.current !== e.pointerId) {
+      // no button down: the probe (color readout, smart measurement) follows a mouse or pen
+      if (capturing.current === null && e.pointerType !== 'touch' && !gesture.current)
+        annot.pointer.hover(toImage(e))
+      return
+    }
     annot.pointer.move(toImage(e))
   }
   const end = (e: PointerEvent, cancelled: boolean) => {
@@ -440,6 +552,9 @@ export function AnnotateStage({
   const sw = 2
   const crop = annot.doc.crop
   const cropOpen = annot.tool === 'crop'
+  const pad = cropOpen ? 0 : padSize(annot.doc)
+  const padColor = annot.doc.pad?.color ?? 'transparent'
+  const shown = crop ?? { x: 0, y: 0, w: img.w, h: img.h }
 
   // the text box sits OUTSIDE the zoomed stage so it is never scaled below iOS's 16px zoom threshold
   const svgRect = editShape ? svgRef.current?.getBoundingClientRect() : undefined
@@ -504,6 +619,7 @@ export function AnnotateStage({
         onPointerMove={onPointerMove}
         onPointerUp={(e) => end(e, false)}
         onPointerCancel={(e) => end(e, true)}
+        onPointerLeave={() => annot.pointer.leave()}
       >
         <svg
           ref={svgRef}
@@ -514,31 +630,45 @@ export function AnnotateStage({
           aria-hidden="true"
           focusable="false"
         >
-          <defs>
-            <pattern
-              id="annot-blur"
-              width={12 / scale}
-              height={12 / scale}
-              patternUnits="userSpaceOnUse"
-            >
-              <rect width={12 / scale} height={12 / scale} fill="#ffffff" fillOpacity={0.55} />
-              <rect width={6 / scale} height={6 / scale} fill="#000000" fillOpacity={0.45} />
+          {pad > 0 && (
+            <>
+              <defs>
+                <pattern id="annot-checker" width={16 / scale} height={16 / scale} patternUnits="userSpaceOnUse">
+                  <rect width={16 / scale} height={16 / scale} fill="#ffffff" />
+                  <rect width={8 / scale} height={8 / scale} fill="#e4e4ea" />
+                  <rect x={8 / scale} y={8 / scale} width={8 / scale} height={8 / scale} fill="#e4e4ea" />
+                </pattern>
+                <clipPath id="annot-shown">
+                  <rect x={shown.x} y={shown.y} width={shown.w} height={shown.h} />
+                </clipPath>
+              </defs>
               <rect
-                x={6 / scale}
-                y={6 / scale}
-                width={6 / scale}
-                height={6 / scale}
-                fill="#000000"
-                fillOpacity={0.45}
+                data-testid="annotate-pad"
+                x={view.x}
+                y={view.y}
+                width={view.w}
+                height={view.h}
+                fill={padColor === 'transparent' ? 'url(#annot-checker)' : padColor}
               />
-            </pattern>
-          </defs>
-          <image href={imageUrl} x={0} y={0} width={img.w} height={img.h} />
+            </>
+          )}
+          <g clipPath={pad > 0 ? 'url(#annot-shown)' : undefined}>
+            <g id={BASE_LAYER_ID}>
+              <image href={imageUrl} x={0} y={0} width={img.w} height={img.h} />
+              {annot.doc.shapes.map((sh) =>
+                sh.kind === 'blur' ? <BlurView key={sh.id} shape={sh} imageUrl={imageUrl} img={img} /> : null,
+              )}
+            </g>
+          </g>
           {annot.doc.shapes.map((sh) => (
             <ShapeView key={sh.id} shape={sh} hidden={sh.id === editingId} />
           ))}
-          {sel && !editingId && !cropOpen && <Selection shape={sel} hr={hr} sw={sw} />}
-          {cropOpen && <CropOverlay crop={crop} img={img} hr={hr} />}
+          {sel && !editingId && !cropOpen && <Selection shape={sel} hr={hr} sw={sw} u={1 / scale} />}
+          {cropOpen && <CropOverlay crop={crop} img={img} hr={hr} u={1 / scale} />}
+          {annot.probe && annot.tool === 'measure' && annot.probe.span && (
+            <MeasureProbe pt={annot.probe.pt} span={annot.probe.span} unit={annot.unit} u={1 / scale} />
+          )}
+          {annot.probe && annot.tool === 'picker' && <PickerProbe pt={annot.probe.pt} u={1 / scale} />}
         </svg>
       </div>
       {editShape?.kind === 'text' && annot.editing && (
@@ -575,33 +705,45 @@ export function AnnotateStage({
   )
 }
 
-/** dashed outline + handles of the selected shape (two-tone, so they show on any picture) */
-function Selection({ shape, hr, sw }: { shape: Shape; hr: number; sw: number }) {
-  const handles = handlesOf(shape, measureText)
-  const b = boundsOf(shape, measureText)
+/**
+ * Dashed outline + handles of the selected shape (two-tone, so they show on any picture). Stroke widths are in image px
+ * (`u` = image px per screen px), not vector-effect="non-scaling-stroke": WebKit ignores the stage's CSS zoom there,
+ * so a zoomed-in selection got 8x thicker strokes.
+ */
+function Selection({ shape, hr, sw, u }: { shape: Shape; hr: number; sw: number; u: number }) {
+  // pushed clear of the shape's own stroke, so the outline never covers what it selects
+  const pad = selectionPad(shape, SELECTION_GAP * u)
+  const handles = handlesOf(shape, measureText, pad)
+  // a magnifier outlines its source and its lens separately (one box around both would cover the picture between)
+  const boxes =
+    shape.kind === 'magnify'
+      ? [shape.src, { x: shape.x, y: shape.y, w: shape.w, h: shape.h }]
+      : [padRect(boundsOf(shape, measureText), pad)]
   return (
     <g pointerEvents="none" data-testid="annotate-selection">
-      <rect
-        x={b.x}
-        y={b.y}
-        width={b.w}
-        height={b.h}
-        fill="none"
-        stroke="#ffffff"
-        strokeWidth={sw + 2}
-        vectorEffect="non-scaling-stroke"
-      />
-      <rect
-        x={b.x}
-        y={b.y}
-        width={b.w}
-        height={b.h}
-        fill="none"
-        stroke="#18181b"
-        strokeWidth={sw}
-        strokeDasharray="5 4"
-        vectorEffect="non-scaling-stroke"
-      />
+      {boxes.map((b, i) => (
+        <g key={i}>
+          <rect
+            x={b.x}
+            y={b.y}
+            width={b.w}
+            height={b.h}
+            fill="none"
+            stroke="#ffffff"
+            strokeWidth={(sw + 2) * u}
+          />
+          <rect
+            x={b.x}
+            y={b.y}
+            width={b.w}
+            height={b.h}
+            fill="none"
+            stroke="#18181b"
+            strokeWidth={sw * u}
+            strokeDasharray={`${5 * u} ${4 * u}`}
+          />
+        </g>
+      ))}
       {handles.map((h) => (
         <circle
           key={h.id}
@@ -610,10 +752,50 @@ function Selection({ shape, hr, sw }: { shape: Shape; hr: number; sw: number }) 
           r={hr}
           fill="#ffffff"
           stroke="#18181b"
-          strokeWidth={sw}
-          vectorEffect="non-scaling-stroke"
+          strokeWidth={sw * u}
         />
       ))}
+    </g>
+  )
+}
+
+/** the measure tool's live readout: the edges around the pointer, across and down, with their lengths */
+function MeasureProbe({ pt, span, unit, u }: { pt: Pt; span: Span; unit: number; u: number }) {
+  const y = Math.floor(pt.y) + 0.5
+  const x = Math.floor(pt.x) + 0.5
+  const w = Math.round((span.x2 - span.x1) / unit)
+  const h = Math.round((span.y2 - span.y1) / unit)
+  const t = 5 * u
+  const tag = (cx: number, cy: number, text: string) => {
+    const fw = (text.length * 6.6 + 10) * u
+    return (
+      <g>
+        <rect x={cx - fw / 2} y={cy - 9 * u} width={fw} height={18 * u} rx={4 * u} fill="#18181b" />
+        <text x={cx} y={cy + 0.5 * u} textAnchor="middle" dominantBaseline="central" fontSize={11 * u} fontWeight={600} fontFamily={FONT_STACK} fill="#ffffff">
+          {text}
+        </text>
+      </g>
+    )
+  }
+  const d = `M${span.x1} ${y}H${span.x2}M${span.x1} ${y - t}V${y + t}M${span.x2} ${y - t}V${y + t}M${x} ${span.y1}V${span.y2}M${x - t} ${span.y1}H${x + t}M${x - t} ${span.y2}H${x + t}`
+  return (
+    <g pointerEvents="none" data-testid="annotate-measure-probe">
+      <path d={d} fill="none" stroke="#ffffff" strokeWidth={3 * u} />
+      <path d={d} fill="none" stroke="#e5322d" strokeWidth={1.25 * u} />
+      {tag(pt.x + 16 * u + ((`${w} × ${h}`.length * 6.6 + 10) * u) / 2, pt.y + 18 * u, `${w} × ${h}`)}
+    </g>
+  )
+}
+
+/** the color picker's target: the pixel under the pointer, outlined */
+function PickerProbe({ pt, u }: { pt: Pt; u: number }) {
+  const x = Math.floor(pt.x)
+  const y = Math.floor(pt.y)
+  const s = Math.max(1, 6 * u)
+  return (
+    <g pointerEvents="none" data-testid="annotate-picker-probe">
+      <rect x={x + 0.5 - s} y={y + 0.5 - s} width={s * 2} height={s * 2} fill="none" stroke="#ffffff" strokeWidth={3 * u} />
+      <rect x={x + 0.5 - s} y={y + 0.5 - s} width={s * 2} height={s * 2} fill="none" stroke="#18181b" strokeWidth={1.25 * u} />
     </g>
   )
 }
@@ -622,10 +804,13 @@ function CropOverlay({
   crop,
   img,
   hr,
+  u,
 }: {
   crop: Rect | null
   img: { w: number; h: number }
   hr: number
+  /** image px per screen px (see Selection) */
+  u: number
 }) {
   if (!crop) return null
   const d = `M0 0H${img.w}V${img.h}H0Z M${crop.x} ${crop.y}V${crop.y + crop.h}H${crop.x + crop.w}V${crop.y}Z`
@@ -639,8 +824,7 @@ function CropOverlay({
         height={crop.h}
         fill="none"
         stroke="#ffffff"
-        strokeWidth={4}
-        vectorEffect="non-scaling-stroke"
+        strokeWidth={4 * u}
       />
       <rect
         x={crop.x}
@@ -649,9 +833,8 @@ function CropOverlay({
         height={crop.h}
         fill="none"
         stroke="#18181b"
-        strokeWidth={2}
-        strokeDasharray="6 4"
-        vectorEffect="non-scaling-stroke"
+        strokeWidth={2 * u}
+        strokeDasharray={`${6 * u} ${4 * u}`}
       />
       {rectHandles(crop).map((h) => (
         <circle
@@ -661,8 +844,7 @@ function CropOverlay({
           r={hr}
           fill="#ffffff"
           stroke="#18181b"
-          strokeWidth={2}
-          vectorEffect="non-scaling-stroke"
+          strokeWidth={2 * u}
         />
       ))}
     </g>

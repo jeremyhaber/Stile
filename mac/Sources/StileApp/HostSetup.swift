@@ -1,10 +1,58 @@
 import AppKit
 import Foundation
+import StileCore
 
 /// Launch-time housekeeping: native messaging manifest, import of the old helper's state, clean-up.
 enum HostSetup {
     static let hostName = "com.stile.helper"
-    static let extensionOrigin = "chrome-extension://ffblekellgdmlecjablfojaaadpkmdgg/"
+    /// v3.10: the ID of the unpacked extension, fixed by the key in extension/manifest.json.
+    static let unpackedExtensionID = "ffblekellgdmlecjablfojaaadpkmdgg"
+    static let extensionOrigin = "chrome-extension://" + unpackedExtensionID + "/"
+
+    // TODO: after publishing, paste the Chrome Web Store ID here (32 letters a-p, from the store URL). If the
+    // store upload reused the manifest key, it equals unpackedExtensionID. While this is the placeholder every
+    // store-install feature stays off.
+    /// v3.10: the Chrome Web Store ID of the published extension.
+    static let storeExtensionID = "REPLACE_WITH_STORE_ID"
+
+    /// v3.10: true once storeExtensionID is a real Chrome ID; the placeholder disables all store logic.
+    static var storeIDSet: Bool { ExtensionInstall.isValidID(storeExtensionID) }
+
+    /// v3.10: native messaging origins to allow: unpacked first, the store ID too when set and different.
+    static var allowedOrigins: [String] {
+        var o = [extensionOrigin]
+        if storeIDSet && storeExtensionID != unpackedExtensionID { o.append("chrome-extension://" + storeExtensionID + "/") }
+        return o
+    }
+
+    /// v3.10: IDs to look for in a profile's preferences.
+    static var knownExtensionIDs: [String] {
+        storeIDSet && storeExtensionID != unpackedExtensionID ? [unpackedExtensionID, storeExtensionID] : [unpackedExtensionID]
+    }
+
+    /// v3.10: how the extension is installed in each profile (by dir), from its Preferences and Secure Preferences.
+    /// Profiles without it are absent from the result.
+    static func installedKinds() -> [String: ExtensionInstallKind] {
+        let dataDir = (HostPaths.localState as NSString).deletingLastPathComponent
+        func read(_ path: String) -> [String: Any]? {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                  (attrs[.size] as? Int ?? 0) <= HostStore.maxPrefs,
+                  let raw = FileManager.default.contents(atPath: path) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any]
+        }
+        var out: [String: ExtensionInstallKind] = [:]
+        for p in HostStore.readProfiles(withExtras: false) {
+            guard let dir = p["dir"] as? String, !dir.isEmpty, !dir.contains("/"), !dir.contains("\\"),
+                  dir != ".", dir != ".." else { continue }
+            let base = dataDir + "/" + dir
+            if let k = ExtensionInstall.installKind(preferences: read(base + "/Preferences"),
+                                                    securePreferences: read(base + "/Secure Preferences"),
+                                                    ids: knownExtensionIDs) {
+                out[dir] = k
+            }
+        }
+        return out
+    }
 
     static func runAtLaunch() {
         let fm = FileManager.default
@@ -49,7 +97,7 @@ enum HostSetup {
             "description": "Stile",
             "path": exe,
             "type": "stdio",
-            "allowed_origins": [extensionOrigin],
+            "allowed_origins": allowedOrigins,
         ]
         let dir = HostPaths.nativeMessagingDir
         let file = dir + "/" + hostName + ".json"
@@ -138,6 +186,15 @@ enum HostActions {
         }
     }
 
+    /// v3.10: opens the extension's Chrome Web Store page in a window of the given profile (user-initiated).
+    static func openStorePage(profileDir: String) {
+        guard HostSetup.storeIDSet else { return }
+        let url = "https://chromewebstore.google.com/detail/" + HostSetup.storeExtensionID
+        if let err = launchChrome(args: ["--profile-directory=\(profileDir)", url]) {
+            Log.write("setup: cannot open the store page: \(err)")
+        }
+    }
+
     static var bundledExtensionURL: URL? {
         Bundle.main.resourceURL?.appendingPathComponent("extension", isDirectory: true)
     }
@@ -168,6 +225,20 @@ enum SetupCard {
             let label = candidates.count == 1 ? "Open chrome://extensions" : "Open chrome://extensions in \(esc(c.name))"
             buttons += "<button data-dir=\"\(esc(c.dir))\" onclick=\"post('openExtensions', this.getAttribute('data-dir'))\">\(label)</button>\n"
         }
+        // v3.10: with a store ID, "Add from Chrome Web Store" leads and the unpacked steps get a subheading.
+        // Both stay empty with the placeholder, which keeps the output unchanged.
+        var storeBlock = ""
+        var devHeading = ""
+        var storeCSS = ""
+        if HostSetup.storeIDSet {
+            for c in candidates {
+                let label = candidates.count == 1 ? "Add from Chrome Web Store" : "Add from Chrome Web Store in \(esc(c.name))"
+                storeBlock += "<button class=\"primary\" data-dir=\"\(esc(c.dir))\" onclick=\"post('openStore', this.getAttribute('data-dir'))\">\(label)</button>\n"
+            }
+            storeBlock = "<div class=\"store\">\(storeBlock)</div>"
+            devHeading = "<h2>Developer: load unpacked</h2>"
+            storeCSS = "h2{font-size:11px;font-weight:600;margin:18px 0 8px;opacity:.6}.store{margin-bottom:4px}button.primary{background:rgba(10,132,255,.9);color:#fff}button.primary:hover{background:rgba(10,132,255,1)}"
+        }
         return """
         <!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
         <style>
@@ -182,11 +253,11 @@ enum SetupCard {
         button{display:block;margin-top:6px;font:inherit;padding:5px 10px;border-radius:8px;border:0;
           background:rgba(128,128,128,.22);color:inherit;cursor:pointer;text-align:left}
         button:hover{background:rgba(128,128,128,.34)}
-        p{opacity:.65;line-height:1.4}
+        p{opacity:.65;line-height:1.4}\(storeCSS)
         @media (max-width:120px){.card{display:none}.mini{display:flex}}
         </style>
         <div class="mini" title="Add the Stile extension to this profile">+</div>
-        <div class="card"><h1>Add the Stile extension to this profile</h1>
+        <div class="card"><h1>Add the Stile extension to this profile</h1>\(storeBlock)\(devHeading)
         <ol>
         <li>Open the extensions page<span>chrome://extensions</span>
         \(buttons)</li>

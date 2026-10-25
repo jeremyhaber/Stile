@@ -1,10 +1,10 @@
 // Settings window (v3.0). An extension page opened by the sidebar's gear in its own popup window.
 // Left navigation + one pane per section. App-only settings go through the service worker (`appSetting`),
-// which relays them to Sidebar.app; the app's latest state comes back as `appState`.
-import { ARCHIVE_CHOICES, DEFAULT_ARCHIVE_MINUTES, fmtMinutes, resolveStyle, onColor, PROFILE_COLORS, PROFILE_GLYPHS } from './shared.js';
+// which relays them to Stile.app; the app's latest state comes back as `appState`.
+import { ARCHIVE_CHOICES, DEFAULT_ARCHIVE_MINUTES, STILE_APP_URL, fmtMinutes, resolveStyle, onColor, PROFILE_COLORS, PROFILE_GLYPHS } from './shared.js';
 import { icon } from './icons.js';
 import { renderBoostSettings } from './boost-view.js';
-import { renderCaptureSettings } from './capture/capture-view.js';
+import { renderCaptureSettings, renderRecordingSettings } from './capture/capture-view.js';
 
 const $ = (id) => document.getElementById(id);
 function h(tag, props = {}, ...kids) {
@@ -30,23 +30,29 @@ function toast(msg, ms = 3200) {
 
 // ------------------------------------------------------------------ state
 const S = {
-  helper: null, app: null,
+  helper: null, app: null, appEverConnected: false,
   archiveMinutes: null, globalMinutes: DEFAULT_ARCHIVE_MINUTES, archiveGrouped: false, mergeOnClose: true, pinnedReset: true,
   sidebarColor: { mode: 'auto' }, ownStyle: null, overlayEnabled: true, defaultBrowser: false,
-  littleStyle: 'minimal', littleMaxOpen: 3, temporaryMinutes: 360, styleEditing: null
+  littleStyle: 'minimal', littleMaxOpen: 3, temporaryMinutes: 360, styleEditing: null,
+  connectedProfiles: null, scopeProfile: null   // app-hosted only: which profiles have a live extension, and the one this page is scoped to
 };
+// Stile.app's own window loads this page with a bridge to one profile's extension (`host=app&profile=<dir>`).
+const QS = new URLSearchParams(location.search);
+const APP_HOST = QS.get('host') === 'app' && !!QS.get('profile');
+const native = (msg) => window.webkit.messageHandlers.stileSettings.postMessage(msg);
 const HEX6 = /^#[0-9a-f]{6}$/i;
 const normSidebarColor = (v) => (v && v.mode === 'custom' && typeof v.color === 'string' && HEX6.test(v.color) ? { mode: 'custom', color: v.color.toLowerCase() } : { mode: 'auto' });
 
 async function load() {
   const [ses, loc, syn] = await Promise.all([
     chrome.storage.session.get(['helper', 'appState']).catch(() => ({})),
-    chrome.storage.local.get(['globalDefaultMinutes', 'overlayEnabled', 'defaultBrowser']).catch(() => ({})),
+    chrome.storage.local.get(['globalDefaultMinutes', 'overlayEnabled', 'defaultBrowser', 'appEverConnected']).catch(() => ({})),
     chrome.storage.sync.get(['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'sidebarColor', 'littleStyle', 'littleMaxOpen', 'temporaryMinutes', 'pinnedResetOnRestart']).catch(() => ({}))
   ]);
   S.helper = ses.helper || null;
   S.app = ses.appState && typeof ses.appState === 'object' ? ses.appState : null;
   S.globalMinutes = typeof loc.globalDefaultMinutes === 'number' ? loc.globalDefaultMinutes : DEFAULT_ARCHIVE_MINUTES;
+  S.appEverConnected = !!loc.appEverConnected;
   S.overlayEnabled = loc.overlayEnabled !== false;
   S.defaultBrowser = !!loc.defaultBrowser;
   S.archiveMinutes = syn.archiveMinutes === undefined ? null : syn.archiveMinutes;
@@ -72,7 +78,6 @@ const appOn = () => connected() && !!S.app;   // the app is running and has repo
 
 // ------------------------------------------------------------------ building blocks
 const NAV = [
-  ['general', 'General', '#8e8e93', 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c2.5 2.4 3.8 5.4 3.8 9S14.5 18.6 12 21c-2.5-2.4-3.8-5.4-3.8-9S9.5 5.4 12 3z'],
   ['appearance', 'Appearance', '#bf5af2', 'M12 3a9 9 0 1 0 0 18c1.2 0 2-.8 2-1.8 0-.5-.2-.9-.5-1.3-.3-.4-.5-.8-.5-1.3 0-1 .8-1.8 1.8-1.8H17a4 4 0 0 0 4-4C21 6.6 17 3 12 3z'],
   ['tabs', 'Tabs & Archive', '#ff9f0a', 'M3 5h18v4H3zM5 9v10h14V9M10 13h4'],
   ['windows', 'Windows', '#0a84ff', 'M3 5h18v14H3zM3 9h18'],
@@ -82,6 +87,10 @@ const NAV = [
   ['profiles', 'Profiles', '#5e5ce6', 'M12 4a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM4 20c0-4 3.6-6 8-6s8 2 8 6'],
   ['app', 'App', '#32d74b', 'M5 4h14a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zM4 9h16M8 6.5h.01']
 ];
+// What a section's settings apply to: every profile, one profile, or both (an app-wide row among per-profile ones).
+// Screenshots are app-owned (global) while Stile.app is connected, and per-profile storage otherwise.
+const SCOPE = { appearance: 'profile', tabs: 'mixed', windows: 'profile', little: 'mixed', screenshots: 'profile', boosts: 'profile', profiles: 'global', app: 'global' };
+const scopeOf = (id) => (id === 'screenshots' && connected() ? 'global' : SCOPE[id] || 'profile');
 const svgOf = (d) => { const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); s.setAttribute('viewBox', '0 0 24 24'); s.setAttribute('fill', 'none'); s.setAttribute('stroke', 'currentColor'); s.setAttribute('stroke-width', '2'); s.setAttribute('stroke-linecap', 'round'); s.setAttribute('stroke-linejoin', 'round'); const p = document.createElementNS('http://www.w3.org/2000/svg', 'path'); p.setAttribute('d', d); s.append(p); return s; };
 
 const R = {};   // element refs by key
@@ -111,32 +120,12 @@ function fillOptions(s, opts, cur) {
 }
 const appSetting = async (name, value) => {
   const r = await cmd('appSetting', { name, value });
-  if (!r || !r.ok) toast((r && r.error) || 'Sidebar.app didn’t respond');
+  if (!r || !r.ok) toast((r && r.error) || 'Stile.app didn’t respond');
   return r;
 };
 
 // ------------------------------------------------------------------ sections
 const sections = {};
-
-sections.general = () => {
-  const root = h('section', { 'data-testid': 'settings-section-general' });
-  const [pickWrap, pick] = sel('settings-profile-picker', (v) => { if (v) cmd('setProfileDir', { dir: v }); });
-  R.pick = pick;
-  R.curProfile = h('span', { class: 'status', 'data-testid': 'settings-current-profile' });
-  const shortcutBtn = h('button', { type: 'button', class: 'btn', 'data-testid': 'shortcut-button', text: 'Change…', onclick: () => chrome.tabs.create({ url: 'chrome://extensions/shortcuts' }).catch(() => {}) });
-  const leftBtn = h('button', { type: 'button', class: 'btn', 'data-testid': 'left-button', text: 'Show panel on the left', onclick: () => chrome.tabs.create({ url: 'chrome://settings/appearance' }).catch(() => {}) });
-  root.append(
-    group(
-      setRow('This profile', 'Which Chrome profile this window belongs to.', [R.curProfile, pickWrap], { key: 'rowProfile' })
-    ),
-    R.kbd = h('div', {}, groupHead('In Chrome’s side panel'),
-      group(
-        setRow('Keyboard shortcut', 'Opens and closes the Sidebar panel.', shortcutBtn),
-        setRow('Panel position', 'Set Side panel to Left in Chrome’s appearance settings.', leftBtn)
-      ))
-  );
-  return root;
-};
 
 sections.appearance = () => {
   const root = h('section', { 'data-testid': 'settings-section-appearance' });
@@ -157,10 +146,7 @@ sections.appearance = () => {
   R.sbcCustom = h('div', { class: 'row block', 'data-testid': 'sidebar-color-custom' }, R.sbcSwatches,
     h('div', { class: 'sbc-pick', style: 'margin-top:12px' }, h('span', { text: 'Any colour' }), R.sbcPicker));
   const colourRow = h('div', { class: 'row' }, h('div', { class: 'lbl' }, h('div', { class: 't', text: 'Sidebar colour' }), R.sbcNote), h('div', { class: 'ctl' }, R.sbcMode));
-  R.pinned = sw('app-pinned', (v) => appSetting('setPinned', v));
-  R.pinnedRow = setRow('Keep the sidebar open', 'Stays beside the page. Off collapses it to a slim strip that opens when you point at it.', R.pinned, { key: 'pinnedRowEl' });
-  R.pinnedHint = h('p', { class: 'note', 'data-testid': 'app-needed-appearance' });
-  root.append(groupHead('Colour'), h('div', { class: 'group' }, colourRow, R.sbcCustom), groupHead('Behaviour'), group(R.pinnedRow), R.pinnedHint);
+  root.append(groupHead('Colour'), h('div', { class: 'group' }, colourRow, R.sbcCustom));
   return root;
 };
 
@@ -171,11 +157,22 @@ sections.tabs = () => {
   R.archProfile = ps; R.archGlobal = gs;
   R.archGrouped = sw('settings-archive-grouped', (v) => { S.archiveGrouped = v; syncSet({ archiveGrouped: v }); });
   R.pinnedReset = sw('pinned-reset-on-restart', (v) => { S.pinnedReset = v; syncSet({ pinnedResetOnRestart: v }); });
+  R.applyAll = h('button', { type: 'button', class: 'btn', 'data-testid': 'archive-apply-all', text: 'Apply to all profiles', onclick: async () => {
+    const r = await cmd('clearArchiveOverrides');
+    if (!r || !r.ok) { toast((r && r.error) || 'Stile.app didn’t respond'); return; }
+    toast(`All profiles now use ${fmtMinutes(S.globalMinutes)}`);
+    refresh();
+  } });
+  R.profHead = groupHead('This profile');
   root.append(
-    groupHead('Archive'),
+    groupHead('All profiles'),
     group(
-      setRow('Archive tabs after', 'Unused tabs in this profile move to the archive. Tabs pinned to Favourites or Pinned are never archived.', pw),
-      setRow('Default for all profiles', '', gw, { descKey: 'globalHint', descTestid: 'global-hint' }),
+      setRow('Archive tabs after', 'Unused tabs move to the archive. Tabs in Favourites and Pinned are never archived.', gw, { key: 'globalRow' }),
+      setRow('Apply to all profiles', 'Clears every profile’s own setting so they all use this one.', R.applyAll, { key: 'applyRow' })
+    ),
+    R.profHead,
+    group(
+      setRow('Archive tabs after', 'Overrides the default for this profile only.', pw),
       setRow('Also archive tabs in groups', 'Tabs inside tab groups are kept by default, including when you press Clear.', R.archGrouped)
     ),
     groupHead('Pinned tabs'),
@@ -191,7 +188,8 @@ sections.windows = () => {
   fillOptions(gbSel, [['full', 'Full screen'], ['fill', 'Fill screen']], 'full');
   R.greenSel = gbSel;
   R.greenRow = setRow('Green button', 'What the green window button does in Chrome. Fill screen enlarges the window to the screen without entering full screen.', gbWrap);
-  root.append(group(setRow('Move tabs back when a pop-out closes', 'Closing a pop-out with a single tab archives that tab instead. The main window is the first window of the session; right-click a window in Today to change it.', R.mergeOnClose), R.greenRow));
+  // The green button always fills the screen now (Stile doesn't run in full screen), so the choice is gone.
+  root.append(group(setRow('Move tabs back when a pop-out closes', 'Closing a pop-out with a single tab archives that tab instead. The main window is the first window of the session; right-click a window in Today to change it.', R.mergeOnClose)));
   return root;
 };
 
@@ -207,15 +205,17 @@ sections.little = () => {
   const [mw, ms] = sel('little-max-open', (v) => { S.littleMaxOpen = Number(v); syncSet({ littleMaxOpen: S.littleMaxOpen }); });
   const [ew, es] = sel('temporary-expiry', (v) => { S.temporaryMinutes = Number(v); syncSet({ temporaryMinutes: S.temporaryMinutes }); });
   R.littleMax = ms; R.littleExpiry = es;
+  R.littleProfHead = groupHead('This profile');
   root.append(
-    group(setRow('Open links from other apps in little windows', '', R.littleDefault, { descKey: 'littleDefaultHint', descTestid: 'little-default-hint' })),
-    groupHead('Windows'),
+    groupHead('All profiles'),
+    group(setRow('Open links from other apps in little windows', '', R.littleDefault, { descKey: 'littleDefaultHint', descTestid: 'little-default-hint', key: 'littleDefaultRow' })),
+    R.littleProfHead,
     group(
       setRow('Window style', '', R.littleStyle, { descKey: 'littleStyleHint' }),
       setRow('Keep open at most', 'Older little windows close, and their links stay in Temporary.', mw),
       setRow('Move temporary links to Archive after', '', ew)
     ),
-    h('p', { class: 'note', text: 'Control+Option+N opens a little window from anywhere.' })
+    R.littleHotkey = h('p', { class: 'note', 'data-testid': 'little-hotkey-note', text: 'Control+Option+N opens a little window from anywhere.' })
   );
   R.littleStyleHint.id = 'little-style-hint';
   return root;
@@ -224,7 +224,8 @@ sections.little = () => {
 sections.screenshots = () => {
   const root = h('section', { 'data-testid': 'settings-section-screenshots' });
   R.capHost = h('div');
-  root.append(R.capHost);
+  R.recHost = h('div');   // recording defaults: shown while Stile.app owns the capture settings
+  root.append(R.capHost, R.recHost);
   return root;
 };
 sections.boosts = () => {
@@ -248,8 +249,8 @@ sections.app = () => {
   R.helperRetry = h('button', { type: 'button', class: 'btn', 'data-testid': 'helper-retry', text: 'Retry', onclick: () => cmd('retryHelper') });
   R.overlayEnabled = sw('overlay-enabled', async (v) => { const r = await cmd('setOverlayEnabled', { enabled: v }); if (!r || !r.ok) refresh(); });
   R.login = sw('app-launch-login', (v) => appSetting('setLaunchAtLogin', v));
-  R.lockstep = sw('app-lockstep', (v) => appSetting('setLockstep', v));
   R.menubar = sw('app-menubar-icon', (v) => appSetting('setShowMenuBarIcon', v));
+  R.useChrome = sw('app-use-chrome', (v) => appSetting('setUseChrome', v));
   R.axDot = h('span', { class: 'status-dot' });
   R.axStatus = h('span', { 'data-testid': 'app-accessibility' });
   R.axOpen = h('button', { type: 'button', class: 'btn', 'data-testid': 'app-accessibility-open', text: 'Open settings', onclick: () => appSetting('openAccessibilitySettings', true) });
@@ -259,37 +260,50 @@ sections.app = () => {
   R.rescan = h('button', { type: 'button', class: 'btn', 'data-testid': 'app-rescan', text: 'Find again', onclick: () => appSetting('rescanRail', true) });
   R.review = h('button', { type: 'button', class: 'btn', 'data-testid': 'app-review-permissions', text: 'Review permissions…', onclick: () => appSetting('reviewPermissions', true) });
   R.version = h('span', { class: 'status', 'data-testid': 'app-version' });
-  R.quit = h('button', { type: 'button', class: 'btn danger', 'data-testid': 'app-quit', text: 'Quit Sidebar', onclick: async () => {
-    if (R.quit.dataset.armed !== '1') { R.quit.dataset.armed = '1'; R.quit.textContent = 'Click again to quit'; setTimeout(() => { R.quit.dataset.armed = ''; R.quit.textContent = 'Quit Sidebar'; }, 3500); return; }
-    R.quit.dataset.armed = ''; R.quit.textContent = 'Quit Sidebar';
+  R.quit = h('button', { type: 'button', class: 'btn danger', 'data-testid': 'app-quit', text: 'Quit Stile', onclick: async () => {
+    if (R.quit.dataset.armed !== '1') { R.quit.dataset.armed = '1'; R.quit.textContent = 'Click again to quit'; setTimeout(() => { R.quit.dataset.armed = ''; R.quit.textContent = 'Quit Stile'; }, 3500); return; }
+    R.quit.dataset.armed = ''; R.quit.textContent = 'Quit Stile';
     appSetting('quitApp', true);
   } });
+  const [pickWrap, pick] = sel('settings-profile-picker', (v) => { if (v) cmd('setProfileDir', { dir: v }); });
+  R.pick = pick;
+  R.curProfile = h('span', { class: 'status', 'data-testid': 'settings-current-profile' });
+  const shortcutBtn = h('button', { type: 'button', class: 'btn', 'data-testid': 'shortcut-button', text: 'Change…', onclick: () => chrome.tabs.create({ url: 'chrome://extensions/shortcuts' }).catch(() => {}) });
+  const leftBtn = h('button', { type: 'button', class: 'btn', 'data-testid': 'left-button', text: 'Show panel on the left', onclick: () => chrome.tabs.create({ url: 'chrome://settings/appearance' }).catch(() => {}) });
   R.appNeeded = h('p', { class: 'note', 'data-testid': 'app-needed' });
   R.appRows = [];
   const arow = (label, desc, ctl, o) => { const r = setRow(label, desc, ctl, o); R.appRows.push(r); return r; };
   root.append(
     group(
-      setRow('Sidebar app', '', [h('span', { class: 'status' }, R.helperDot, R.helperStatus), R.helperRetry]),
+      setRow('Stile app', '', [h('span', { class: 'status' }, R.helperDot, R.helperStatus), R.helperRetry]),
       setRow('Show sidebar over Chrome’s tabs', 'Covers Chrome’s own tab rail with this sidebar.', R.overlayEnabled, { key: 'overlayRow' })
     ),
     R.appNeeded,
     groupHead('Behaviour'),
     group(
-      arow('Launch at login', 'Starts Sidebar.app when you sign in.', R.login),
-      arow('Move Chrome and the sidebar together', 'Sidebar.app moves Chrome’s window itself while you drag it, so the two stay together. Turn off if window snapping or other window tools misbehave.', R.lockstep),
-      arow('Show menu bar icon', 'Puts Sidebar in the menu bar, with shortcuts for the sidebar, settings and quitting.', R.menubar)
+      arow('Launch at login', 'Starts Stile.app when you sign in.', R.login),
+      arow('Use Stile with Chrome', 'On: the sidebar over Chrome’s tabs, plus screenshots. Off: capture only; Chrome keeps its own tabs and Stile.app just takes screenshots from the menu bar.', R.useChrome),
+      arow('Show menu bar icon', 'Puts Stile in the menu bar, with shortcuts for the sidebar, settings and quitting.', R.menubar)
     ),
     groupHead('Permissions'),
     group(
-      arow('Accessibility', 'Lets Sidebar follow and move Chrome’s windows.', [h('span', { class: 'status' }, R.axDot, R.axStatus), R.axOpen]),
-      arow('Match Chrome’s colour exactly', 'Needs Screen Recording permission. Sidebar only looks at Chrome’s window.', [R.scStatus, R.scOn], { descKey: 'scNote', descTestid: 'app-screen-capture-note' }),
+      arow('Accessibility', 'Lets Stile follow and move Chrome’s windows.', [h('span', { class: 'status' }, R.axDot, R.axStatus), R.axOpen]),
+      arow('Match Chrome’s colour exactly', 'Needs Screen Recording permission, which also lets Stile take screenshots of other apps.', [R.scStatus, R.scOn], { descKey: 'scNote', descTestid: 'app-screen-capture-note' }),
       arow('Permissions overview', 'Accessibility, Screen Recording, launch at login and the Chrome extension in one place.', R.review)
     ),
     R.floatNote,
     groupHead('Chrome’s tab rail'),
     group(arow('Find Chrome’s tab rail again', 'Use this if Chrome’s vertical tabs moved and the sidebar no longer lines up.', R.rescan)),
     groupHead('About'),
-    group(arow('Version', '', R.version), arow('Quit Sidebar', 'The sidebar disappears until you open Sidebar.app again.', R.quit))
+    group(arow('Version', '', R.version), arow('Quit Stile', 'The sidebar disappears until you open Stile.app again.', R.quit)),
+    // side-panel mode only (the overlay replaces the side panel)
+    R.kbdHead = groupHead('Chrome’s side panel'),
+    group(
+      R.kbdRow = setRow('Keyboard shortcut', 'Opens and closes the sidebar.', shortcutBtn),
+      R.leftRow = setRow('Panel position', 'Set Side panel to Left in Chrome’s appearance settings.', leftBtn)
+    ),
+    R.tsHead = groupHead('Troubleshooting'),
+    group(R.rowProfile = setRow('Chrome profile', 'Stile matches this extension to a Chrome profile by its signed-in account. Change this only if the names look wrong.', [R.curProfile, pickWrap]))
   );
   return root;
 };
@@ -324,10 +338,11 @@ function drawColour() {
 function drawLittle() {
   const c = connected();
   R.littleDefault.checked = c && S.defaultBrowser;
-  R.littleDefault.disabled = !c;
-  R.littleDefaultHint.textContent = c
-    ? 'Sidebar.app asks macOS to make it your default browser; links it can’t show go to Chrome as usual.'
-    : 'Needs Sidebar.app. Open it, then turn this on.';
+  R.littleDefaultRow.hidden = !c;   // app-only: hidden until Stile.app is connected
+  const cp = currentProfile();
+  R.littleProfHead.textContent = cp && !cp.own ? cp.p.name || cp.dir : 'This profile';
+  R.littleHotkey.hidden = !c;
+  R.littleDefaultHint.textContent = 'Stile.app asks macOS to make it your default browser; links it can’t show go to Chrome as usual.';
   setSegPressed(R.littleStyle, 'style', S.littleStyle);
   R.littleStyleHint.textContent = S.littleStyle === 'minimal'
     ? 'Just the page and a slim address bar. “Make full tab” reopens the page in your main window.'
@@ -389,7 +404,7 @@ function drawProfiles() {
   const kids = [];
   for (const en of entries) {
     const open = S.styleEditing === en.dir;
-    const sub = en.own ? 'Without Sidebar.app, only this profile can be styled' : (en.p.email || (en.current ? 'This profile' : ''));
+    const sub = en.own ? 'Without Stile.app, only this profile can be styled' : (en.p.email || (en.current ? 'This profile' : ''));
     kids.push(h('button', { type: 'button', class: 'pstyle-row', 'aria-expanded': open ? 'true' : 'false', 'data-testid': 'profile-style-row', 'data-dir': en.dir, onclick: () => { S.styleEditing = open ? null : en.dir; drawProfiles(); } },
       avatarEl('span', en.p, en.style, { 'aria-hidden': 'true' }, true),
       h('span', { class: 'pname' }, en.p.name || en.dir, sub ? h('small', { text: en.current && en.p.email ? `${en.p.email} · this profile` : sub }) : null),
@@ -406,20 +421,20 @@ function drawApp() {
   const st = R.helperStatus;
   if (!hs || !hs.status) st.textContent = 'Checking…';
   else if (hs.status === 'connected') st.textContent = 'Connected';
-  else if (hs.status === 'not_installed') st.textContent = 'Not running. Open Sidebar.app, then Retry';
+  else if (hs.status === 'not_installed') st.textContent = S.appEverConnected ? 'Not running. Open Stile.app, then Retry' : 'Not installed';
   else st.textContent = `Error: ${hs.error || 'unknown'}`;
   st.dataset.status = (hs && hs.status) || 'checking';
   R.helperRetry.hidden = c;
   R.overlayRow.hidden = !c;
   R.overlayEnabled.checked = S.overlayEnabled;
   const on = appOn();
-  for (const r of R.appRows) { r.classList.toggle('disabled', !on); for (const b of r.querySelectorAll('button, input')) b.disabled = !on; }
-  R.appNeeded.textContent = on ? '' : (c ? 'Waiting for Sidebar.app’s status…' : 'Open Sidebar.app to change these settings.');
-  R.appNeeded.hidden = on;
+  for (const r of R.appRows) { r.hidden = !c; r.classList.toggle('disabled', !on); for (const b of r.querySelectorAll('button, input')) b.disabled = !on; }
+  R.appNeeded.textContent = on || !c ? '' : 'Waiting for Stile.app’s status…';
+  R.appNeeded.hidden = on || !c;
   const a = S.app || {};
   R.login.checked = !!a.launchAtLogin;
-  R.lockstep.checked = a.lockstep !== false;
   R.menubar.checked = a.showMenuBarIcon !== false;
+  R.useChrome.checked = a.useChrome !== false;
   const ax = on ? (typeof a.accessibility === 'boolean' ? a.accessibility : null) : null;
   R.axStatus.textContent = ax === true ? 'Granted' : ax === false ? 'Needed' : 'Unknown';
   R.axDot.className = 'status-dot' + (ax === true ? ' ok' : ax === false ? ' bad' : '');
@@ -431,52 +446,117 @@ function drawApp() {
   R.scOn.hidden = sc === true;
   R.scNote.hidden = sc === true;
   R.floatNote.hidden = !(on && a.railFound !== false && a.railControllable === false);
-  R.version.textContent = a.appVersion ? `Sidebar ${a.appVersion}` : '';
+  R.version.textContent = a.appVersion ? `Stile ${a.appVersion}` : '';
   // Windows: green button
   if (R.greenSel) { R.greenSel.value = a.greenButtonAction === 'fill' ? 'fill' : 'full'; R.greenSel.disabled = !on; }
-  // Appearance: pinned sidebar
-  R.pinned.checked = a.state === 'pinned' || (a.state === undefined && a.pinned === true);
-  R.pinned.disabled = !on;
-  R.pinnedRowEl.classList.toggle('disabled', !on);
-  R.pinnedHint.textContent = on ? '' : 'Needs Sidebar.app.';
-  R.pinnedHint.hidden = on;
 }
 
-function drawGeneral() {
+function drawTroubleshoot() {
   const c = connected();
   const ps = profiles();
   const cur = currentProfile();
   R.rowProfile.hidden = !c || !ps.length;
+  R.kbdRow.hidden = R.leftRow.hidden = !c || S.overlayEnabled;   // useful in side-panel mode only
   const dir = (S.helper && S.helper.currentProfileDir) || '';
   const opts = [];
   if (!dir || !ps.some((p) => p.dir === dir)) opts.push(['', 'Choose…']);
   for (const p of ps) opts.push([p.dir, p.name + (p.email ? ` (${p.email})` : '')]);
   fillOptions(R.pick, opts, ps.some((p) => p.dir === dir) ? dir : '');
   R.curProfile.replaceChildren(cur && !cur.own ? avatarEl('span', cur.p, cur.style, { 'aria-hidden': 'true' }) : '');
-  R.kbd.hidden = appOn();
+}
+
+// Pane header: which profile the section's settings apply to (a picker), or an "All profiles" chip.
+function drawScope() {
+  const box = $('pane-scope');
+  const kind = scopeOf(current);
+  box.dataset.kind = kind;
+  if (kind === 'global') { box.replaceChildren(h('span', { class: 'scope-chip', 'data-testid': 'settings-scope-global', text: 'All profiles' })); return; }
+  const ps = profiles();
+  const cur = currentProfile();
+  const dir = APP_HOST ? (S.scopeProfile || (S.helper && S.helper.currentProfileDir) || '') : (cur && !cur.own ? cur.dir : '');
+  if (!R.scopeSel) {
+    const [wrap, s] = sel('settings-scope', async (v) => {
+      if (!APP_HOST || !v || v === S.scopeProfile) return;
+      try { await native({ op: 'selectProfile', dir: v, section: current }); }
+      catch (e) { toast(String((e && e.message) || e)); drawScope(); }
+    });
+    s.setAttribute('aria-label', 'Settings for profile');
+    R.scopeSel = s; R.scopeAv = h('span', { class: 'scope-av' });
+    R.scopeBox = h('span', { class: 'scope-pick' }, h('span', { class: 'scope-lbl', text: 'Settings for' }), R.scopeAv, wrap);
+  }
+  const off = (p) => APP_HOST && !!S.connectedProfiles && !S.connectedProfiles.includes(p.dir) && p.dir !== dir;   // not open in Chrome (never the scoped one)
+  const list = APP_HOST ? ps : ps.filter((p) => p.dir === dir);
+  const opts = list.length ? list.map((p) => [p.dir, p.name + (p.email ? ` (${p.email})` : '') + (off(p) ? ' — not open in Chrome' : '')]) : [['', cur && !cur.own ? cur.p.name || cur.dir : 'This profile']];
+  fillOptions(R.scopeSel, opts, opts.some((o) => o[0] === dir) ? dir : opts[0][0]);
+  list.forEach((p, i) => { R.scopeSel.options[i].disabled = off(p); });
+  R.scopeSel.disabled = !APP_HOST;
+  R.scopeSel.title = APP_HOST ? '' : 'Open settings from Stile.app’s menu to switch profiles';
+  const sp = ps.find((p) => p.dir === dir);
+  R.scopeAv.replaceChildren(sp ? avatarEl('span', sp, resolveStyle(sp), { 'aria-hidden': 'true' }) : '');
+  box.replaceChildren(R.scopeBox);
 }
 
 function drawTabs() {
   const c = connected();
-  fillOptions(R.archProfile, [['', `Default for all profiles (${fmtMinutes(S.globalMinutes)})`], ...ARCHIVE_CHOICES.map((v) => [String(v), fmtMinutes(v)])].concat(
+  fillOptions(R.archProfile, [['', `Use default (${fmtMinutes(S.globalMinutes)})`], ...ARCHIVE_CHOICES.map((v) => [String(v), fmtMinutes(v)])].concat(
     S.archiveMinutes !== null && !ARCHIVE_CHOICES.includes(S.archiveMinutes) ? [[String(S.archiveMinutes), fmtMinutes(S.archiveMinutes)]] : []), S.archiveMinutes === null ? '' : S.archiveMinutes);
   fillOptions(R.archGlobal, ARCHIVE_CHOICES.map((v) => [String(v), fmtMinutes(v)]).concat(ARCHIVE_CHOICES.includes(S.globalMinutes) ? [] : [[String(S.globalMinutes), fmtMinutes(S.globalMinutes)]]), S.globalMinutes);
-  R.archGlobal.disabled = !c;
-  R.globalHint.textContent = c ? 'Shared by every Chrome profile that has Sidebar installed.' : 'Needs Sidebar.app. Until it is running the default stays at 12 hours.';
+  R.globalRow.hidden = !c; R.applyRow.hidden = !c;   // app-only: the shared default lives in Stile.app
+  const cur = currentProfile();
+  R.profHead.textContent = cur && !cur.own ? cur.p.name || cur.dir : 'This profile';
   R.archGrouped.checked = S.archiveGrouped;
   R.pinnedReset.checked = S.pinnedReset;
   R.mergeOnClose.checked = S.mergeOnClose;
 }
 
+// A group card whose rows are all hidden is hidden too, together with its heading.
+function syncGroups() {
+  for (const g of document.querySelectorAll('.group')) {
+    const kids = [...g.children];
+    const empty = kids.length > 0 && kids.every((k) => k.hidden);
+    g.hidden = empty;
+    const head = g.previousElementSibling;
+    if (head && head.classList.contains('group-h')) head.hidden = empty;
+  }
+}
+
+// Stile.app is required: a gate over the whole window until the helper connects (never for 'checking'/unknown).
+function drawGate() {
+  const st = S.helper && S.helper.status;
+  const down = st === 'not_installed' || st === 'error';
+  if (!R.gate) {
+    const dl = () => chrome.tabs.create({ url: STILE_APP_URL }).catch(() => {});
+    R.gTitle = h('h2', { 'data-testid': 'app-required-title' });
+    R.gMsg = h('p', { 'data-testid': 'app-offline-message' });
+    R.gSteps = h('ol', { class: 'ag-steps', 'data-testid': 'app-required-steps' }, ['Download Stile.app and move it to Applications.', 'Open it and allow Accessibility.', 'Come back here.'].map((t) => h('li', { text: t })));
+    R.gOpen = h('button', { type: 'button', class: 'btn primary', 'data-testid': 'app-offline-open', text: 'Open Stile.app', onclick: () => cmd('retryHelper') });
+    R.gDl = h('button', { type: 'button', class: 'btn primary', 'data-testid': 'app-required-download', text: 'Download Stile.app', onclick: dl });
+    R.gRetry = h('button', { type: 'button', class: 'btn', 'data-testid': 'app-offline-retry', onclick: () => cmd('retryHelper') });
+    R.gGet = h('button', { type: 'button', class: 'ag-link', 'data-testid': 'app-required-get', text: 'Don’t have it? Download Stile.app', onclick: dl });
+    R.gate = h('section', { class: 'app-gate', 'data-testid': 'app-required', hidden: true }, h('div', { class: 'ag-body' }, R.gTitle, R.gMsg, R.gSteps, h('div', { class: 'ag-actions' }, R.gOpen, R.gDl, R.gRetry), R.gGet));
+    document.body.append(R.gate);
+  }
+  const fresh = !S.appEverConnected;
+  R.gate.hidden = !down;
+  document.querySelector('.win').inert = down;
+  R.gTitle.textContent = fresh ? 'Stile needs the Stile app' : 'Stile.app isn’t running';
+  R.gMsg.textContent = fresh ? 'Stile works together with Stile.app on your Mac. Install it and this window turns on by itself.' : 'Open it to cover Chrome’s tabs with this sidebar.';
+  R.gSteps.hidden = !fresh; R.gDl.hidden = !fresh; R.gOpen.hidden = fresh; R.gGet.hidden = fresh;
+  R.gRetry.textContent = fresh ? 'Check again' : 'Retry';
+}
+
 function drawAll() {
-  drawGeneral(); drawColour(); drawTabs(); drawLittle(); drawProfiles(); drawApp();
+  drawTroubleshoot(); drawColour(); drawTabs(); drawLittle(); drawProfiles(); drawApp(); drawScope();
+  syncGroups();
+  drawGate();
 }
 
 // ------------------------------------------------------------------ shell
-let current = 'general';
+let current = 'tabs';
 function show(id, push = true) {
-  if (!NAV.some((n) => n[0] === id)) id = 'general';
+  if (!NAV.some((n) => n[0] === id)) id = 'tabs';
   current = id;
+  if (secEls.tabs) drawScope();
   for (const b of document.querySelectorAll('.nav-item')) { if (b.dataset.section === id) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); }
   for (const [k, el] of Object.entries(secEls)) el.hidden = k !== id;
   $('pane-title').textContent = NAV.find((n) => n[0] === id)[1];
@@ -502,19 +582,39 @@ async function init() {
     settingsUi: true
   };
   try { renderCaptureSettings(R.capHost, ctx); } catch (e) { console.warn('[sidebar] capture settings', e); }
+  try { renderRecordingSettings(R.recHost, ctx); } catch (e) { console.warn('[sidebar] recording settings', e); }
   try { renderBoostSettings(R.boostHost, ctx); } catch (e) { console.warn('[sidebar] boost settings', e); }
   drawAll();
-  const fromHash = () => { const hs = location.hash.replace('#', ''); const [sec, edit] = hs.split(':'); if (edit) S.styleEditing = decodeURIComponent(edit); show(sec || 'general', false); drawProfiles(); };
+  const fromHash = () => { const hs = location.hash.replace('#', ''); const [sec, edit] = hs.split(':'); if (edit) S.styleEditing = decodeURIComponent(edit); show(sec || 'tabs', false); drawProfiles(); };
   window.addEventListener('hashchange', fromHash);
   fromHash();
   chrome.storage.onChanged.addListener((ch, area) => {
     const keys = Object.keys(ch);
     const rel = {
       session: ['helper', 'appState'],
-      local: ['globalDefaultMinutes', 'overlayEnabled', 'defaultBrowser'],
+      local: ['globalDefaultMinutes', 'overlayEnabled', 'defaultBrowser', 'appEverConnected'],
       sync: ['archiveMinutes', 'archiveGrouped', 'ownStyle', 'mergeOnClose', 'littleStyle', 'littleMaxOpen', 'temporaryMinutes', 'pinnedResetOnRestart', 'sidebarColor']
     }[area];
     if (rel && keys.some((k) => rel.includes(k))) refresh();
   });
 }
-init();
+// `settings.html?host=app&profile=<dir>` is Stile.app's own window, bridged to that profile's extension (bridge-shim.js
+// supplies `chrome`): the normal page, plus the app's profile scope. Without `profile` (capture-only mode, or no extension
+// connected) there is no chrome.* at all: see settings-app.js.
+async function boot() {
+  if (!APP_HOST) return init();
+  document.documentElement.dataset.host = 'app';
+  try { await window.__sidebarReady; } catch (e) {
+    $('pane-body').replaceChildren(h('p', { class: 'note', 'data-testid': 'settings-bridge-error', text: `Couldn’t reach this profile’s Stile extension (${(e && e.message) || e}). Close this window and open settings again.` }));
+    return;
+  }
+  try { const st = await native({ op: 'state' }); S.connectedProfiles = st.connectedProfiles || null; S.scopeProfile = st.scopeProfile || null; } catch { /* no state: every profile stays selectable */ }
+  window.__stileSettingsPush = (st) => {
+    if (!st || typeof st !== 'object') return;
+    S.connectedProfiles = st.connectedProfiles || null; S.scopeProfile = st.scopeProfile || null;
+    if (R.scopeSel) drawScope();
+  };
+  await init();
+}
+if (QS.get('host') === 'app' && !QS.get('profile')) import('./settings-app.js').then((m) => m.initAppSettings());
+else boot();

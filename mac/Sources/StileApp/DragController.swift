@@ -6,7 +6,7 @@ import ApplicationServices
 ///
 /// The event tap runs on its own thread (TapThread) and never touches the main thread or AX: it decides from a
 /// lock-protected snapshot (window frames, toolbar bands, cached interactive-control and panel rects) and hands
-/// every side effect to the main queue. Own tap, installed only while lockstep is on (or, briefly, for a drag
+/// every side effect to the main queue. Own tap, installed whenever Chrome mode and Accessibility are on (or, briefly, for a drag
 /// started from our own panel): drag events must not wait on anything slow.
 private let dragTapCallback: CGEventTapCallBack = { _, type, event, refcon in
     guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
@@ -274,10 +274,11 @@ final class DragController {
         }
     }
 
-    /// Installs or removes the tap to match the setting. Cheap to call often. A panel-initiated session (v3.0)
-    /// keeps the tap alive until it ends even when the setting is off; it is removed right after.
+    /// Installs or removes the tap to match Chrome mode, Accessibility and the run-time fallback. Cheap to call often.
+    /// A panel-initiated session (v3.0) keeps the tap alive until it ends even when the tap would otherwise go
+    /// away; it is removed right after.
     func syncTap() {
-        let want = Settings.lockstepDrag && Settings.useChrome && !Self.disabledThisRun && Permissions.isTrusted
+        let want = Settings.useChrome && !Self.disabledThisRun && Permissions.isTrusted
         if want {
             _ = installTap()
         } else if tap != nil, session?.fromPanel != true {
@@ -322,7 +323,7 @@ final class DragController {
     /// setting changes; reads only cached state (no AX).
     func updateSnapshot() {
         guard let m = manager else { return }
-        let on = m.overlayEnabled && Settings.lockstepDrag && Permissions.isTrusted && m.tracker.chromeFrontmost
+        let on = m.overlayEnabled && Permissions.isTrusted && m.tracker.chromeFrontmost
             && m.tracker.pid != 0
         var list: [LockstepTapState.Win] = []
         if on {
@@ -375,8 +376,8 @@ final class DragController {
     // MARK: Panel-initiated drags (v3.0)
 
     /// `beginWindowDrag` from the sidebar page or the header: the mouse-down landed on empty space of our own panel.
-    /// Starts a lockstep move of this window from the current mouse location, whatever the lockstep setting says.
-    /// With the setting off, the drag tap exists only for this session. `doubleClick` runs the title-bar
+    /// Starts a lockstep move of this window from the current mouse location, even after the fallback has turned the tap off.
+    /// In that case the drag tap exists only for this session. `doubleClick` runs the title-bar
     /// double-click action instead.
     @discardableResult
     func beginFromPanel(windowKey key: Int, doubleClick: Bool = false) -> Bool {
@@ -486,7 +487,7 @@ final class DragController {
             s.mismatches = 0
         }
         if !ok {
-            Log.write("lockstep: Chrome didn't follow the drag; turning lockstep off for this session")
+            Log.write("lockstep: Chrome didn't follow the drag; using native dragging until restart")
             Self.disabledThisRun = true
             state.disabled = true
             s.failed = true

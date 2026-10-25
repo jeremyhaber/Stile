@@ -21,7 +21,7 @@
     <key>CFBundleVersion</key>
     <string>__BUILD__</string>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>15.0</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>LSUIElement</key>
@@ -62,5 +62,9 @@
     </array>
     <key>NSAccessibilityUsageDescription</key>
     <string>Stile needs Accessibility access to follow Chrome's windows and to draw its sidebar over Chrome's vertical tab rail.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Stile uses the camera to add you to screen recordings, or to record just the camera, only when you choose a camera.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Stile uses the microphone to add your voice to screen recordings, only when you choose a microphone.</string>
 </dict>
 </plist>

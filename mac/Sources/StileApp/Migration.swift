@@ -6,7 +6,7 @@ enum Migration {
     static let oldBundleID = "ca.simplistics.sidebar"
     /// Every UserDefaults key the app reads or writes.
     static let defaultsKeys = ["peekWidth", "sidebarWidth", "showMenuBarIcon", "greenButtonAction",
-                               "greenButtonNotePending", "lockstepDrag", "permissionsOnboarded", "screenCaptureAsked", "captureWindowShadow"]
+                               "greenButtonNotePending", "permissionsOnboarded", "screenCaptureAsked", "captureWindowShadow"]
 
     static func run() {
         migrateSupportDir()

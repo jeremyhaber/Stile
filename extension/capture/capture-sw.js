@@ -1,6 +1,6 @@
 // Screenshots: capture modes, after-capture handling, recent captures, upload. Imported by background.js.
 import { getCaptureSettings, getS3Config, putCapture, listMeta, getMeta, getBlob, updateMeta, removeCapture, screenshotFilename, MODE_LABEL } from './common.js';
-import { s3Configured, uploadPng, testConnection } from './s3.js';
+import { DEFAULT_S3, s3Configured, uploadPng, testConnection } from './s3.js';
 
 const PAGE_JS = 'capture/page.js';
 const MENU_PARENT = 'sbcap';
@@ -216,6 +216,7 @@ async function copyFromPage(tabId, blob) {
 }
 
 export async function openEditor(id, opts = {}) {
+  if (await openInApp(id, opts)) return { ok: true, app: true };
   const url = chrome.runtime.getURL(`capture/capture.html?id=${encodeURIComponent(id)}${opts.theme ? '&theme=' + opts.theme : ''}`);
   // reuse an editor window that already shows this capture
   const tabs = await chrome.tabs.query({ url: chrome.runtime.getURL('capture/capture.html*') }).catch(() => []);
@@ -226,6 +227,124 @@ export async function openEditor(id, opts = {}) {
   try { w = await chrome.windows.create({ url, type: 'popup', width: 1000, height: 720, focused: true, incognito: !!m?.incognito }); }
   catch { w = await chrome.windows.create({ url, type: 'popup', width: 1000, height: 720, focused: true }); }
   return { ok: true, windowId: w.id };
+}
+
+// ------------------------------------------------------------------ Stile.app: its editor window
+// With the app connected, the editor opens in an app window rather than a Chrome popup. The picture goes over in
+// base64 parts ({ type: 'openCaptureEditor', id, part, parts, data, meta, config }); the last part is a request the
+// app answers once the window is open, so an older app (or none) falls back to the popup.
+let app = null;                          // { connected(), post(m), request(m, timeout) } from background.js
+export function setCaptureApp(a) { app = a; }
+const APP_PART = 8_000_000;              // base64 characters per message (extension-to-host messages may be 64 MB)
+
+/**
+ * v3.5c: while the app is connected it owns the capture settings. The S3 setup to upload with: the app's when it has one
+ * (the secret comes from its Keychain just for this call), else this browser's own copy.
+ */
+async function s3ForUpload() {
+  if (app && app.connected()) {
+    try {
+      const r = await app.request({ type: 'getCaptureSettings', full: true }, 4000);
+      const s3 = r && r.settings && r.settings.s3;
+      if (s3 && s3Configured(s3)) return { ...DEFAULT_S3, ...s3 };
+    } catch { /* fall back to the local copy */ }
+  }
+  return getS3Config();
+}
+
+/** what the app's editor needs from this profile's settings */
+export async function captureConfig() {
+  const [st, s3, sync] = await Promise.all([getCaptureSettings(), getS3Config(), chrome.storage.sync.get('sidebarColor').catch(() => ({}))]);
+  return { annotate: st.captureAnnotate, askWhere: st.captureAskWhere, s3, sidebarColor: sync.sidebarColor || null };
+}
+export async function pushCaptureConfig() {
+  if (app && app.connected()) app.post({ type: 'captureConfig', config: await captureConfig() });
+}
+
+async function openInApp(id, opts) {
+  if (!app || !app.connected()) return false;
+  try {
+    const [meta, blob] = await Promise.all([metaOf(id), blobOf(id)]);
+    if (!meta || !blob) return false;
+    const b64 = (await blobToDataUrl(blob)).replace(/^data:[^,]*,/, '');
+    const parts = Math.max(1, Math.ceil(b64.length / APP_PART));
+    const { thumb, ...m } = meta;
+    const head = { type: 'openCaptureEditor', id, parts, meta: m, config: await captureConfig(), theme: opts.theme || null };
+    for (let i = 0; i < parts - 1; i++) app.post({ ...head, part: i, data: b64.slice(i * APP_PART, (i + 1) * APP_PART) });
+    const r = await app.request({ ...head, part: parts - 1, data: b64.slice((parts - 1) * APP_PART) }, 15000);
+    return !!(r && r.ok);
+  } catch (e) {
+    console.warn('app editor unavailable, using a popup', e);
+    return false;
+  }
+}
+
+// ------------------------------------------------------------------ screenshots of any app (taken by the Mac app)
+// The app sends the PNG base64-encoded in parts (native messages to the extension are limited to 1 MB):
+// { type: 'nativeCapture', id, part, parts, data, mode: one of NATIVE_MODES, title, dpr, open }. With `open: false`
+// the app shows the picture in its own editor and only wants it in the recent captures (under the app's id, so a link
+// uploaded from the app's editor can follow: { type: 'nativeCaptureLink', id, link }).
+const NATIVE_MODES = ['screen', 'area', 'window', 'activeWindow', 'repeatArea', 'delayed', 'file', 'clipboard', 'scroll'];
+const incoming = new Map();             // id -> { parts: [], got, timer }
+export async function receiveNativeCapture(m) {
+  if (typeof m.id !== 'string' || !NATIVE_MODES.includes(m.mode) || typeof m.data !== 'string') return;
+  const parts = Math.max(1, Math.min(500, m.parts | 0)), part = m.part | 0;
+  if (part < 0 || part >= parts) return;
+  let e = incoming.get(m.id);
+  if (!e) {
+    e = { parts: new Array(parts), got: 0, timer: setTimeout(() => incoming.delete(m.id), 60_000) };
+    incoming.set(m.id, e);
+  }
+  if (e.parts[part] == null) { e.parts[part] = m.data; e.got++; }
+  if (e.got < parts) return;
+  clearTimeout(e.timer); incoming.delete(m.id);
+  const blob = dataUrlToBlobSync(e.parts.join(''));
+  const bmp = await createImageBitmap(blob);
+  const id = /^[\w-]{1,64}$/.test(m.id) && !(await getMeta(m.id)) ? m.id : rid();
+  const meta = { id, time: Date.now(), url: '', title: String(m.title || ''), mode: m.mode, width: bmp.width, height: bmp.height, dpr: Number(m.dpr) || 1, note: '', incognito: false, link: '', thumb: await thumbOf(bmp), windowId: null };
+  bmp.close?.();
+  await putCapture(meta, blob);
+  tick();
+  // no page to show a thumbnail card or copy from: always the editor (it has Copy, Save and Upload)
+  if (m.open !== false) await openEditor(id);
+}
+export async function receiveNativeCaptureLink(m) {
+  if (typeof m.id === 'string' && typeof m.link === 'string' && (await metaOf(m.id))) await setLink(m.id, m.link);
+}
+function dataUrlToBlobSync(b64) {
+  const bin = atob(b64);
+  const a = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+  return new Blob([a], { type: 'image/png' });
+}
+
+// ------------------------------------------------------------------ recordings made by the Mac app (v3.6)
+// The app keeps the video; the extension only lists the last 10 beside recent captures: { type: 'nativeRecording', id, title,
+// duration (s), time (ms), link, thumb (base64 JPEG, small: native messages to the extension are capped at 1 MB) }, or
+// { type: 'nativeRecording', id, removed: true }. Stored in chrome.storage.local ('nativeRecordings'), newest first.
+const MAX_RECORDINGS = 10;
+let recQueue = Promise.resolve();
+export function receiveNativeRecording(m) {
+  if (!m || typeof m.id !== 'string' || !/^[\w-]{1,64}$/.test(m.id)) return Promise.resolve();
+  recQueue = recQueue.then(async () => {
+    const { nativeRecordings = [] } = await chrome.storage.local.get('nativeRecordings');
+    const old = nativeRecordings.find((r) => r.id === m.id);
+    let list = nativeRecordings.filter((r) => r.id !== m.id);
+    if (!m.removed) {
+      const thumb = typeof m.thumb === 'string' && m.thumb.length < 300_000 && /^[A-Za-z0-9+/=]+$/.test(m.thumb) ? m.thumb : (old && old.thumb) || '';
+      const link = typeof m.link === 'string' && /^https?:\/\//i.test(m.link) && m.link.length < 4000 ? m.link : '';
+      list.push({ id: m.id, title: String(m.title || '').slice(0, 200), duration: Math.max(0, Number(m.duration) || 0), time: Number(m.time) || Date.now(), link, thumb });
+      list.sort((a, b) => b.time - a.time);
+      list = list.slice(0, MAX_RECORDINGS);
+    }
+    await chrome.storage.local.set({ nativeRecordings: list });
+    tick();
+  }).catch((e) => console.warn('native recording', e));
+  return recQueue;
+}
+async function listRecordings() {
+  const { nativeRecordings = [] } = await chrome.storage.local.get('nativeRecordings');
+  return nativeRecordings;
 }
 
 // ------------------------------------------------------------------ store access (memory for private windows)
@@ -243,7 +362,7 @@ async function saveToDownloads(id) {
 async function uploadCapture(id) {
   const blob = await blobOf(id);
   if (!blob) return { ok: false, error: 'That screenshot is gone' };
-  const r = await uploadPng(await getS3Config(), blob);
+  const r = await uploadPng(await s3ForUpload(), blob);
   await setLink(id, r.url);
   return { ok: true, url: r.url };
 }
@@ -281,6 +400,10 @@ export function registerCaptureListeners() {
     const mode = { 'capture-visible': 'visible', 'capture-full': 'full', 'capture-region': 'region' }[c];
     if (mode) startCapture(mode, null);
   });
+  chrome.storage.onChanged.addListener((ch, area) => {
+    const keys = area === 'local' ? ['captureS3'] : area === 'sync' ? ['captureAnnotate', 'captureAskWhere', 'sidebarColor'] : [];
+    if (keys.some((k) => k in ch)) pushCaptureConfig().catch(() => {});
+  });
   chrome.windows?.onRemoved.addListener(async (wid) => {
     // private captures are discarded once their editor window is gone
     for (const [id, v] of incognitoStore) {
@@ -301,7 +424,7 @@ export async function handleCaptureCommand(msg, sender) {
       case 'captureRegionCancel': { const f = frozen.get(msg.token); if (f) { clearTimeout(f.timer); frozen.delete(msg.token); } return { ok: true }; }
       case 'captureList': {
         const all = [...(await listMeta()), ...[...incognitoStore.values()].map((v) => v.meta)].sort((a, b) => b.time - a.time);
-        return { ok: true, captures: all, s3: s3Configured(await getS3Config()) };
+        return { ok: true, captures: all, recordings: await listRecordings(), s3: s3Configured(await s3ForUpload()) };
       }
       case 'captureOpen': return await openEditor(msg.id, { theme: msg.theme });
       case 'captureDelete': { incognitoStore.delete(msg.id); await removeCapture(msg.id); tick(); return { ok: true }; }
@@ -313,6 +436,20 @@ export async function handleCaptureCommand(msg, sender) {
       case 'captureSetLink': await setLink(msg.id, msg.link || ''); return { ok: true };
       case 'captureDiscard': incognitoStore.delete(msg.id); return { ok: true };
       case 'captureEditorOpened': { const v = incognitoStore.get(msg.id); if (v) v.editorWindow = sender?.tab?.windowId; return { ok: true }; }
+      // v3.5c: the app-owned settings (settings page -> service worker -> app)
+      case 'captureAppSet':
+        if (!app || !app.connected()) return { ok: false, error: 'Stile.app isn’t running' };
+        app.post({ type: 'appSetting', name: 'setCaptureSettings', value: msg.patch && typeof msg.patch === 'object' ? msg.patch : {} });
+        return { ok: true };
+      case 'captureAppChoose':
+        if (!app || !app.connected()) return { ok: false, error: 'Stile.app isn’t running' };
+        app.post({ type: 'appSetting', name: 'chooseCaptureFolder', value: msg.kind === 'recordings' ? 'recordings' : 'screenshots' });
+        return { ok: true };
+      case 'captureAppFull': {
+        if (!app || !app.connected()) return { ok: false, error: 'Stile.app isn’t running' };
+        const r = await app.request({ type: 'getCaptureSettings', full: true }, 8000);
+        return r && r.settings ? { ok: true, settings: r.settings } : { ok: false, error: 'Stile.app didn’t respond' };
+      }
       case 'captureTestS3': try { await testConnection(msg.cfg || await getS3Config()); return { ok: true }; } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
     }
   } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }

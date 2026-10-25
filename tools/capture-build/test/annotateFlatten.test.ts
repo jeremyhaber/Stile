@@ -8,7 +8,7 @@ import {
   PNG_LIMIT_BYTES,
   annotatedFilename,
   flattenToFile,
-  pixelateImageData,
+  blurImageData,
   type CanvasLike,
 } from '../../../extension/capture/src/annotate/flatten'
 import type { AnnotDoc, Shape } from '../../../extension/capture/src/annotate/model'
@@ -87,29 +87,30 @@ describe('annotatedFilename', () => {
   })
 })
 
-describe('pixelateImageData', () => {
-  it('replaces each block by its average color', () => {
-    // 4x2 image, blocks of 2: left block black/white pixels, right block uniform
-    const px = (r: number) => [r, r, r, 255]
-    const data = new Uint8ClampedArray([
-      ...px(0),
-      ...px(100),
-      ...px(7),
-      ...px(7),
-      ...px(200),
-      ...px(0),
-      ...px(7),
-      ...px(7),
-    ])
-    pixelateImageData({ data, width: 4, height: 2 }, 2)
-    expect([data[0], data[4], data[16], data[20]]).toEqual([75, 75, 75, 75])
-    expect([data[8], data[12], data[24], data[28]]).toEqual([7, 7, 7, 7])
+describe('blurImageData', () => {
+  const px = (r: number) => [r, r, r, 255]
+  it('spreads a hard edge into a smooth ramp', () => {
+    // one row: 10 black pixels then 10 white ones
+    const data = new Uint8ClampedArray([...Array(10)].flatMap(() => px(0)).concat([...Array(10)].flatMap(() => px(255))))
+    blurImageData({ data, width: 20, height: 1 }, 3)
+    const row = [...Array(20)].map((_, x) => data[x * 4]!)
+    for (let x = 1; x < 20; x++) expect(row[x]!).toBeGreaterThanOrEqual(row[x - 1]!)
+    expect(row[8]).toBeGreaterThan(0)
+    expect(row[11]).toBeLessThan(255)
+    expect(row[0]).toBeLessThan(20)
+    expect(row[19]).toBeGreaterThan(235)
     expect(data[3]).toBe(255)
   })
-  it('copes with partial blocks at the edge', () => {
+  it('leaves a flat color alone (edges clamped, no dark border)', () => {
     const data = new Uint8ClampedArray(5 * 5 * 4).fill(10)
-    pixelateImageData({ data, width: 5, height: 5 }, 4)
+    blurImageData({ data, width: 5, height: 5 }, 4)
     expect(data.every((v) => v === 10)).toBe(true)
+  })
+  it('blurs vertically too', () => {
+    const data = new Uint8ClampedArray([...px(0), ...px(0), ...px(0), ...px(255), ...px(255), ...px(255)])
+    blurImageData({ data, width: 1, height: 6 }, 1)
+    expect(data[8]).toBeGreaterThan(0)
+    expect(data[12]).toBeLessThan(255)
   })
 })
 
@@ -169,7 +170,7 @@ describe('flattenToFile', () => {
     expect(calls.find((c) => c[0] === 'setTransform')).toEqual(['setTransform', 1, 0, 0, 1, -5, -8])
   })
 
-  it('really pixelates blur boxes (getImageData / putImageData) BEFORE annotations are drawn', async () => {
+  it('really blurs blur boxes (getImageData / putImageData) BEFORE annotations are drawn', async () => {
     const { canvas, calls } = stubCanvas(1000)
     await flattenToFile({
       ...base,
@@ -181,7 +182,9 @@ describe('flattenToFile', () => {
     const names = calls.map((c) => c[0])
     expect(names).toContain('getImageData')
     expect(names).toContain('putImageData')
-    expect(calls.find((c) => c[0] === 'getImageData')).toEqual(['getImageData', 20, 20, 100, 40])
+    // the box (20, 20, 100 x 40, radius 10) is read with 30 px of surroundings, and only the box is written back
+    expect(calls.find((c) => c[0] === 'getImageData')).toEqual(['getImageData', 0, 0, 150, 90])
+    expect(calls.find((c) => c[0] === 'putImageData')!.slice(2)).toEqual([0, 0, 20, 20, 100, 40])
     expect(names.indexOf('putImageData')).toBeLessThan(names.indexOf('strokeRect'))
     // the stage-only blur preview is never drawn as a shape
     expect(names.filter((n) => n === 'fillRect')).toHaveLength(0)

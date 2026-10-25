@@ -31,7 +31,7 @@ export function screenshotFilename(d = new Date()) {
   return `Screenshot ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} at ${pad(d.getHours())}.${pad(d.getMinutes())}.${pad(d.getSeconds())}.png`;
 }
 
-export const MODE_LABEL = { visible: 'Visible area', full: 'Full page', region: 'Region' };
+export const MODE_LABEL = { visible: 'Visible area', full: 'Full page', region: 'Region', screen: 'Screen', area: 'Area', window: 'Window', activeWindow: 'Active window', repeatArea: 'Repeated area', delayed: 'Delayed screen', file: 'Opened image', clipboard: 'Clipboard', scroll: 'Scrolling capture' };
 
 // ------------------------------------------------------------------ IndexedDB store (never synced)
 let dbp = null;

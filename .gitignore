@@ -3,4 +3,4 @@ mac/.build/
 mac/dist/
 node_modules/
 .DS_Store
-dev/fs-rec-out/
+dev/
